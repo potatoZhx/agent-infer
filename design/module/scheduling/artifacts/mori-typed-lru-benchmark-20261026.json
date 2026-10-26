@@ -1,0 +1,189 @@
+{
+  "comparison_scope": "CPU typed-LRU maintenance and eviction; excludes model execution and transfer time",
+  "full_trace_reconstruction": {
+    "d2h_store_calls": 16849,
+    "evicted_chunks": 879759,
+    "eviction_calls": 16795,
+    "final_resident_chunks": 10922,
+    "stored_chunks": 890681
+  },
+  "host": {
+    "cpu_affinity": [
+      40
+    ],
+    "platform": "Linux-5.10.134-16.103.al8.x86_64-x86_64-with-glibc2.35",
+    "python": "3.12.13 (main, Mar  4 2026, 09:23:07) [GCC 11.4.0]"
+  },
+  "inputs": {
+    "capacity_chunks": 10922,
+    "isolated_source": "/data/zx/agent-kvc/research/studies/kvc_theory/mori-reproduction-20261022/candidate/joint/mori.py",
+    "isolated_source_sha256": "566a01fdf24312b5e4826cee916116e24eefe4a78ca4633e91053a9e493b5d77",
+    "operation_chunks": 50193,
+    "operations": 500,
+    "programs": 192,
+    "repeats": 5,
+    "shared_owner_every_n_keys": 11,
+    "touch_count": 8,
+    "trace": "/data/zx/agent-kvc/research/studies/kvc_theory/mori-reproduction-20261022/runs/mori-k5-v6-bounded/r1-full-mori/run/transfers.jsonl",
+    "trace_sha256": "7867b54ceba18d374e737de81e55c82c82bce195848d0df6eade2ab3e60d329f",
+    "transition_interval": 8
+  },
+  "schema": "agentinfer_mori_typed_lru_benchmark_v1",
+  "summary": {
+    "formal_reservation_reduction_vs_isolated_percent": 82.4123681083309,
+    "formal_reservation_speedup_over_isolated": 5.685813793235455,
+    "median_thread_cpu_seconds": {
+      "formal_proposal": 0.749834859,
+      "formal_reservation": 0.62222863,
+      "isolated_scan": 3.537876127
+    },
+    "reservation_reduction_vs_formal_proposal_percent": 17.017911006455368,
+    "reservation_speedup_over_formal_proposal": 1.2050793275134255
+  },
+  "trial_order_rotates": true,
+  "trials": [
+    {
+      "repeat": 1,
+      "thread_cpu_seconds": 3.631059563,
+      "variant": "isolated_scan",
+      "victim_count": 50193,
+      "victim_digest": "532c985ffe518a66a502df3aff52434d93ad51912730fe6cd51e3a15251b03b7"
+    },
+    {
+      "repeat": 1,
+      "thread_cpu_seconds": 0.837563209,
+      "variant": "formal_proposal",
+      "victim_count": 50193,
+      "victim_digest": "532c985ffe518a66a502df3aff52434d93ad51912730fe6cd51e3a15251b03b7"
+    },
+    {
+      "repeat": 1,
+      "thread_cpu_seconds": 0.591023086,
+      "variant": "formal_reservation",
+      "victim_count": 50193,
+      "victim_digest": "532c985ffe518a66a502df3aff52434d93ad51912730fe6cd51e3a15251b03b7"
+    },
+    {
+      "repeat": 2,
+      "thread_cpu_seconds": 0.656473763,
+      "variant": "formal_proposal",
+      "victim_count": 50193,
+      "victim_digest": "532c985ffe518a66a502df3aff52434d93ad51912730fe6cd51e3a15251b03b7"
+    },
+    {
+      "repeat": 2,
+      "thread_cpu_seconds": 0.736619854,
+      "variant": "formal_reservation",
+      "victim_count": 50193,
+      "victim_digest": "532c985ffe518a66a502df3aff52434d93ad51912730fe6cd51e3a15251b03b7"
+    },
+    {
+      "repeat": 2,
+      "thread_cpu_seconds": 3.537876127,
+      "variant": "isolated_scan",
+      "victim_count": 50193,
+      "victim_digest": "532c985ffe518a66a502df3aff52434d93ad51912730fe6cd51e3a15251b03b7"
+    },
+    {
+      "repeat": 3,
+      "thread_cpu_seconds": 0.676912101,
+      "variant": "formal_reservation",
+      "victim_count": 50193,
+      "victim_digest": "532c985ffe518a66a502df3aff52434d93ad51912730fe6cd51e3a15251b03b7"
+    },
+    {
+      "repeat": 3,
+      "thread_cpu_seconds": 3.546158098,
+      "variant": "isolated_scan",
+      "victim_count": 50193,
+      "victim_digest": "532c985ffe518a66a502df3aff52434d93ad51912730fe6cd51e3a15251b03b7"
+    },
+    {
+      "repeat": 3,
+      "thread_cpu_seconds": 0.749834859,
+      "variant": "formal_proposal",
+      "victim_count": 50193,
+      "victim_digest": "532c985ffe518a66a502df3aff52434d93ad51912730fe6cd51e3a15251b03b7"
+    },
+    {
+      "repeat": 4,
+      "thread_cpu_seconds": 3.380454819,
+      "variant": "isolated_scan",
+      "victim_count": 50193,
+      "victim_digest": "532c985ffe518a66a502df3aff52434d93ad51912730fe6cd51e3a15251b03b7"
+    },
+    {
+      "repeat": 4,
+      "thread_cpu_seconds": 0.640970773,
+      "variant": "formal_proposal",
+      "victim_count": 50193,
+      "victim_digest": "532c985ffe518a66a502df3aff52434d93ad51912730fe6cd51e3a15251b03b7"
+    },
+    {
+      "repeat": 4,
+      "thread_cpu_seconds": 0.62222863,
+      "variant": "formal_reservation",
+      "victim_count": 50193,
+      "victim_digest": "532c985ffe518a66a502df3aff52434d93ad51912730fe6cd51e3a15251b03b7"
+    },
+    {
+      "repeat": 5,
+      "thread_cpu_seconds": 0.790686765,
+      "variant": "formal_proposal",
+      "victim_count": 50193,
+      "victim_digest": "532c985ffe518a66a502df3aff52434d93ad51912730fe6cd51e3a15251b03b7"
+    },
+    {
+      "repeat": 5,
+      "thread_cpu_seconds": 0.589311185,
+      "variant": "formal_reservation",
+      "victim_count": 50193,
+      "victim_digest": "532c985ffe518a66a502df3aff52434d93ad51912730fe6cd51e3a15251b03b7"
+    },
+    {
+      "repeat": 5,
+      "thread_cpu_seconds": 3.447668083,
+      "variant": "isolated_scan",
+      "victim_count": 50193,
+      "victim_digest": "532c985ffe518a66a502df3aff52434d93ad51912730fe6cd51e3a15251b03b7"
+    }
+  ],
+  "valid": true,
+  "variant_operation_counters": {
+    "formal_proposal": {
+      "entries_reclassified": 3501,
+      "heap_compaction_entries": 2809,
+      "heap_compactions": 97,
+      "program_reclassifications": 63,
+      "proposals": 500,
+      "proposed_entries": 50193,
+      "removes": 50193,
+      "stale_repairs": 25068,
+      "touches": 1138,
+      "upserts": 61115
+    },
+    "formal_reservation": {
+      "entries_reclassified": 3501,
+      "program_reclassifications": 63,
+      "proposals": 500,
+      "proposed_entries": 50193,
+      "removes": 50193,
+      "stale_repairs": 3561,
+      "touches": 1138,
+      "upserts": 61115
+    },
+    "isolated_scan": {
+      "busy_evicted": 20615,
+      "calls": 500,
+      "chunks": 50193,
+      "idle_evicted": 8661,
+      "inactive_evicted": 20917,
+      "keys_examined": 5461000,
+      "priority_cache_hits": 4728518,
+      "priority_cache_misses": 732482,
+      "selection_heap_pushes": 106292,
+      "selection_heap_replacements": 175421
+    }
+  },
+  "victim_sequences_identical": true
+}

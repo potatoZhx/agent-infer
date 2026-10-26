@@ -65,9 +65,9 @@ def add_agentinfer_arguments(parser: argparse.ArgumentParser) -> None:
         "--agentinfer",
         action="store_true",
         default=False,
-        help="Enable the AgentInfer Progress-TTL serving path: injects the AgentCache scheduler bridge "
+        help="Enable the AgentInfer agent-aware serving path: injects the AgentCache scheduler bridge "
         "(async or sync, following --async-scheduling/--no-async-scheduling), the identity and lifecycle "
-        "middleware, and the embedded Progress-TTL controller.",
+        "middleware, and the explicitly selected embedded scheduling controller.",
     )
 
 

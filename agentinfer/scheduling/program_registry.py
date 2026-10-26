@@ -19,6 +19,7 @@ from agentinfer.scheduling.domain import (
     ProgramStatus,
     ProgramTokenObservation,
     ProgramView,
+    TokenObservationSource,
 )
 from agentinfer.scheduling.identity import AgentIdentity
 from agentinfer.scheduling.program_runtime import RuntimeProgram
@@ -155,6 +156,7 @@ class ProgramRegistry:
             estimated_context_tokens=previous.estimated_context_tokens
             if total_tokens is None
             else max(0, total_tokens),
+            source=(TokenObservationSource.BACKEND_USAGE if total_tokens is not None else previous.source),
             observed_at_monotonic_s=(time.monotonic() if observed_at_monotonic_s is None else observed_at_monotonic_s),
         )
         program.step_count += 1

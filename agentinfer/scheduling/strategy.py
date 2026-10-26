@@ -18,6 +18,7 @@ transition from stale decision factors.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from enum import Enum
 from typing import ClassVar, Generic
 
 from agentinfer.scheduling.admission_outcome import AdmissionOutcome
@@ -28,8 +29,35 @@ from agentinfer.scheduling.snapshot import SchedulingSnapshot
 from agentinfer.scheduling.transitions import TransitionController
 
 
+class SchedulingCycleOrder(str, Enum):
+    """Ordering of the two capacity-changing hooks in one scheduling cycle."""
+
+    RESUME_THEN_REPAIR = "resume_then_repair"
+    REPAIR_THEN_RESUME = "repair_then_resume"
+
+
 class SchedulingStrategy(Generic[StrategyGlobalFactorsT, StrategyProgramFactorsT], ABC):
     """Policy that consumes runtime facts and maintained factors under the caller's scheduling lock."""
+
+    @property
+    def cycle_order(self) -> SchedulingCycleOrder:
+        """Return the hook order required by this strategy.
+
+        Existing strategies retain the historical resume-before-repair behavior. A
+        placement strategy may opt into repair-before-resume so it never promotes
+        new work while an already committed placement exceeds its quota.
+        """
+        return SchedulingCycleOrder.RESUME_THEN_REPAIR
+
+    @property
+    def requires_program_identity(self) -> bool:
+        """Return whether compatibility traffic without Program identity is forbidden."""
+        return False
+
+    @property
+    def allows_overlapping_program_requests(self) -> bool:
+        """Return whether one Program may own multiple simultaneous requests."""
+        return True
 
     _EVENT_CALLBACKS: ClassVar[dict[SchedulingEventKind, str]] = {
         SchedulingEventKind.REQUEST_PENDING: "on_request_pending",

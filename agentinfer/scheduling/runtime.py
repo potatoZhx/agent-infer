@@ -35,7 +35,7 @@ from agentinfer.scheduling.program_registry import ProgramRegistry
 from agentinfer.scheduling.program_runtime import RuntimeProgram
 from agentinfer.scheduling.request_pool import RequestPool, RequestPoolEntry, RequestPoolStatus, RetainedRequestT
 from agentinfer.scheduling.snapshot import SchedulingSnapshot
-from agentinfer.scheduling.strategy import SchedulingStrategy
+from agentinfer.scheduling.strategy import SchedulingCycleOrder, SchedulingStrategy
 from agentinfer.scheduling.transitions import (
     TRANSITION_EVENT_KINDS,
     TransitionController,
@@ -105,6 +105,11 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
         return self.request_pool.unfinished_count
 
     @property
+    def requires_program_identity(self) -> bool:
+        """Return whether the selected strategy rejects untracked compatibility traffic."""
+        return self.strategy.requires_program_identity
+
+    @property
     def retained_request_ids(self) -> tuple[str, ...]:
         """Return all retained attempts for host-wide cancellation."""
         return tuple(entry.request_id for entry in self.request_pool.entries)
@@ -162,6 +167,15 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
         """Bind, retain, and run immediate Program-level admission."""
         if request_id in self._request_bindings:
             raise ValueError(f"duplicate request_id: {request_id}")
+        current_ref = self.registry.current_ref(metadata.program_id)
+        if (
+            current_ref is not None
+            and not self.strategy.allows_overlapping_program_requests
+            and self._program_requests.get(current_ref)
+        ):
+            raise ValueError(
+                f"strategy forbids overlapping requests for Program {current_ref.program_id}@{current_ref.generation}"
+            )
         self._cycle_dirty = True
         self._replace_backend_info(backend_pool_info)
         program, created = self.registry.materialize(metadata)
@@ -247,9 +261,14 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
         snapshot = self._snapshot()
         self.strategy.on_schedule_cycle_start(snapshot, self.strategy_factors)
         self._log_periodic_diagnostics(snapshot, now)
-        self.strategy.schedule_resume(snapshot, self.strategy_factors, controller)
-        snapshot = self._advance_snapshot(snapshot, controller.take_applied_requests())
-        self.strategy.repair_capacity(snapshot, self.strategy_factors, controller)
+        if self.strategy.cycle_order is SchedulingCycleOrder.REPAIR_THEN_RESUME:
+            self.strategy.repair_capacity(snapshot, self.strategy_factors, controller)
+            snapshot = self._advance_snapshot(snapshot, controller.take_applied_requests())
+            self.strategy.schedule_resume(snapshot, self.strategy_factors, controller)
+        else:
+            self.strategy.schedule_resume(snapshot, self.strategy_factors, controller)
+            snapshot = self._advance_snapshot(snapshot, controller.take_applied_requests())
+            self.strategy.repair_capacity(snapshot, self.strategy_factors, controller)
         if self._next_check_at_monotonic_s is not None and self._next_check_at_monotonic_s <= now:
             snapshot = self._advance_snapshot(snapshot, controller.take_applied_requests())
             self.strategy.handle_scheduled_check(snapshot, self.strategy_factors, controller)
@@ -279,7 +298,26 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
         if binding is not None:
             if total_output_tokens > 0 and binding.first_output_at_monotonic_s is None:
                 binding.first_output_at_monotonic_s = time.monotonic()
+            previous_output = binding.output_tokens
             binding.output_tokens = max(binding.output_tokens, max(0, total_output_tokens))
+            if binding.output_tokens > previous_output:
+                program = self.registry.get(binding.program)
+                if program is not None:
+                    program.tokens = replace(
+                        program.tokens,
+                        estimated_context_tokens=max(
+                            program.tokens.estimated_context_tokens,
+                            binding.prompt_tokens + binding.output_tokens,
+                        ),
+                        source=TokenObservationSource.MIXED,
+                        observed_at_monotonic_s=time.monotonic(),
+                    )
+                    self._cycle_dirty = True
+
+    def program_ref_for_request(self, request_id: str) -> ProgramRef | None:
+        """Return the exact Program generation bound to one live request attempt."""
+        binding = self._request_bindings.get(request_id)
+        return binding.program if binding is not None else None
 
     def on_prefix_cache_observation(
         self,
@@ -595,6 +633,12 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
             waiting_programs=waiting,
             native_used_kv_tokens=dp_rank.used_hbm_kv_tokens,
             native_waiting_kv_tokens=dp_rank.waiting_hbm_kv_tokens,
+            total_dram_kv_tokens=dp_rank.total_dram_kv_tokens,
+            used_dram_kv_tokens=dp_rank.used_dram_kv_tokens,
+            pending_h2d_kv_tokens=dp_rank.pending_h2d_kv_tokens,
+            pending_d2h_kv_tokens=dp_rank.pending_d2h_kv_tokens,
+            hbm_block_size_tokens=dp_rank.hbm_block_size_tokens,
+            dram_chunk_size_tokens=dp_rank.dram_chunk_size_tokens,
             request_pool_waiting_requests=len(self.request_pool.waiting_request_ids),
         )
 

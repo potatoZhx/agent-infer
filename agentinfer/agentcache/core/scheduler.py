@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AgentCache project
 """Explicit AgentCache admission bridges for vLLM.
 
-Progress-TTL uses the explicit async or sync bridge and a composed helper, while native waiting/running/KV state and
-every token-level scheduling operation remain owned by vLLM.
+Progress-TTL and MORI use the explicit async or sync bridge and a composed
+helper, while native waiting/running/KV state and every token-level scheduling
+operation remain owned by vLLM.
 """
 
 from __future__ import annotations
@@ -21,11 +22,14 @@ from vllm.v1.engine import EngineCoreEventType
 from vllm.v1.request import Request, RequestStatus
 
 from agentinfer.agentcache.core.api_adapter import LIFECYCLE_SOCKET_ENV, UnixLifecycleReceiver
-from agentinfer.agentcache.core.controller import build_progress_ttl_controller
+from agentinfer.agentcache.core.controller import build_controller, build_progress_ttl_controller
 from agentinfer.agentcache.core.vllm_logging import attach_agentinfer_to_vllm_logging
+from agentinfer.agentcache.mori.runtime_state import MORI_RUNTIME_STATE
+from agentinfer.agentcache.mori.vllm_adapter import install_vllm_mori, observe_vllm_offload
 from agentinfer.scheduling.backend import BackendInfo, BackendPoolInfo, DispatchTarget, DpRankInfo
 from agentinfer.scheduling.identity import AgentIdentity, JsonMapping, JsonObject, parse_agent_identity
 from agentinfer.scheduling.lifecycle import ProgramLifecycle
+from agentinfer.scheduling.mori import MORIStrategy
 from agentinfer.scheduling.request_pool import RequestPoolEntry, RetainedRequestT
 
 logger = logging.getLogger(__name__)
@@ -41,6 +45,10 @@ class EmbeddedSchedulerController(Protocol[RetainedRequestT]):
     @property
     def retained_request_ids(self) -> tuple[str, ...]:
         """Return retained request attempts for host-wide abort."""
+
+    @property
+    def requires_program_identity(self) -> bool:
+        """Return whether a request without server-resolved identity must fail."""
 
     def prefix_cache_candidates(self) -> tuple[tuple[str, RetainedRequestT], ...]:
         """Return retained paused reasoning requests needing a refreshed prefix-cache observation."""
@@ -71,6 +79,9 @@ class EmbeddedSchedulerController(Protocol[RetainedRequestT]):
 
     def on_stream_output(self, request_id: str, total_output_tokens: int) -> None:
         """Observe one native output update."""
+
+    def program_ref_for_request(self, request_id: str):
+        """Return the exact Program generation for one live request."""
 
     def on_prefix_cache_observation(
         self,
@@ -119,12 +130,19 @@ class _VllmAdmissionHooks:
             raise ValueError("agentcache.expected_reasoning_agent_nums must be a non-negative integer")
         self.expected_agents = expected
         # EngineCore passes resolve_kv_cache_block_sizes() as block_size, which already includes DCP and PCP.
-        self.local_hbm_kv_tokens = int(kv_cache_config.num_blocks) * int(block_size)
+        self.block_size = int(block_size)
+        self.local_hbm_kv_tokens = int(kv_cache_config.num_blocks) * self.block_size
         self.tracked_native: set[str] = set()
         self._local_prefix_observations: dict[str, tuple[int, int]] = {}
         self._prefix_refresh_pending = False
-        self.controller = build_progress_ttl_controller(self.backend_pool_info(owner), settings)
+        self.controller = (
+            build_progress_ttl_controller(self.backend_pool_info(owner), settings)
+            if settings.get("strategy", "progress_ttl") == "progress_ttl"
+            else build_controller(self.backend_pool_info(owner), settings)
+        )
         self._install_prefix_lookup_observer(owner)
+        strategy = getattr(self.controller, "strategy", None)
+        self._mori_adapter = install_vllm_mori(owner, strategy) if isinstance(strategy, MORIStrategy) else None
         self.lifecycle_receiver: UnixLifecycleReceiver | None = None
         socket_path = settings.get("lifecycle_socket_path") or os.environ.get(LIFECYCLE_SOCKET_ENV)
         if socket_path is not None:
@@ -137,6 +155,8 @@ class _VllmAdmissionHooks:
         self._drain_lifecycle_signals()
         metadata = _metadata_from_request(request)
         if metadata is None:
+            if bool(getattr(self.controller, "requires_program_identity", False)):
+                raise ValueError("selected AgentInfer strategy requires server-resolved Program identity")
             native_add(request)
             return
         retained_at_monotonic_s = time.monotonic()
@@ -147,6 +167,11 @@ class _VllmAdmissionHooks:
             self.backend_pool_info(owner),
             request,
         )
+        if isinstance(getattr(self.controller, "strategy", None), MORIStrategy):
+            program = self.controller.program_ref_for_request(request.request_id)
+            if program is None:
+                raise RuntimeError("AgentInfer controller did not retain the request-to-Program binding")
+            MORI_RUNTIME_STATE.bind_request(request.request_id, program)
         if dispatch_now:
             self.tracked_native.add(request.request_id)
             self._add_to_native_waiting(request, retained_at_monotonic_s, native_add)
@@ -248,6 +273,7 @@ class _VllmAdmissionHooks:
                     self.controller.on_request_completion(request_id, total_tokens)
                     self.tracked_native.discard(request_id)
                     self._local_prefix_observations.pop(request_id, None)
+                    MORI_RUNTIME_STATE.unbind_request(request_id)
                     completed_request = True
         if completed_request:
             self._prefix_refresh_pending = True
@@ -281,6 +307,7 @@ class _VllmAdmissionHooks:
         for request_id in normalized:
             entry = self.controller.cancel_request(request_id)
             if entry is not None:
+                MORI_RUNTIME_STATE.unbind_request(request_id)
                 cancelled.append((request_id, entry.retained_request.client_index))
         return cancelled
 
@@ -307,6 +334,7 @@ class _VllmAdmissionHooks:
                 self.controller.on_request_completion(request_id, token_counts.get(request_id, 0))
                 self.tracked_native.discard(request_id)
                 self._local_prefix_observations.pop(request_id, None)
+                MORI_RUNTIME_STATE.unbind_request(request_id)
         return retained + native
 
     def _install_prefix_lookup_observer(self, owner: Scheduler) -> None:
@@ -351,12 +379,31 @@ class _VllmAdmissionHooks:
         """Merge retained and native liveness without exposing request objects to EngineCore."""
         return native_count + self.controller.retained_request_count
 
+    def close(self) -> None:
+        """Release process-local MORI hooks and the lifecycle socket idempotently."""
+        if self.lifecycle_receiver is not None:
+            self.lifecycle_receiver.close()
+            self.lifecycle_receiver = None
+        if self._mori_adapter is not None:
+            self._mori_adapter.close()
+            self._mori_adapter = None
+
     def backend_pool_info(self, owner: Scheduler) -> BackendPoolInfo:
         """Build rank-local logical KV-token and request-load facts from native vLLM state."""
         now = time.monotonic()
-        running, waiting = owner.get_request_counts()
+        try:
+            running, waiting = owner.get_request_counts()
+        except AttributeError:
+            # Test doubles and older/newer vLLM layouts may not materialize
+            # every auxiliary waiting queue. The primary queues still provide
+            # an exact lower-level count for controller construction.
+            running = len(getattr(owner, "running", ()))
+            waiting = sum(
+                len(getattr(owner, name, ())) for name in ("waiting", "skipped_waiting", "kv_holding_waiting")
+            )
         native_used_kv_tokens = self._native_used_kv_tokens(owner)
         native_waiting_kv_tokens = self._native_waiting_kv_tokens(owner)
+        offload = observe_vllm_offload(owner)
         backend = BackendInfo(
             backend_id=self.backend_id,
             backend_url="embedded://vllm",
@@ -371,6 +418,12 @@ class _VllmAdmissionHooks:
                     total_hbm_kv_tokens=self.local_hbm_kv_tokens,
                     used_hbm_kv_tokens=native_used_kv_tokens,
                     waiting_hbm_kv_tokens=native_waiting_kv_tokens,
+                    total_dram_kv_tokens=offload.total_dram_kv_tokens,
+                    used_dram_kv_tokens=offload.used_dram_kv_tokens,
+                    pending_h2d_kv_tokens=offload.pending_h2d_kv_tokens,
+                    pending_d2h_kv_tokens=offload.pending_d2h_kv_tokens,
+                    hbm_block_size_tokens=self.block_size,
+                    dram_chunk_size_tokens=offload.dram_chunk_size_tokens,
                     expected_reasoning_agent_nums=self.expected_agents,
                 ),
             ),
@@ -458,6 +511,12 @@ class AgentCacheAsyncSchedulerBridge(AsyncScheduler):
     def get_num_unfinished_requests(self) -> int:
         return self._agentcache.unfinished_count(super().get_num_unfinished_requests())
 
+    def shutdown(self) -> None:
+        try:
+            super().shutdown()
+        finally:
+            self._agentcache.close()
+
 
 class AgentCacheSyncSchedulerBridge(Scheduler):
     """Explicit fallback bridge for configurations where vLLM disables async scheduling."""
@@ -495,6 +554,12 @@ class AgentCacheSyncSchedulerBridge(Scheduler):
 
     def get_num_unfinished_requests(self) -> int:
         return self._agentcache.unfinished_count(super().get_num_unfinished_requests())
+
+    def shutdown(self) -> None:
+        try:
+            super().shutdown()
+        finally:
+            self._agentcache.close()
 
 
 def _metadata_from_request(request: Request) -> AgentIdentity | None:

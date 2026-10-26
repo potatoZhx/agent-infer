@@ -103,6 +103,28 @@ deadline：用请求前方剩余轮数除以近期聚合请求吞吐，乘以 `f
 `resume_fairness_weight`、`resume_resource_penalty_weight`、`capacity_safety_margin_tokens`、
 `ttl_impact_multiplier`、`uncached_ratio_default` 和可配置的 `decode_buffer_tokens`。
 
+### 选择 MORI（vLLM 0.31）
+
+MORI 通过同一个 scheduler bridge 接入，但 full 模式要求 vLLM 0.31 的窄 HBM provider patch 和原生
+`OffloadingConnector`。先按 [`agentinfer/agentcache/patches/README.md`](../../../agentinfer/agentcache/patches/README.md)
+应用 patch，再使用 [`examples/serve-mori.sh`](../../../examples/serve-mori.sh) 启动。核心配置为：
+
+```json
+{
+  "agentcache": {
+    "strategy": "mori",
+    "schedule_interval_seconds": 5.0,
+    "mori": {"mode": "full", "window_size": 5}
+  }
+}
+```
+
+CPU offload 需选择 `MoriCPUCachePolicy`，并把
+`cache_policy_module_path` 设为 `agentinfer.agentcache.mori_cpu_policy`。`decode_buffer_tokens=100` 是固定的
+实现 reservation，不能从配置覆盖。MORI 只接受服务端从请求解析出的 Program identity，不读取 replay plan，
+且 full 模式缺少 HBM hook、DRAM quota 或 MORI CPU policy 时会在启动期失败。架构、容量公式、typed-LRU
+复杂度和源码目录见 [MORI 设计文档](../../../design/module/scheduling/mori-scheduling.md)。
+
 ## 了解 CLI 委托行为
 
 AgentInfer 会安装一个委托型 `vllm` 控制台脚本：

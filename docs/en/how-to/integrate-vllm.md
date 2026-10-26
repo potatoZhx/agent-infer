@@ -109,6 +109,30 @@ The policy rejects removed legacy keys instead of silently ignoring them. Replac
 `resume_fairness_weight`, `resume_resource_penalty_weight`, `capacity_safety_margin_tokens`,
 `ttl_impact_multiplier`, `uncached_ratio_default`, and configurable `decode_buffer_tokens`.
 
+### Select MORI (vLLM 0.31)
+
+MORI uses the same scheduler bridge, but full mode requires the narrow vLLM 0.31 HBM provider patch and the native
+`OffloadingConnector`. Apply the patch as described in
+[`agentinfer/agentcache/patches/README.md`](../../../agentinfer/agentcache/patches/README.md), then use
+[`examples/serve-mori.sh`](../../../examples/serve-mori.sh). The core AgentInfer configuration is:
+
+```json
+{
+  "agentcache": {
+    "strategy": "mori",
+    "schedule_interval_seconds": 5.0,
+    "mori": {"mode": "full", "window_size": 5}
+  }
+}
+```
+
+CPU offload must select `MoriCPUCachePolicy` with
+`cache_policy_module_path=agentinfer.agentcache.mori_cpu_policy`. The 100-token decode buffer is a fixed reservation,
+not an operator setting. MORI accepts only server-resolved Program identity and never consumes a replay plan. Full mode
+fails during startup when the HBM hook, rank-local DRAM quota, or MORI CPU policy is missing. See the
+[MORI design](../../../design/module/scheduling/mori-scheduling.md) for the architecture, capacity formulas,
+typed-LRU complexity, and source map.
+
 ## Understand CLI Delegation
 
 AgentInfer installs a delegating `vllm` console script:
