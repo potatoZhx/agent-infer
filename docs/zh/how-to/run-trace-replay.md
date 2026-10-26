@@ -216,6 +216,10 @@ AgentX 要求 `prompt_calibration_tolerance_tokens=0`。默认值已是 `0`，Ag
 子 agent 身份仍会传递，`blocks_parent` 设为 false。转换结果保留零输出请求；规划时将其执行输出目标
 映射为 1 个 token，发送请求和响应校验均使用该目标，分析产物中的来源输出数量仍为 0。
 后端上下文窗口必须容纳选中请求的输入与规划输出目标。
+AgentX 计划还会按 actor 把最后一条请求标为 `expected_lifecycle: terminal`，其余请求标为
+`continue`。该可选字段经 `/v1/completions` 的 `vllm_xargs.agentinfer_expected_lifecycle`
+发送；启用 AgentCache lifecycle middleware 时，显式结果用于释放 Program。若 terminal 响应先于同一
+actor 的重叠请求完成，Scheduler 会保留该 terminal 事实，直到该 Program 不再有在途请求。
 `replay.max_inflight_requests` 限制每个 Runtime Session 同时在途的 AgentX 请求数。
 请求到达计划释放时间并取得会话内信号量后，才读取 hash 配方和构建 token 快照，以限制同时持有的
 大输入数量；完成后不保留输入快照或实时回答作为后续上下文。`scheduler_lag_seconds` 包括信号量等待

@@ -159,7 +159,12 @@ subagent identity is retained while `blocks_parent` is false. The converter
 keeps zero-output records for coverage; planning maps their output target to one
 token for Backend execution and exact response validation. The source output count
 remains zero in analysis. Set the Backend context limit high enough for the selected
-request's `input_tokens + planned_output_tokens`. `replay.max_inflight_requests` bounds
+request's `input_tokens + planned_output_tokens`. The plan marks the last request for
+each actor as `expected_lifecycle: terminal` and every earlier request as `continue`.
+This optional value travels beside `agentic_context` as
+`vllm_xargs.agentinfer_expected_lifecycle` on `/v1/completions`. When the AgentCache
+lifecycle middleware is enabled, a terminal result that finishes before an overlapping
+request is retained until that Program has no request in flight. `replay.max_inflight_requests` bounds
 simultaneous AgentX requests within each runtime session.
 Snapshots are read and rendered after the planned release time and inside the session semaphore,
 bounding the number of prepared large inputs. Completed requests do not retain snapshots or live answers

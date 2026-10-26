@@ -19,6 +19,7 @@ from agentinfer.agentcache.core.api_adapter import (
     UnixLifecycleReceiver,
     UnixLifecycleSender,
     _adapt_identity_request_body,
+    _explicit_completion_lifecycle,
     _LifecycleResponseObserver,
     _parse_anthropic_replay_sampling,
     _response_lifecycle,
@@ -85,6 +86,22 @@ def test_openai_lifecycle_uses_post_tool_parser_semantics() -> None:
             {"choices": [{"finish_reason": "stop", "message": {"content": "done"}}]},
         )
         is ProgramLifecycle.TERMINAL
+    )
+
+
+def test_completion_lifecycle_uses_only_explicit_optional_xarg() -> None:
+    assert (
+        _explicit_completion_lifecycle({"vllm_xargs": {"agentinfer_expected_lifecycle": "terminal"}})
+        is ProgramLifecycle.TERMINAL
+    )
+    assert (
+        _explicit_completion_lifecycle({"vllm_xargs": {"agentinfer_expected_lifecycle": "continue"}})
+        is ProgramLifecycle.CONTINUE
+    )
+    assert _explicit_completion_lifecycle({"vllm_xargs": {}}) is ProgramLifecycle.UNKNOWN
+    assert (
+        _explicit_completion_lifecycle({"vllm_xargs": {"agentinfer_expected_lifecycle": "bad"}})
+        is ProgramLifecycle.UNKNOWN
     )
     assert (
         _response_lifecycle(
@@ -435,6 +452,64 @@ def test_middleware_delivers_terminal_program_signal_without_rewriting_response(
 
     assert outbound[-1]["body"] == json.dumps(response_payload).encode()
     assert receiver.receive() == (LifecycleSignal("program-1", ProgramLifecycle.TERMINAL),)
+    receiver.close()
+
+
+def test_completion_middleware_delivers_explicit_terminal_after_success(tmp_path, monkeypatch) -> None:
+    socket_path = tmp_path / "completion-lifecycle.sock"
+    receiver = UnixLifecycleReceiver(str(socket_path), 0)
+    monkeypatch.setenv(LIFECYCLE_SOCKET_ENV, str(socket_path))
+
+    async def app(scope, receive, send) -> None:
+        await receive()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"text/event-stream")],
+            }
+        )
+        await send({"type": "http.response.body", "body": b"data: [DONE]\n\n", "more_body": False})
+
+    middleware = AgentCacheLifecycleMiddleware(app)
+    request_payload = {
+        "model": "test",
+        "prompt": [1, 2, 3],
+        "vllm_xargs": {
+            "agentic_context": json.dumps(
+                {
+                    "program_id": "program-1",
+                    "task_id": "task",
+                    "agent_id": "lead",
+                    "request_id": "request-terminal",
+                }
+            ),
+            "agentinfer_expected_lifecycle": "terminal",
+        },
+    }
+    inbound = [
+        {
+            "type": "http.request",
+            "body": json.dumps(request_payload).encode(),
+            "more_body": False,
+        }
+    ]
+
+    async def receive() -> dict[str, object]:
+        return inbound.pop(0)
+
+    async def send(message: dict[str, object]) -> None:
+        return None
+
+    asyncio.run(
+        middleware(
+            {"type": "http", "method": "POST", "path": "/v1/completions", "headers": []},
+            receive,
+            send,
+        )
+    )
+
+    assert receiver.receive() == (LifecycleSignal("program-1", ProgramLifecycle.TERMINAL, "request-terminal"),)
     receiver.close()
 
 

@@ -1,0 +1,22 @@
+{
+  "name": "mori-public-causal-k5-tick5",
+  "mori": {
+    "window_size": 5,
+    "tick_seconds": 5.0,
+    "decode_buffer_tokens": 256
+  },
+  "causality": {
+    "future_return_reads": false,
+    "server_plan_reads": false,
+    "identity_source": "request_metadata",
+    "lifecycle_source": "api_completion_signal"
+  },
+  "gpu_eviction": {
+    "type_order": ["inactive", "idle", "busy"],
+    "native_ownership": true
+  },
+  "cpu_eviction": {
+    "type_order": ["inactive", "busy", "idle"],
+    "native_ownership": true
+  }
+}

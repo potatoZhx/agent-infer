@@ -96,6 +96,7 @@ def _parse_anthropic_replay_sampling(metadata: object) -> tuple[int, int, bool] 
 class ApiEndpoint(str, Enum):
     """Wire protocols whose response lifecycle semantics differ at the API boundary."""
 
+    OPENAI_COMPLETIONS = "openai_completions"
     OPENAI_CHAT_COMPLETIONS = "openai_chat_completions"
     ANTHROPIC_MESSAGES = "anthropic_messages"
 
@@ -106,6 +107,7 @@ class LifecycleSignal:
 
     program_id: str
     lifecycle: ProgramLifecycle
+    request_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.program_id:
@@ -143,7 +145,10 @@ class UnixLifecycleReceiver:
                 lifecycle = decoded.get("lifecycle")
                 if not isinstance(program_id, str) or not isinstance(lifecycle, str):
                     raise ValueError("lifecycle signal fields must be strings")
-                signals.append(LifecycleSignal(program_id, ProgramLifecycle(lifecycle)))
+                request_id = decoded.get("request_id")
+                if request_id is not None and not isinstance(request_id, str):
+                    raise ValueError("lifecycle signal request_id must be a string")
+                signals.append(LifecycleSignal(program_id, ProgramLifecycle(lifecycle), request_id))
             except (ValueError, RecursionError, UnicodeDecodeError) as exc:
                 logger.warning("Ignoring invalid AgentCache lifecycle signal: %s", exc)
         return tuple(signals)
@@ -171,10 +176,10 @@ class UnixLifecycleSender:
 
     def send(self, signal: LifecycleSignal, dp_rank: int | None) -> bool:
         """Best-effort delivery to one selected rank or every discoverable internal rank."""
-        payload = json.dumps(
-            {"program_id": signal.program_id, "lifecycle": signal.lifecycle.value},
-            separators=(",", ":"),
-        ).encode()
+        signal_payload = {"program_id": signal.program_id, "lifecycle": signal.lifecycle.value}
+        if signal.request_id is not None:
+            signal_payload["request_id"] = signal.request_id
+        payload = json.dumps(signal_payload, separators=(",", ":")).encode()
         if len(payload) > _MAX_SIGNAL_BYTES:
             raise ValueError("lifecycle signal exceeds datagram limit")
         targets = (
@@ -348,7 +353,11 @@ class AgentCacheIdentityMiddleware:
 
     async def __call__(self, scope: dict[str, object], receive: AsgiReceive, send: AsgiSend) -> None:
         endpoint = _endpoint_for_scope(scope)
-        if endpoint not in (ApiEndpoint.OPENAI_CHAT_COMPLETIONS, ApiEndpoint.ANTHROPIC_MESSAGES):
+        if endpoint not in (
+            ApiEndpoint.OPENAI_COMPLETIONS,
+            ApiEndpoint.OPENAI_CHAT_COMPLETIONS,
+            ApiEndpoint.ANTHROPIC_MESSAGES,
+        ):
             await self.app(scope, receive, send)
             return
         if endpoint is ApiEndpoint.ANTHROPIC_MESSAGES:
@@ -448,8 +457,8 @@ class AgentCacheLifecycleMiddleware:
         request_body: bytes | None,
         observer: _LifecycleResponseObserver,
     ) -> None:
-        lifecycle = observer.finish()
-        if request_body is None or lifecycle is ProgramLifecycle.UNKNOWN or not 200 <= observer.status_code < 300:
+        observed_lifecycle = observer.finish()
+        if request_body is None or not 200 <= observer.status_code < 300:
             return
         try:
             payload = json.loads(request_body)
@@ -458,6 +467,13 @@ class AgentCacheLifecycleMiddleware:
         if not isinstance(payload, dict):
             return
         request_payload = cast(JsonObject, payload)
+        lifecycle = (
+            _explicit_completion_lifecycle(request_payload)
+            if observer.endpoint is ApiEndpoint.OPENAI_COMPLETIONS
+            else observed_lifecycle
+        )
+        if lifecycle is ProgramLifecycle.UNKNOWN:
+            return
         headers = _request_headers(scope)
         metadata = parse_agent_identity(
             vllm_xargs=request_payload.get("vllm_xargs"),
@@ -471,7 +487,7 @@ class AgentCacheLifecycleMiddleware:
         except ValueError:
             logger.warning("AgentCache lifecycle signal has an invalid X-data-parallel-rank header")
             return
-        self.sender.send(LifecycleSignal(metadata.program_id, lifecycle), dp_rank)
+        self.sender.send(LifecycleSignal(metadata.program_id, lifecycle, metadata.request_id), dp_rank)
 
 
 class _LifecycleResponseObserver:
@@ -552,11 +568,26 @@ def _endpoint_for_scope(scope: Mapping[str, object]) -> ApiEndpoint | None:
     if scope.get("type") != "http" or scope.get("method") != "POST":
         return None
     path = scope.get("path")
+    if path in {"/v1/completions", "/completions"}:
+        return ApiEndpoint.OPENAI_COMPLETIONS
     if path in {"/v1/chat/completions", "/chat/completions"}:
         return ApiEndpoint.OPENAI_CHAT_COMPLETIONS
     if path in {"/v1/messages", "/messages"}:
         return ApiEndpoint.ANTHROPIC_MESSAGES
     return None
+
+
+def _explicit_completion_lifecycle(payload: Mapping[str, object]) -> ProgramLifecycle:
+    """Read Replay's optional lifecycle oracle from the existing scalar xargs channel."""
+    xargs = payload.get("vllm_xargs")
+    if not isinstance(xargs, Mapping):
+        return ProgramLifecycle.UNKNOWN
+    value = xargs.get("agentinfer_expected_lifecycle")
+    if value == "continue":
+        return ProgramLifecycle.CONTINUE
+    if value == "terminal":
+        return ProgramLifecycle.TERMINAL
+    return ProgramLifecycle.UNKNOWN
 
 
 def _request_headers(scope: Mapping[str, object]) -> dict[str, str]:

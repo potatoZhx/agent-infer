@@ -193,6 +193,21 @@ def test_agentx_zero_output_is_retained_and_planned_as_one_token(tmp_path: Path)
     assert plan.tasks[0].requests[-1].planned_output_tokens == 1
     assert plan.tasks[0].requests[-1].source_output_tokens == 0
     assert plan.tasks[0].requests[-1].response_validation == "exact_tokens"
+    assert [node.expected_lifecycle for node in plan.tasks[0].requests] == [
+        "continue",
+        "continue",
+        "continue",
+        "terminal",
+        "terminal",
+    ]
+    serialized = plan.tasks[0].to_dict()["requests"]
+    assert [node["expected_lifecycle"] for node in serialized] == [
+        "continue",
+        "continue",
+        "continue",
+        "terminal",
+        "terminal",
+    ]
 
 
 def test_agentx_execution_audits_original_zero_output_separately(tmp_path, monkeypatch) -> None:
@@ -403,10 +418,77 @@ def test_agentx_completions_wire_and_usage(
     assert "return_token_ids" not in body
     assert facts[0].actor_id == "child"
     identity = body["vllm_xargs"]["agentic_context"]  # type: ignore[index]
+    assert body["vllm_xargs"]["agentinfer_expected_lifecycle"] == "continue"  # type: ignore[index]
     if isinstance(identity, str):
         identity = json.loads(identity)
     assert identity["blocks_parent"] is False
     assert result.assistant_content == "reply"
+
+
+@pytest.mark.parametrize("malformed_usage", [False, True])
+def test_agentx_completions_only_recovers_malformed_text_event(tmp_path: Path, malformed_usage: bool) -> None:
+    source = tmp_path / "source.jsonl"
+    _source(source)
+    _, ir, analysis = _converted(source, tmp_path / "convert")
+    config = _config(source)
+    task = build_replay_plan(config, analysis, ir).tasks[0]
+    node = task.requests[2]
+
+    class FakeTokenizer:
+        async def text_token_ids(self, text: str) -> tuple[int, ...]:
+            return tuple(range(50, 100))
+
+    class Observer:
+        def __init__(self) -> None:
+            self.events: list[dict[str, object]] = []
+
+        def emit(self, event: dict[str, object]) -> None:
+            self.events.append(event)
+
+    async def send():
+        prompt = await PromptBuilder(config, FakeTokenizer(), ir).build(task, node, None)  # type: ignore[arg-type]
+        writer = RequestTraceWriter(tmp_path / "observed.jsonl")
+        await writer.start()
+        observer = Observer()
+        transport = ReplayTransport(config, "run", writer, observer=observer)
+        await transport.client.aclose()
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            malformed = (
+                'data: {"choices":[],"usage":{"prompt_tokens":128,"completion_tokens":\n\n'
+                if malformed_usage
+                else 'data: {"id":"completion","choices":[{"text":"unterminated}\n\n'
+            )
+            stream = malformed + (
+                'data: {"choices":[{"text":"reply"}]}\n\n'
+                + (
+                    ""
+                    if malformed_usage
+                    else 'data: {"choices":[],"usage":{"prompt_tokens":128,"completion_tokens":3}}\n\n'
+                )
+                + "data: [DONE]\n\n"
+            )
+            return httpx.Response(200, content=stream, headers={"content-type": "text/event-stream"})
+
+        transport.client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        try:
+            result = await transport.send(task, node, prompt)
+        finally:
+            await transport.close()
+            await writer.close()
+        return result, observer.events
+
+    result, events = asyncio.run(send())
+    facts = load_request_facts(tmp_path / "observed.jsonl")
+    assert result.success is not malformed_usage
+    assert facts[0].status == ("error" if malformed_usage else "success")
+    discarded = [event for event in events if event["event"] == "malformed_agentx_text_event_discarded"]
+    assert len(discarded) == (0 if malformed_usage else 1)
+    if malformed_usage:
+        assert result.error is not None and result.error.startswith("JSONDecodeError:")
+    else:
+        assert result.assistant_content == "reply"
+        assert discarded[0]["runtime_request_id"] == node.runtime_request_id
 
 
 @pytest.mark.parametrize("transport", ["auto", "completion_token_ids"])

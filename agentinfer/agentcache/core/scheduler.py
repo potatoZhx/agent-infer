@@ -85,7 +85,9 @@ class EmbeddedSchedulerController(Protocol[RetainedRequestT]):
     def on_request_completion(self, request_id: str, total_tokens: int) -> None:
         """Observe terminal request cleanup without success/failure semantics."""
 
-    def on_response_completion(self, program_id: str, lifecycle: ProgramLifecycle) -> bool:
+    def on_response_completion(
+        self, program_id: str, lifecycle: ProgramLifecycle, request_id: str | None = None
+    ) -> bool:
         """Apply an optional lifecycle fact observed after API tool parsing."""
 
     def cancel_request(self, request_id: str) -> RequestPoolEntry[RetainedRequestT] | None:
@@ -412,10 +414,11 @@ class _VllmAdmissionHooks:
         if self.lifecycle_receiver is None:
             return
         for signal in self.lifecycle_receiver.receive():
-            released = self.controller.on_response_completion(signal.program_id, signal.lifecycle)
+            released = self.controller.on_response_completion(signal.program_id, signal.lifecycle, signal.request_id)
             logger.info(
-                "AgentCache API lifecycle program=%s lifecycle=%s released=%s",
+                "AgentCache API lifecycle program=%s request=%s lifecycle=%s released=%s",
                 signal.program_id,
+                signal.request_id,
                 signal.lifecycle.value,
                 released,
             )

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass
@@ -21,6 +22,8 @@ from .config import ReplayBenchConfig
 from .observation import ReplayObserver, emit
 from .planner import ReplayPlan, ReplayPlanNode, ReplayTaskPlan
 from .prompt import SyntheticPrompt
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -172,7 +175,37 @@ class ReplayTransport:
                             continue
                         if not raw:
                             continue
-                        payload = json.loads(raw)
+                        try:
+                            payload = json.loads(raw)
+                        except json.JSONDecodeError as exc:
+                            # AgentX replays fixed prompt snapshots and never feed
+                            # generated text into a later request.  A malformed text
+                            # chunk is therefore recoverable, but usage/error events
+                            # are not: exact token accounting and [DONE] remain hard
+                            # success requirements below.
+                            if (
+                                self.config.replay.trace_type != "agentX"
+                                or '"choices"' not in raw
+                                or '"usage"' in raw
+                                or '"error"' in raw
+                            ):
+                                raise
+                            logger.warning(
+                                "Discarding malformed AgentX text stream event request_id=%s bytes=%d error=%s",
+                                node.runtime_request_id,
+                                len(raw),
+                                exc,
+                            )
+                            emit(
+                                self.observer,
+                                None,
+                                "malformed_agentx_text_event_discarded",
+                                task,
+                                node,
+                                bytes=len(raw),
+                                error=f"{type(exc).__name__}: {exc}",
+                            )
+                            continue
                         if not isinstance(payload, dict):
                             raise ValueError("Backend stream event must be an object")
                         if payload.get("error") or payload.get("type") == "error":
@@ -329,6 +362,9 @@ class ReplayTransport:
         if prompt.token_ids is not None:
             if len(prompt.token_ids) != node.planned_input_tokens:
                 raise ValueError("completion requires exact planned token IDs")
+            vllm_xargs = {"agentic_context": encode_agent_identity(identity)}
+            if node.expected_lifecycle is not None:
+                vllm_xargs["agentinfer_expected_lifecycle"] = node.expected_lifecycle
             body: dict[str, object] = {
                 "model": self.config.backend.model,
                 "prompt": list(prompt.token_ids),
@@ -339,7 +375,7 @@ class ReplayTransport:
                 "seed": node.backend_sampling_seed,
                 "stream": True,
                 "stream_options": {"include_usage": True},
-                "vllm_xargs": {"agentic_context": encode_agent_identity(identity)},
+                "vllm_xargs": vllm_xargs,
             }
             if self.config.replay.trace_type != "agentX":
                 body["return_token_ids"] = True

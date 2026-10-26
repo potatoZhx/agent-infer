@@ -53,6 +53,7 @@ class ReplayPlanNode:
     response_validation: Literal["exact_tokens"] | None = None
     source_prefix_tokens: int | None = None
     source_output_tokens: int | None = None
+    expected_lifecycle: Literal["continue", "terminal"] | None = None
 
     def to_dict(self) -> dict[str, object]:
         """Serialize only the materialized fields required to execute the node."""
@@ -91,6 +92,8 @@ class ReplayPlanNode:
                 value["effective_output_tokens"] = self.planned_output_tokens
         if self.source_prefix_tokens is not None:
             value["source_prefix_tokens"] = self.source_prefix_tokens
+        if self.expected_lifecycle is not None:
+            value["expected_lifecycle"] = self.expected_lifecycle
         return value
 
 
@@ -245,6 +248,9 @@ def _task_plan(
 ) -> ReplayTaskPlan:
     requests = _required_requests(sampled.source)
     token_targets = {request.key: (request.input_tokens, request.output_tokens) for request in requests}
+    last_agentx_request_by_actor = {
+        request.actor_id: request.key for request in requests if request.replay_kind == "request"
+    }
     nodes: list[ReplayPlanNode] = []
     for request in requests:
         context_after, context_mode = _context_plan(
@@ -300,6 +306,11 @@ def _task_plan(
                 source_prefix_tokens=(
                     request.source_cached_tokens if config.replay.prompt_shape == "tracelab_synthetic" else None
                 ),
+                expected_lifecycle=(
+                    "terminal" if last_agentx_request_by_actor.get(request.actor_id) == request.key else "continue"
+                )
+                if config.replay.trace_type == "agentX" and request.replay_kind == "request"
+                else None,
             )
         )
     return ReplayTaskPlan(

@@ -88,6 +88,8 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
         self.registry = ProgramRegistry()
         self._request_bindings: dict[str, _RequestBinding] = {}
         self._program_requests: dict[ProgramRef, set[str]] = {}
+        self._overlapped_completed_requests: dict[str, ProgramRef] = {}
+        self._pending_terminal_programs: set[ProgramRef] = set()
         self._last_request_finished_at: dict[ProgramRef, float] = {}
         self._shared_prefix_freshness_anchor_at: dict[ProgramRef, float] = {}
         self._event_sequence = 0
@@ -356,6 +358,8 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
         program = self.registry.get(binding.program)
         if program is None:
             return
+        if self._program_requests.get(binding.program):
+            self._overlapped_completed_requests[request_id] = binding.program
         now = time.monotonic()
         self._last_request_finished_at[binding.program] = now
         previous_status = self.registry.record_completion(binding.program, total_tokens=max(0, total_tokens))
@@ -415,6 +419,8 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
                 ),
             )
         )
+        if self._release_pending_terminal_if_idle(binding.program):
+            return
         if program.marked_for_pause and current_status is ProgramStatus.ACTING:
             self._apply_transition(TransitionRequest(TransitionKind.PAUSE, program.ref, "marked_pause_completion"))
         else:
@@ -425,7 +431,9 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
                 program.ref,
             )
 
-    def on_response_completion(self, program_id: str, lifecycle: ProgramLifecycle) -> bool:
+    def on_response_completion(
+        self, program_id: str, lifecycle: ProgramLifecycle, request_id: str | None = None
+    ) -> bool:
         """Apply an optional API-layer lifecycle fact after response semantic parsing.
 
         Terminal facts release only an idle exact generation. A late signal never interrupts a newer reasoning
@@ -439,10 +447,15 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
         Returns:
             Whether this call released a live Program generation.
         """
+        completed_ref = self._overlapped_completed_requests.pop(request_id, None) if request_id is not None else None
         if lifecycle is not ProgramLifecycle.TERMINAL:
             return False
         ref = self.registry.current_ref(program_id)
-        if ref is None or self._program_requests.get(ref):
+        if ref is None:
+            return False
+        if self._program_requests.get(ref):
+            if completed_ref == ref:
+                self._pending_terminal_programs.add(ref)
             return False
         program = self.registry.get(ref)
         if program is None or program.status is not ProgramStatus.ACTING:
@@ -477,6 +490,8 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
                             program.status,
                         )
                     )
+                if self._release_pending_terminal_if_idle(binding.program):
+                    return entry
                 if (
                     not self._program_requests.get(binding.program)
                     and program.state is ProgramState.PAUSED
@@ -486,6 +501,19 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
                         TransitionRequest(TransitionKind.RELEASE, program.ref, "cancelled_before_admission")
                     )
         return entry
+
+    def _release_pending_terminal_if_idle(self, ref: ProgramRef) -> bool:
+        """Commit a terminal fact once completion or cancellation drains the exact generation."""
+        if ref not in self._pending_terminal_programs or self._program_requests.get(ref):
+            return False
+        program = self.registry.get(ref)
+        if program is None or program.status is not ProgramStatus.ACTING:
+            return False
+        self._pending_terminal_programs.discard(ref)
+        result = self._apply_transition(TransitionRequest(TransitionKind.RELEASE, ref, "pending_api_terminal_response"))
+        if result.applied:
+            self._cycle_dirty = True
+        return result.applied
 
     def _apply_transition(self, request: TransitionRequest) -> TransitionResult:
         program = self.registry.get(request.program)
@@ -520,6 +548,10 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
             if self._program_requests.get(program.ref):
                 return TransitionResult(request.kind, request.program, False, "release_requires_idle")
             self.registry.release(program.ref)
+            self._pending_terminal_programs.discard(program.ref)
+            self._overlapped_completed_requests = {
+                request_id: ref for request_id, ref in self._overlapped_completed_requests.items() if ref != program.ref
+            }
             self._last_request_finished_at.pop(program.ref, None)
             self._shared_prefix_freshness_anchor_at.pop(program.ref, None)
         else:

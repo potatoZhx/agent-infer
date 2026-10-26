@@ -211,6 +211,47 @@ def test_late_api_terminal_completion_does_not_interrupt_new_reasoning() -> None
     assert scheduler.registry.require(ref).status is ProgramStatus.REASONING
 
 
+def test_overlapping_terminal_response_is_released_after_last_request_finishes() -> None:
+    components = build_progress_ttl_strategy(ProgressTTLConfig(decode_buffer_tokens=0))
+    components.initial_factors.global_factors.avg_input_token_growth_per_round = 0
+    scheduler = ProgramScheduler[str, object, object](
+        components.strategy,
+        components.initial_factors,
+        backend(1000),
+    )
+    metadata = AgentIdentity("p1")
+
+    assert scheduler.on_request_arrival("terminal", metadata, 100, backend(1000), "native-terminal") is True
+    assert scheduler.on_request_arrival("overlap", metadata, 120, backend(1000), "native-overlap") is True
+    scheduler.on_request_completion("terminal", 130)
+    assert scheduler.on_response_completion("p1", ProgramLifecycle.TERMINAL, request_id="terminal") is False
+    assert scheduler.registry.current_ref("p1") is not None
+
+    scheduler.on_request_completion("overlap", 150)
+
+    assert scheduler.registry.current_ref("p1") is None
+
+
+def test_overlapping_terminal_response_is_released_after_last_request_is_cancelled() -> None:
+    components = build_progress_ttl_strategy(ProgressTTLConfig(decode_buffer_tokens=0))
+    components.initial_factors.global_factors.avg_input_token_growth_per_round = 0
+    scheduler = ProgramScheduler[str, object, object](
+        components.strategy,
+        components.initial_factors,
+        backend(1000),
+    )
+    metadata = AgentIdentity("p1")
+
+    assert scheduler.on_request_arrival("terminal", metadata, 100, backend(1000), "native-terminal") is True
+    assert scheduler.on_request_arrival("overlap", metadata, 120, backend(1000), "native-overlap") is True
+    scheduler.on_request_completion("terminal", 130)
+    assert scheduler.on_response_completion("p1", ProgramLifecycle.TERMINAL, request_id="terminal") is False
+
+    scheduler.cancel_request("overlap")
+
+    assert scheduler.registry.current_ref("p1") is None
+
+
 def test_scheduler_throttles_periodic_work_but_preserves_due_deadlines() -> None:
     components = build_progress_ttl_strategy(
         ProgressTTLConfig(
