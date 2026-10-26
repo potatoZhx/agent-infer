@@ -1,0 +1,68 @@
+{
+  "schema": "agentinfer_mori_validation_receipt_v1",
+  "date": "2026-10-26",
+  "source_commit": "83ee3205710d24fa4ec6ea23afa64ef936d78c63",
+  "branch": "codex/mori-formal",
+  "repository": "https://github.com/potatoZhx/agent-infer.git",
+  "checks": [
+    {
+      "name": "focused_mori_tests",
+      "command": "pytest -q tests/scheduling/test_mori_strategy.py tests/scheduling/test_mori_runtime.py tests/agentcache/test_mori_typed_lru.py tests/agentcache/test_mori_cpu_policy.py tests/agentcache/core/test_mori_controller.py tests/agentcache/core/test_mori_vllm_adapter.py",
+      "result": "passed",
+      "passed": 27,
+      "warnings": 16
+    },
+    {
+      "name": "scheduling_and_agentcache_tests",
+      "command": "pytest -q tests/scheduling tests/agentcache --ignore=tests/agentcache/core/test_vllm_api_adapter.py --ignore=tests/agentcache/entrypoints/test_serve_flag_e2e.py",
+      "result": "passed",
+      "passed": 302,
+      "warnings": 16
+    },
+    {
+      "name": "pre_commit_changed_files",
+      "command": "pre-commit run --files $(git diff --cached --name-only)",
+      "result": "passed",
+      "hooks": [
+        "ruff check",
+        "ruff format",
+        "typos",
+        "markdownlint-cli2",
+        "Suggestion"
+      ]
+    },
+    {
+      "name": "vllm_0_31_hbm_patch",
+      "result": "passed",
+      "checks": [
+        "git apply --check on a fresh vLLM 0.31 source copy",
+        "patched modules py_compile",
+        "ruff check --ignore B905",
+        "patched BlockPool provider smoke"
+      ]
+    },
+    {
+      "name": "vllm_0_31_cpu_policy",
+      "result": "passed",
+      "checks": [
+        "direct CachePolicy contract smoke",
+        "external CPUOffloadingManager factory load"
+      ]
+    }
+  ],
+  "benchmark_artifact": "mori-typed-lru-benchmark-20261026.json",
+  "not_run": [
+    {
+      "scope": "tests/agentcache/core/test_vllm_api_adapter.py",
+      "reason": "installed AnthropicServingMessages lacks _convert_anthropic_to_openai_request"
+    },
+    {
+      "scope": "tests/agentcache/entrypoints/test_serve_flag_e2e.py",
+      "reason": "host /usr/local/bin/vllm is not the repository delegating CLI and rejects --agentinfer; host plugins also report deep_ep ABI and vllm_omni API mismatches"
+    },
+    {
+      "scope": "1290-request end-to-end CPU simulator and real GPU serve",
+      "reason": "the requested fast gate used the bounded trace-calibrated controlled experiment; no new makespan or JCT claim is made"
+    }
+  ]
+}
