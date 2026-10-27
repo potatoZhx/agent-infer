@@ -50,10 +50,6 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         return True
 
     @property
-    def allows_overlapping_program_requests(self) -> bool:
-        return False
-
-    @property
     def observes_streaming_context_growth(self) -> bool:
         """Account for generated tokens when repairing MORI reservations."""
         return True
@@ -342,7 +338,6 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         sidecar = self._factor(strategy_factors, event.program)
         latency = self._event_non_negative_float(event.field("request_latency_seconds"))
         scheduler_wait = self._event_non_negative_float(event.field("scheduler_queue_seconds"))
-        reasoning = max(0.0, latency - scheduler_wait)
         prompt_tokens = self._event_non_negative_int(event.field("prompt_tokens"))
         prefix_hit_tokens = min(
             prompt_tokens,
@@ -361,14 +356,20 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         self.counters["cache_prefix_hit_tokens"] += prefix_hit_tokens
         self.counters["cache_hbm_hit_tokens"] += hbm_hit_tokens
         self.counters["cache_hbm_ref_zero_hit_tokens"] += hbm_ref_zero_hit_tokens
-        acting_started = event.occurred_at_monotonic_s if event.current_status is ProgramStatus.ACTING else None
+        reasoning_finished = event.current_status is ProgramStatus.ACTING
+        reasoning = sidecar.pending_reasoning_seconds
+        if reasoning_finished:
+            reasoning = (
+                max(0.0, event.occurred_at_monotonic_s - sidecar.reasoning_started_at_monotonic_s)
+                if sidecar.reasoning_started_at_monotonic_s is not None
+                else max(0.0, latency - scheduler_wait)
+            )
+        acting_started = event.occurred_at_monotonic_s if reasoning_finished else sidecar.acting_started_at_monotonic_s
         updated = replace(
             sidecar,
             pending_reasoning_seconds=reasoning,
             acting_started_at_monotonic_s=acting_started,
-            reasoning_started_at_monotonic_s=None
-            if acting_started is not None
-            else sidecar.reasoning_started_at_monotonic_s,
+            reasoning_started_at_monotonic_s=(None if reasoning_finished else sidecar.reasoning_started_at_monotonic_s),
         )
         self._set_factor(
             strategy_factors,

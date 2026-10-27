@@ -251,6 +251,59 @@ def test_completion_accumulates_cache_hit_report_from_server_observations() -> N
     assert report["cache_hbm_hit_ratio"] == pytest.approx(0.625)
 
 
+def test_overlapping_completions_end_reasoning_only_after_the_last_request() -> None:
+    components = build_mori_strategy(MORIConfig(mode=MORIMode.PLACEMENT_ONLY))
+    program = view("program", state=ProgramState.ACTIVE, status=ProgramStatus.REASONING, tokens=400)
+    set_tier(components, program, MORITier.GPU)
+    started = SchedulingEvent(
+        event_id="started",
+        sequence=1,
+        kind=SchedulingEventKind.PROGRAM_STATUS_CHANGED,
+        occurred_at_monotonic_s=10.0,
+        reason="request_started",
+        program=program.ref,
+        current_state=ProgramState.ACTIVE,
+        current_status=ProgramStatus.REASONING,
+    )
+    first_finished = SchedulingEvent(
+        event_id="first-finished",
+        sequence=2,
+        kind=SchedulingEventKind.REQUEST_FINISHED,
+        occurred_at_monotonic_s=12.0,
+        reason="request_completed",
+        program=program.ref,
+        current_state=ProgramState.ACTIVE,
+        current_status=ProgramStatus.REASONING,
+        fields=(("request_latency_seconds", 2.0), ("scheduler_queue_seconds", 0.0)),
+    )
+    last_finished = SchedulingEvent(
+        event_id="last-finished",
+        sequence=3,
+        kind=SchedulingEventKind.REQUEST_FINISHED,
+        occurred_at_monotonic_s=15.0,
+        reason="request_completed",
+        program=program.ref,
+        current_state=ProgramState.ACTIVE,
+        current_status=ProgramStatus.ACTING,
+        fields=(("request_latency_seconds", 4.0), ("scheduler_queue_seconds", 0.0)),
+    )
+
+    components.strategy.handle_scheduling_event(components.initial_factors, started)
+    components.strategy.handle_scheduling_event(components.initial_factors, first_finished)
+    during_overlap = components.initial_factors.for_program(program.ref)
+    assert during_overlap is not None
+    assert during_overlap.pending_reasoning_seconds == 0.0
+    assert during_overlap.reasoning_started_at_monotonic_s == 10.0
+    assert during_overlap.acting_started_at_monotonic_s is None
+
+    components.strategy.handle_scheduling_event(components.initial_factors, last_finished)
+    completed = components.initial_factors.for_program(program.ref)
+    assert completed is not None
+    assert completed.pending_reasoning_seconds == 5.0
+    assert completed.reasoning_started_at_monotonic_s is None
+    assert completed.acting_started_at_monotonic_s == 15.0
+
+
 @pytest.mark.parametrize("tier,steps", [(MORITier.CPU, 1), (MORITier.WAITING, 1), (MORITier.WAITING, 0)])
 def test_overdue_waiter_precedes_each_normal_promotion_group(tier, steps) -> None:
     components = build_mori_strategy()

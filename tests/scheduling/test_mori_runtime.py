@@ -9,8 +9,9 @@ from unittest.mock import patch
 import pytest
 
 from agentinfer.scheduling.backend import BackendInfo, BackendPoolInfo, DpRankInfo
-from agentinfer.scheduling.domain import TokenObservationSource
+from agentinfer.scheduling.domain import ProgramStatus, TokenObservationSource
 from agentinfer.scheduling.identity import AgentIdentity
+from agentinfer.scheduling.lifecycle import ProgramLifecycle
 from agentinfer.scheduling.mori import MORIConfig, MORIMode, build_mori_strategy
 from agentinfer.scheduling.runtime import ProgramScheduler
 
@@ -67,36 +68,28 @@ def test_server_observed_stream_and_final_usage_replace_prompt_estimate() -> Non
     assert completed.source is TokenObservationSource.BACKEND_USAGE
 
 
-def test_same_program_cannot_overlap_but_subagent_is_a_distinct_program() -> None:
+def test_same_program_requests_overlap_and_act_only_after_the_last_completion() -> None:
     runtime = scheduler()
     lead = AgentIdentity("task:lead", task_id="task", agent_id="lead", agent_role="lead")
-    child = AgentIdentity(
-        "task:child",
-        task_id="task",
-        agent_id="child",
-        agent_role="subagent",
-        parent_program_id="task:lead",
-        blocks_parent=True,
-    )
 
     assert runtime.on_request_arrival("lead-1", lead, 100, backend(), "lead") is True
-    with pytest.raises(ValueError, match="forbids overlapping requests"):
-        runtime.on_request_arrival(
-            "lead-2",
-            AgentIdentity("task:lead", expected_resume=False),
-            100,
-            backend(),
-            "duplicate",
-        )
-    assert runtime.on_request_arrival("child-1", child, 100, backend(), "child") is True
+    assert runtime.on_request_arrival("lead-2", lead, 120, backend(), "overlap") is True
 
     lead_ref = runtime.program_ref_for_request("lead-1")
-    child_ref = runtime.program_ref_for_request("child-1")
-    assert lead_ref is not None and child_ref is not None
-    assert lead_ref != child_ref
-    assert lead_ref.program_id == "task:lead"
-    assert child_ref.program_id == "task:child"
-    assert runtime.registry.require(lead_ref).expected_resume is True
+    assert lead_ref is not None
+    assert runtime.program_ref_for_request("lead-2") == lead_ref
+    assert runtime.registry.require(lead_ref).status is ProgramStatus.REASONING
+
+    runtime.on_request_completion("lead-2", 140)
+    assert runtime.program_ref_for_request("lead-1") == lead_ref
+    assert runtime.program_ref_for_request("lead-2") is None
+    assert runtime.registry.require(lead_ref).status is ProgramStatus.REASONING
+    assert runtime.on_response_completion("task:lead", ProgramLifecycle.TERMINAL) is False
+    assert runtime.registry.current_ref("task:lead") == lead_ref
+
+    runtime.on_request_completion("lead-1", 130)
+    assert runtime.program_ref_for_request("lead-1") is None
+    assert runtime.registry.require(lead_ref).status is ProgramStatus.ACTING
 
 
 @pytest.mark.parametrize("resident_finished", [True, False])

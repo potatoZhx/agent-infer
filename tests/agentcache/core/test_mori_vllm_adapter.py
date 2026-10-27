@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
@@ -20,7 +20,7 @@ from agentinfer.agentcache.core.scheduler import (
 )
 from agentinfer.agentcache.mori.runtime_state import MORI_RUNTIME_STATE
 from agentinfer.agentcache.mori.vllm_adapter import install_vllm_mori, observe_vllm_offload
-from agentinfer.scheduling import ProgramRef
+from agentinfer.scheduling import ProgramRef, ProgramStatus
 from agentinfer.scheduling.mori import MORIConfig, MORIMode, build_mori_strategy
 
 pytestmark = pytest.mark.cpu_test
@@ -277,7 +277,7 @@ def test_full_adapter_cleans_process_state_when_native_unregister_fails() -> Non
 
 
 @pytest.mark.parametrize("bridge_type", [AgentCacheSyncSchedulerBridge, AgentCacheAsyncSchedulerBridge])
-@pytest.mark.parametrize("invalid", ["missing", "malformed", "overlap"])
+@pytest.mark.parametrize("invalid", ["missing", "malformed"])
 def test_mori_rejects_only_invalid_request_and_delivers_terminal_output(bridge_type, invalid) -> None:
     config = SimpleNamespace(
         scheduler_config=SimpleNamespace(async_scheduling=bridge_type is AgentCacheAsyncSchedulerBridge),
@@ -306,9 +306,7 @@ def test_mori_rejects_only_invalid_request_and_delivers_terminal_output(bridge_t
 
     identity = {"agentic_context": {"program_id": "program"}}
     good = request("good", identity)
-    bad = request(
-        "bad", None if invalid == "missing" else {"agentic_context": "{"} if invalid == "malformed" else identity
-    )
+    bad = request("bad", None if invalid == "missing" else {"agentic_context": "{"})
     with (
         patch.object(Scheduler, "__init__", initialize),
         patch.object(AsyncScheduler, "__init__", initialize),
@@ -319,10 +317,6 @@ def test_mori_rejects_only_invalid_request_and_delivers_terminal_output(bridge_t
         patch.object(AsyncScheduler, "update_from_output", side_effect=[{}, {}]),
     ):
         bridge = bridge_type(config, SimpleNamespace(num_blocks=100), object(), 16, 16)
-        if invalid == "overlap":
-            bridge.add_request(good)
-            binding = MORI_RUNTIME_STATE.program_for_request("good")
-            assert binding is not None
         bridge.add_request(bad)
         assert bad.status is RequestStatus.FINISHED_ERROR
         assert "bad" not in bridge.requests
@@ -335,15 +329,70 @@ def test_mori_rejects_only_invalid_request_and_delivers_terminal_output(bridge_t
         assert outputs[7].finished_requests == {"bad"}
         assert bridge.update_from_output(SimpleNamespace(), SimpleNamespace(req_ids=[])) == {}
         assert bridge._agentcache._rejected_requests == []
-        if invalid == "overlap":
-            assert MORI_RUNTIME_STATE.program_for_request("good") == binding
-        else:
-            bridge.add_request(good)
+        bridge.add_request(good)
         assert bridge.requests["good"] is good
         terminal = {7: EngineCoreOutputs(outputs=[EngineCoreOutput("good", [], finish_reason=FinishReason.STOP)])}
         bridge._agentcache.after_output(bridge, terminal, {})
         assert MORI_RUNTIME_STATE.program_for_request("good") is None
         assert bridge._agentcache.controller.program_ref_for_request("good") is None
+        bridge._agentcache.close()
+
+
+@pytest.mark.parametrize("bridge_type", [AgentCacheSyncSchedulerBridge, AgentCacheAsyncSchedulerBridge])
+def test_mori_bridge_accepts_overlapping_requests_for_one_program(bridge_type) -> None:
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(async_scheduling=bridge_type is AgentCacheAsyncSchedulerBridge),
+        parallel_config=SimpleNamespace(data_parallel_index=0),
+        additional_config={"agentcache": {"strategy": "mori", "mori": {"mode": "placement_only"}}},
+    )
+
+    def initialize(owner, *args, **kwargs):
+        owner.requests = {}
+        owner.kv_cache_manager = None
+
+    def native_add(owner, request):
+        owner.requests[request.request_id] = request
+
+    def request(name):
+        return SimpleNamespace(
+            request_id=name,
+            client_index=7,
+            num_prompt_tokens=100,
+            num_tokens=100,
+            num_output_tokens=0,
+            sampling_params=SimpleNamespace(extra_args={"agentic_context": {"program_id": "program"}}),
+            trace_headers={},
+            events=[],
+        )
+
+    with (
+        patch.object(Scheduler, "__init__", initialize),
+        patch.object(AsyncScheduler, "__init__", initialize),
+        patch.object(Scheduler, "add_request", native_add),
+    ):
+        bridge = bridge_type(config, SimpleNamespace(num_blocks=100), object(), 16, 16)
+        first = request("first")
+        second = request("second")
+        bridge.add_request(first)
+        bridge.add_request(second)
+
+        first_ref = MORI_RUNTIME_STATE.program_for_request("first")
+        assert first_ref is not None
+        assert MORI_RUNTIME_STATE.program_for_request("second") == first_ref
+        assert bridge.requests == {"first": first, "second": second}
+
+        first_output = {7: EngineCoreOutputs(outputs=[EngineCoreOutput("first", [], finish_reason=FinishReason.STOP)])}
+        bridge._agentcache.after_output(bridge, first_output, {})
+        assert MORI_RUNTIME_STATE.program_for_request("first") is None
+        assert MORI_RUNTIME_STATE.program_for_request("second") == first_ref
+        assert bridge._agentcache.controller.registry.require(first_ref).status is ProgramStatus.REASONING
+
+        second_output = {
+            7: EngineCoreOutputs(outputs=[EngineCoreOutput("second", [], finish_reason=FinishReason.STOP)])
+        }
+        bridge._agentcache.after_output(bridge, second_output, {})
+        assert MORI_RUNTIME_STATE.program_for_request("second") is None
+        assert bridge._agentcache.controller.registry.require(first_ref).status is ProgramStatus.ACTING
         bridge._agentcache.close()
 
 
@@ -397,3 +446,53 @@ def test_retained_abort_uses_host_contract_and_releases_program_binding(monkeypa
     assert hooks.controller.program_ref_for_request("retained") is None
     assert MORI_RUNTIME_STATE.program_for_request("retained") is None
     hooks.close()
+
+
+@pytest.mark.parametrize(
+    "cache_hit",
+    [((), 96), ((), 96, 0), ((), 96, 32)],
+    ids=["legacy-pair", "v031-triple", "v031-uncached-prefix"],
+)
+def test_retained_prefix_observation_accepts_vllm_cache_hit_results(cache_hit) -> None:
+    """Both interfaces report the hit length independently of the uncached prefix."""
+    request = SimpleNamespace(request_id="retained", block_hashes=[], num_tokens=129)
+    controller = SimpleNamespace(
+        prefix_cache_candidates=lambda: (("retained", request),),
+        on_prefix_cache_observation=Mock(),
+    )
+    lookup = Mock(return_value=cache_hit)
+    coordinator = SimpleNamespace(find_longest_cache_hit=lookup)
+    owner = SimpleNamespace(
+        kv_cache_manager=SimpleNamespace(coordinator=coordinator, prefix_cache_lookup_enabled=lambda candidate: True)
+    )
+    hooks = object.__new__(_VllmAdmissionHooks)
+    hooks.controller = controller
+
+    with patch("agentinfer.agentcache.core.scheduler.logger.warning") as warning:
+        hooks._observe_retained_prefix_cache(owner)
+
+    lookup.assert_called_once_with(request.block_hashes, 128)
+    controller.on_prefix_cache_observation.assert_called_once_with("retained", 96)
+    warning.assert_not_called()
+
+
+@pytest.mark.parametrize("cache_hit", [(), ((),)])
+def test_retained_prefix_observation_continues_after_incomplete_cache_hit(cache_hit) -> None:
+    """An incomplete result must not prevent observing subsequent retained requests."""
+    request = SimpleNamespace(block_hashes=[], num_tokens=129)
+    controller = SimpleNamespace(
+        prefix_cache_candidates=lambda: (("invalid", request), ("valid", request)),
+        on_prefix_cache_observation=Mock(),
+    )
+    lookup = Mock(side_effect=[cache_hit, ((), 96, 0)])
+    owner = SimpleNamespace(
+        kv_cache_manager=SimpleNamespace(coordinator=SimpleNamespace(find_longest_cache_hit=lookup))
+    )
+    hooks = object.__new__(_VllmAdmissionHooks)
+    hooks.controller = controller
+
+    with patch("agentinfer.agentcache.core.scheduler.logger.warning") as warning:
+        hooks._observe_retained_prefix_cache(owner)
+
+    controller.on_prefix_cache_observation.assert_called_once_with("valid", 96)
+    warning.assert_called_once_with("AgentInfer prefix-cache observation failed request=%s", "invalid", exc_info=True)

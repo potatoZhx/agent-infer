@@ -275,11 +275,14 @@ class _VllmAdmissionHooks:
                 self.controller.on_prefix_cache_observation(request_id, 0)
                 continue
             try:
-                _, cached_prefix_tokens = find_longest_cache_hit(
+                cache_hit = find_longest_cache_hit(
                     request.block_hashes,
                     max(0, int(request.num_tokens) - 1),
                 )
-            except (AttributeError, TypeError, ValueError):
+                # Hit length is the second item in both the legacy pair and
+                # vLLM 0.31's triple (whose third item is an uncached prefix).
+                cached_prefix_tokens = cache_hit[1]
+            except (AttributeError, IndexError, TypeError, ValueError):
                 logger.warning("AgentInfer prefix-cache observation failed request=%s", request_id, exc_info=True)
                 continue
             self.controller.on_prefix_cache_observation(request_id, max(0, int(cached_prefix_tokens)))
