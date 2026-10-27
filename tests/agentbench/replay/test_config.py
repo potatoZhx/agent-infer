@@ -21,6 +21,7 @@ def test_replay_config_resolves_paths(
     config_path.write_text(
         """
 experiment:
+  task_num: 1
   result_dir: ../results
 replay:
   trace_path: ../source.jsonl
@@ -37,12 +38,14 @@ replay:
 def test_tokenizer_url_follows_backend_until_explicitly_overridden() -> None:
     defaulted = ReplayBenchConfig.model_validate(
         {
+            "experiment": {"task_num": 1},
             "backend": {"base_url": "http://backend"},
             "replay": {"trace_path": "source.jsonl"},
         }
     )
     explicit = ReplayBenchConfig.model_validate(
         {
+            "experiment": {"task_num": 1},
             "backend": {
                 "base_url": "http://backend",
                 "tokenizer_base_url": "http://tokenizer",
@@ -58,6 +61,7 @@ def test_tokenizer_url_follows_backend_until_explicitly_overridden() -> None:
 def test_backend_accepts_chat_template_kwargs() -> None:
     config = ReplayBenchConfig.model_validate(
         {
+            "experiment": {"task_num": 1},
             "backend": {
                 "chat_template_kwargs": {
                     "enable_thinking": False,
@@ -75,10 +79,13 @@ def test_backend_accepts_chat_template_kwargs() -> None:
 
 
 def test_replay_sample_yaml_loads() -> None:
-    config = load_replay_config(Path("agentinfer/agentbench/configs/replay_benchmark.yaml"))
+    config = load_replay_config(
+        Path("agentinfer/agentbench/configs/replay_benchmark.yaml"),
+        overrides={"experiment": {"task_num": 8}},
+    )
 
     assert config.backend.endpoint == "/v1/messages"
-    assert config.replay.trace_path.name == "requests.jsonl"
+    assert config.replay.trace_path is None
     assert config.replay.trace_type == "agentinfer"
     assert config.replay.trace_same_agent_gap_scale == 1.0
     assert config.replay.trace_same_agent_gap_offset_seconds == 0.0
@@ -121,7 +128,10 @@ def test_builtin_replay_config_accepts_cli_trace_path(trace_type: str, filename:
     path = builtin_replay_config_path(trace_type)  # type: ignore[arg-type]
     source = tmp_path / "source.jsonl"
 
-    config = load_replay_config(path, overrides={"replay": {"trace_path": source}})
+    config = load_replay_config(
+        path,
+        overrides={"experiment": {"task_num": 1}, "replay": {"trace_path": source}},
+    )
 
     assert path.name == filename
     assert config.replay.trace_type == trace_type
@@ -132,6 +142,7 @@ def test_replay_rejects_obsolete_router_config() -> None:
     with pytest.raises(ValidationError, match="router"):
         ReplayBenchConfig.model_validate(
             {
+                "experiment": {"task_num": 1},
                 "replay": {"trace_path": "source.jsonl"},
                 "router": {"enabled": False},
             }
@@ -139,7 +150,7 @@ def test_replay_rejects_obsolete_router_config() -> None:
 
 
 def test_replay_defaults_to_agentinfer_shape() -> None:
-    config = ReplayBenchConfig.model_validate({"replay": {"trace_path": "source.jsonl"}})
+    config = ReplayBenchConfig.model_validate({"experiment": {"task_num": 1}, "replay": {"trace_path": "source.jsonl"}})
 
     assert config.replay.prompt_shape == "agentinfer_synthetic"
 
@@ -155,12 +166,22 @@ def test_tracelab_allows_null_trace_path_when_task_num_is_set() -> None:
     assert config.replay.trace_path is None
 
 
-def test_null_trace_path_requires_tracelab_and_task_num() -> None:
-    with pytest.raises(ValidationError, match="trace_path may be null only when trace_type=tracelab"):
-        ReplayBenchConfig.model_validate({"replay": {"trace_type": "agentinfer", "trace_path": None}})
+@pytest.mark.parametrize("trace_type", ["agentinfer", "inferact_codex_swebenchpro", "tracelab"])
+def test_supported_trace_types_allow_null_trace_path(trace_type: str) -> None:
+    replay: dict[str, object] = {"trace_type": trace_type, "trace_path": None}
+    if trace_type == "inferact_codex_swebenchpro":
+        replay.update(
+            interval_mode="lognormal",
+            interval_lognormal={"p50_seconds": 2, "p95_seconds": 30, "p99_seconds": 90},
+        )
+    config = ReplayBenchConfig.model_validate({"experiment": {"task_num": 8}, "replay": replay})
+    assert config.replay.trace_path is None
 
-    with pytest.raises(ValidationError, match="automatic dataset download requires experiment.task_num"):
-        ReplayBenchConfig.model_validate({"replay": {"trace_type": "tracelab", "trace_path": None}})
+
+@pytest.mark.parametrize("experiment", [{}, {"task_num": None}, {"task_num": 0}, {"task_num": -1}])
+def test_replay_requires_positive_task_num(experiment: dict[str, object]) -> None:
+    with pytest.raises(ValidationError, match="task_num"):
+        ReplayBenchConfig.model_validate({"experiment": experiment, "replay": {"trace_path": "source.jsonl"}})
 
 
 @pytest.mark.parametrize(
@@ -169,13 +190,18 @@ def test_null_trace_path_requires_tracelab_and_task_num() -> None:
         ("inferact_codex_swebenchpro", "inferact_synthetic"),
         ("agentinfer", "agentinfer_synthetic"),
         ("tracelab", "tracelab_synthetic"),
-        ("agentX", "agentX_synthetic"),
+        ("agentX", "agentX_snapshot"),
     ],
 )
 def test_replay_yaml_derives_prompt_shape_and_round_trips(tmp_path: Path, trace_type: str, shape: str) -> None:
     config_path = tmp_path / "replay.yaml"
+    endpoint = "/v1/completions" if trace_type == "agentX" else "/v1/chat/completions"
     config_path.write_text(
         f"""
+experiment:
+  task_num: 1
+backend:
+  endpoint: {endpoint}
 replay:
   trace_type: {trace_type}
   trace_path: source.json
@@ -201,7 +227,10 @@ replay:
 @pytest.mark.parametrize("shape", ["agentinfer_synthetic", "inferact_synthetic", "trace_record", "legacy"])
 def test_replay_rejects_explicit_prompt_shape(tmp_path: Path, shape: str) -> None:
     config_path = tmp_path / "replay.yaml"
-    config_path.write_text(f"replay:\n  trace_path: source.jsonl\n  prompt_shape: {shape}\n", encoding="utf-8")
+    config_path.write_text(
+        f"experiment:\n  task_num: 1\nreplay:\n  trace_path: source.jsonl\n  prompt_shape: {shape}\n",
+        encoding="utf-8",
+    )
 
     with pytest.raises(ValidationError) as exc_info:
         load_replay_config(config_path)
@@ -213,7 +242,10 @@ def test_replay_rejects_explicit_prompt_shape(tmp_path: Path, shape: str) -> Non
 def test_inferact_still_requires_lognormal_intervals() -> None:
     with pytest.raises(ValidationError, match="requires interval_mode=lognormal"):
         ReplayBenchConfig.model_validate(
-            {"replay": {"trace_type": "inferact_codex_swebenchpro", "trace_path": "source.json"}}
+            {
+                "experiment": {"task_num": 1},
+                "replay": {"trace_type": "inferact_codex_swebenchpro", "trace_path": "source.json"},
+            }
         )
 
 
@@ -221,24 +253,33 @@ def test_lognormal_requires_three_quantile_anchors() -> None:
     with pytest.raises(ValidationError, match="requires interval_lognormal anchors"):
         ReplayBenchConfig.model_validate(
             {
+                "experiment": {"task_num": 1},
                 "replay": {
                     "trace_path": "source.jsonl",
                     "interval_mode": "lognormal",
-                }
+                },
             }
         )
 
 
 def test_removed_timing_mode_is_rejected() -> None:
     with pytest.raises(ValidationError, match="timing_mode"):
-        ReplayBenchConfig.model_validate({"replay": {"trace_path": "source.jsonl", "timing_mode": "closed_loop"}})
+        ReplayBenchConfig.model_validate(
+            {
+                "experiment": {"task_num": 1},
+                "replay": {"trace_path": "source.jsonl", "timing_mode": "closed_loop"},
+            }
+        )
 
 
 @pytest.mark.parametrize("field", ["max_input_tokens", "max_output_tokens"])
 @pytest.mark.parametrize("value", ["null", "1024"])
 def test_removed_token_caps_are_rejected(tmp_path: Path, field: str, value: str) -> None:
     config_path = tmp_path / "replay.yaml"
-    config_path.write_text(f"replay:\n  trace_path: source.jsonl\n  {field}: {value}\n", encoding="utf-8")
+    config_path.write_text(
+        f"experiment:\n  task_num: 1\nreplay:\n  trace_path: source.jsonl\n  {field}: {value}\n",
+        encoding="utf-8",
+    )
 
     with pytest.raises(ValidationError) as exc_info:
         load_replay_config(config_path)
@@ -251,10 +292,11 @@ def test_trace_mode_rejects_unused_lognormal_anchors() -> None:
     with pytest.raises(ValidationError, match="anchors require interval_mode=lognormal"):
         ReplayBenchConfig.model_validate(
             {
+                "experiment": {"task_num": 1},
                 "replay": {
                     "trace_path": "source.jsonl",
                     "interval_lognormal": {"p50_seconds": 2, "p95_seconds": 30, "p99_seconds": 90},
-                }
+                },
             }
         )
 
@@ -262,11 +304,17 @@ def test_trace_mode_rejects_unused_lognormal_anchors() -> None:
 @pytest.mark.parametrize("enabled", [False, True])
 def test_removed_cache_control_option_is_rejected(enabled: bool) -> None:
     with pytest.raises(ValidationError, match="enable_cache_control"):
-        ReplayBenchConfig.model_validate({"replay": {"trace_path": "source.jsonl", "enable_cache_control": enabled}})
+        ReplayBenchConfig.model_validate(
+            {
+                "experiment": {"task_num": 1},
+                "replay": {"trace_path": "source.jsonl", "enable_cache_control": enabled},
+            }
+        )
 
 
 def test_inferact_requires_chat_completions_endpoint() -> None:
     payload = {
+        "experiment": {"task_num": 1},
         "backend": {"endpoint": "/v1/messages"},
         "replay": {
             "trace_type": "inferact_codex_swebenchpro",
@@ -293,29 +341,40 @@ def test_inferact_rejects_nonzero_tolerance_instead_of_normalizing(tolerance) ->
         with pytest.raises(
             ValidationError, match="inferact_codex_swebenchpro requires prompt_calibration_tolerance_tokens=0"
         ):
-            ReplayBenchConfig.model_validate({"replay": replay})
+            ReplayBenchConfig.model_validate({"experiment": {"task_num": 1}, "replay": replay})
         assert replay["prompt_calibration_tolerance_tokens"] == tolerance
         synthetic = ReplayBenchConfig.model_validate(
-            {"replay": {"trace_path": "source.jsonl", "prompt_calibration_tolerance_tokens": tolerance}}
+            {
+                "experiment": {"task_num": 1},
+                "replay": {"trace_path": "source.jsonl", "prompt_calibration_tolerance_tokens": tolerance},
+            }
         )
         assert synthetic.replay.prompt_calibration_tolerance_tokens == tolerance
     else:
-        assert ReplayBenchConfig.model_validate({"replay": replay}).replay.prompt_calibration_tolerance_tokens == 0
+        assert (
+            ReplayBenchConfig.model_validate(
+                {"experiment": {"task_num": 1}, "replay": replay}
+            ).replay.prompt_calibration_tolerance_tokens
+            == 0
+        )
 
 
-def test_tracelab_requires_exact_calibration_and_chat_endpoint() -> None:
+@pytest.mark.parametrize("transport", ["auto", "completion_token_ids"])
+def test_tracelab_requires_exact_calibration_and_chat_endpoint(transport: str) -> None:
     valid = {
+        "experiment": {"task_num": 1},
         "backend": {"endpoint": "/v1/chat/completions"},
         "replay": {
             "trace_type": "tracelab",
             "trace_path": "rounds.jsonl",
+            "prompt_transport": transport,
             "prompt_calibration_tolerance_tokens": 0,
         },
     }
     assert ReplayBenchConfig.model_validate(valid).replay.trace_type == "tracelab"
 
     for section, field, value, message in (
-        ("replay", "prompt_calibration_tolerance_tokens", 1, "tolerance_tokens=0"),
+        ("replay", "prompt_calibration_tolerance_tokens", 1, "tracelab requires prompt_calibration_tolerance_tokens=0"),
         ("backend", "endpoint", "/v1/messages", "endpoint=/v1/chat/completions"),
     ):
         payload = {name: dict(settings) for name, settings in valid.items()}
@@ -324,11 +383,68 @@ def test_tracelab_requires_exact_calibration_and_chat_endpoint() -> None:
             ReplayBenchConfig.model_validate(payload)
 
 
+@pytest.mark.parametrize("tolerance", [0, 1, 8])
+@pytest.mark.parametrize("transport", ["auto", "chat_text", "completion_token_ids"])
+def test_agentinfer_tolerance_depends_on_transport(tolerance: int, transport: str) -> None:
+    payload = {
+        "experiment": {"task_num": 1},
+        "replay": {
+            "trace_type": "agentinfer",
+            "prompt_transport": transport,
+            "prompt_calibration_tolerance_tokens": tolerance,
+        },
+    }
+    if transport == "completion_token_ids" and tolerance != 0:
+        with pytest.raises(
+            ValidationError, match="completion_token_ids requires prompt_calibration_tolerance_tokens=0"
+        ):
+            ReplayBenchConfig.model_validate(payload)
+        return
+    config = ReplayBenchConfig.model_validate(payload)
+    assert config.replay.prompt_calibration_tolerance_tokens == tolerance
+
+
+@pytest.mark.parametrize("tolerance", [None, 0, 1])
+@pytest.mark.parametrize("transport", ["auto", "completion_token_ids"])
+def test_agentx_tolerance_is_fixed_to_zero_and_round_trips(tolerance: int | None, transport: str) -> None:
+    replay = {"trace_type": "agentX", "trace_path": "source.jsonl", "prompt_transport": transport}
+    if tolerance is not None:
+        replay["prompt_calibration_tolerance_tokens"] = tolerance
+    payload = {
+        "experiment": {"task_num": 1},
+        "backend": {"endpoint": "/v1/completions"},
+        "replay": replay,
+    }
+    if tolerance == 1:
+        with pytest.raises(ValidationError, match="agentX requires prompt_calibration_tolerance_tokens=0"):
+            ReplayBenchConfig.model_validate(payload)
+        return
+    config = ReplayBenchConfig.model_validate(payload)
+    assert config.replay.uses_token_ids
+    assert config.replay.prompt_calibration_tolerance_tokens == 0
+    assert ReplayBenchConfig.model_validate(config.model_dump(mode="json")).replay.prompt_shape == "agentX_snapshot"
+
+
+def test_agentx_rejects_text_transport() -> None:
+    """Hash snapshots require raw token transport even when the endpoint is valid."""
+
+    with pytest.raises(ValidationError, match="agentX requires completion_token_ids"):
+        ReplayBenchConfig.model_validate(
+            {
+                "experiment": {"task_num": 1},
+                "backend": {"endpoint": "/v1/completions"},
+                "replay": {"trace_type": "agentX", "prompt_transport": "chat_text"},
+            }
+        )
+
+
 def test_trace_path_is_resolved_relative_to_yaml(tmp_path: Path) -> None:
     config_path = tmp_path / "config" / "replay.yaml"
     config_path.parent.mkdir()
     config_path.write_text(
         """
+experiment:
+  task_num: 1
 replay:
   trace_path: ../traces/source.jsonl
 """,

@@ -4,6 +4,7 @@
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -22,7 +23,34 @@ from agentinfer.agentbench.replay.converters.codex_swebenchpro import (
 from agentinfer.agentbench.replay.planner import build_replay_plan
 from agentinfer.agentbench.replay.prompt import PromptBuilder, PromptExchange, SyntheticPrompt
 from agentinfer.agentbench.replay.runner import _prepare_replay_source, run_replay
-from agentinfer.agentbench.replay.unified_trace_ir import canonical_sha256, validate_trace_ir
+from agentinfer.agentbench.replay.unified_trace_ir import (
+    PromptReference,
+    TraceTextStore,
+    canonical_sha256,
+    validate_trace_ir,
+)
+
+
+def test_source_text_cache_release_preserves_active_reader(monkeypatch, tmp_path) -> None:
+    path = tmp_path / "turn.txt"
+    path.write_text("source content")
+    original_read = Path.read_text
+    reads = []
+
+    def read(source, **kwargs):
+        reads.append(source)
+        return original_read(source, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    store = TraceTextStore(SimpleNamespace(text_path=lambda reference: path))
+    reference = PromptReference("session", 0)
+    active_text = store.read(reference)
+    assert store.read(reference) == active_text
+    assert len(reads) == 1
+    store.discard(reference)
+    assert active_text == "source content"
+    assert store.read(reference) == active_text
+    assert len(reads) == 2
 
 
 class _CharacterTokenizer:
@@ -328,12 +356,13 @@ def test_inferact_trace_is_validated_before_analysis(
     )
     config = ReplayBenchConfig.model_validate(
         {
+            "experiment": {"task_num": 1},
             "replay": {
                 "trace_type": "inferact_codex_swebenchpro",
                 "trace_path": source,
                 "interval_mode": "lognormal",
                 "interval_lognormal": {"p50_seconds": 2, "p95_seconds": 30, "p99_seconds": 90},
-            }
+            },
         }
     )
 
@@ -399,7 +428,10 @@ def test_inferact_synthetic_runner_rejects_backend_residuals_and_reports_them(
         }
     )
 
-    result = run_replay(config)
+    with pytest.raises(RuntimeError, match="did not complete"):
+        run_replay(config)
+    result = config.experiment.result_dir
+    assert json.loads((result / "manifest.json").read_text())["status"] == "failed"
     summary = json.loads((result / "summary.json").read_text(encoding="utf-8"))
     execution = json.loads((result / "replay-execution.json").read_text(encoding="utf-8"))
     validation = json.loads((result / "trace-record-validation.json").read_text(encoding="utf-8"))
@@ -501,7 +533,12 @@ def test_current_turn_replay_repeats_targets_with_different_live_answers(tmp_pat
                 },
             }
         )
-        result = run_replay(config)
+        if bad_usage:
+            with pytest.raises(RuntimeError, match="did not complete"):
+                run_replay(config)
+            result = config.experiment.result_dir
+        else:
+            result = run_replay(config)
         summary = json.loads((result / "summary.json").read_text())
         validation = json.loads((result / "trace-record-validation.json").read_text())
         if bad_usage:
@@ -525,13 +562,6 @@ def test_current_turn_replay_repeats_targets_with_different_live_answers(tmp_pat
     if not bad_usage:
         assert totals == [408, 408]
         assert all(item["pad"] == item["trim"] == 8 for item in adjustments)
-
-
-def test_reserved_agentx_trace_type_fails_explicitly(tmp_path: Path) -> None:
-    config = ReplayBenchConfig.model_validate({"replay": {"trace_type": "agentX", "trace_path": tmp_path / "trace"}})
-
-    with pytest.raises(NotImplementedError, match="reserved for future integration"):
-        _prepare_replay_source(config, tmp_path / "result")
 
 
 def test_runtime_converter_uses_configured_backend_chat_template(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -561,6 +591,7 @@ def test_runtime_converter_uses_configured_backend_chat_template(monkeypatch: py
     monkeypatch.setattr("agentinfer.agentbench.replay.converters.codex_swebenchpro.httpx.Client", Client)
     config = ReplayBenchConfig.model_validate(
         {
+            "experiment": {"task_num": 1},
             "backend": {
                 "base_url": "http://backend",
                 "tokenizer_base_url": "http://tokenizer",
@@ -646,7 +677,7 @@ def test_runtime_converter_counts_each_turn_with_full_backend_history(
         ),
         encoding="utf-8",
     )
-    config = ReplayBenchConfig.model_validate({"replay": {"trace_path": source}})
+    config = ReplayBenchConfig.model_validate({"experiment": {"task_num": 1}, "replay": {"trace_path": source}})
     converter = CodexSwebenchProConverter.from_backend(config)
     converter.convert(source, tmp_path / "output")
     converter.close()

@@ -47,6 +47,7 @@ class _HistorySensitiveTokenizer(_AdditiveTokenizer):
 def _config() -> ReplayBenchConfig:
     return ReplayBenchConfig.model_validate(
         {
+            "experiment": {"task_num": 1},
             "backend": {
                 "base_url": "http://backend",
                 "tokenizer_base_url": "http://tokenizer",
@@ -71,6 +72,15 @@ def test_local_counter_selects_incremental_only_for_additive_template() -> None:
     assert additive.input_tokens(messages) == len(additive.chat_token_ids(messages))
     assert history_sensitive.incremental is False
     assert history_sensitive.input_tokens(messages) == len(history_sensitive.chat_token_ids(messages))
+
+
+def test_uncached_tokenization_does_not_retain_replay_text() -> None:
+    counter = LocalTokenizerCounter(_AdditiveTokenizer(), {})
+    cached = dict(counter._content_cache)
+    for index in range(8):
+        text = f"private replay content {index}"
+        assert counter.text_token_ids(text, cache=False) == tuple(map(ord, text))
+    assert counter._content_cache == cached
 
 
 @pytest.mark.parametrize("message_count", [7, 11, 13])
@@ -143,7 +153,11 @@ def test_discovery_rejects_tokenizer_that_differs_from_backend(monkeypatch) -> N
 
     counter = discover_local_tokenizer(
         ReplayBenchConfig.model_validate(
-            {"backend": {"model": "different-model"}, "replay": {"trace_path": "source.jsonl"}}
+            {
+                "experiment": {"task_num": 1},
+                "backend": {"model": "different-model"},
+                "replay": {"trace_path": "source.jsonl"},
+            }
         ),
         get_json=lambda url: None,
         backend_tokens=lambda payload: (999,),

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
@@ -23,13 +24,16 @@ from ..benchkit.metrics.request import aggregate_request_metrics
 from ..benchkit.metrics.schema import EvidenceCapture
 from ..benchkit.metrics.source_health import evaluate_captures
 from ..benchkit.metrics.task import aggregate_task_results
-from ..benchkit.metrics.vllm import aggregate_vllm_metrics
+from ..benchkit.metrics.vllm import aggregate_vllm_metrics, vllm_capture_reason
 from ..request_proxy.request_trace import RequestFact, RequestTraceWriter, load_request_facts
+from .agentinfer_source import builtin_agentinfer_source
 from .analyzer import analyze_replay_trace, replay_analysis_to_dict
 from .config import ReplayBenchConfig
+from .converters.agentx import AgentXConverter, analyze_agentx_trace_ir
 from .converters.codex_swebenchpro import CodexSwebenchProConverter
 from .converters.tracelab import TraceLabConverter
 from .executor import ReplayExecutor, ReplayTaskExecution
+from .inferact_source import materialize_inferact_source
 from .local_tokenizer import LocalTokenizerCounter
 from .planner import ReplayPlan, build_replay_plan
 from .prompt import PromptBuilder, TokenizerClient
@@ -38,6 +42,38 @@ from .transport import ReplayTransport
 from .unified_trace_ir import UnifiedTraceIR, analyze_explicit_trace_ir, validate_trace_ir
 
 logger = logging.getLogger(__name__)
+
+
+def _complete_replay(plan: ReplayPlan, tasks: tuple[ReplayTaskExecution, ...], facts: tuple[RequestFact, ...]) -> bool:
+    """Require exact identity coverage, including timing nodes and persisted request facts."""
+
+    planned_tasks = Counter((task.task_id, task.runtime_session_id) for task in plan.tasks)
+    actual_tasks = Counter((task.task_id, task.runtime_session_id) for task in tasks)
+    planned_nodes = Counter(
+        (task.runtime_session_id, node.runtime_request_id, node.source_key, node.node_type)
+        for task in plan.tasks
+        for node in task.requests
+    )
+    actual_nodes = Counter(
+        (task.runtime_session_id, node.runtime_request_id, node.source_key, node.node_type)
+        for task in tasks
+        for node in task.nodes
+    )
+    planned_facts = Counter(
+        (task.runtime_session_id, node.runtime_request_id)
+        for task in plan.tasks
+        for node in task.requests
+        if node.node_type == "request"
+    )
+    actual_facts = Counter((fact.session_id, fact.request_id) for fact in facts)
+    return (
+        planned_tasks == actual_tasks
+        and planned_nodes == actual_nodes
+        and planned_facts == actual_facts
+        and all(task.status == "completed" for task in tasks)
+        and all(node.status == "success" for task in tasks for node in task.nodes)
+        and all(fact.status == "success" for fact in facts)
+    )
 
 
 def _capture(source: str, path: Path, available: bool = True, reason: str | None = None) -> EvidenceCapture:
@@ -100,6 +136,8 @@ def _execution_metadata(
     tasks: tuple[ReplayTaskExecution, ...],
     tolerance_tokens: int = 0,
     facts: tuple[RequestFact, ...] = (),
+    *,
+    snapshot_mode: bool = False,
 ) -> dict[str, object]:
     """Aggregate planned coverage, node outcomes, and Prompt calibration evidence."""
 
@@ -125,20 +163,42 @@ def _execution_metadata(
         fact
         for fact in cache_facts
         if planned_by_runtime_id.get(fact.request_id) is not None
-        and planned_by_runtime_id[fact.request_id].context_after is None
+        and (
+            planned_by_runtime_id[fact.request_id].prompt_kind in {"lead_main", "subagent_first"}
+            if snapshot_mode
+            else planned_by_runtime_id[fact.request_id].context_after is None
+        )
     ]
     continuation_cache_facts = [
         fact
         for fact in cache_facts
         if planned_by_runtime_id.get(fact.request_id) is not None
-        and planned_by_runtime_id[fact.request_id].context_after is not None
+        and (
+            planned_by_runtime_id[fact.request_id].prompt_kind not in {"lead_main", "subagent_first"}
+            if snapshot_mode
+            else planned_by_runtime_id[fact.request_id].context_after is not None
+        )
     ]
+    zero_output_nodes = [
+        node
+        for node in planned_nodes
+        if node.node_type == "request" and getattr(node, "source_output_tokens", None) == 0
+    ]
+    zero_output_runtime_ids = {node.runtime_request_id for node in zero_output_nodes}
     return {
         "workload_fingerprint": plan.workload_fingerprint,
+        "prompt_prepare_seconds": sum(node.prompt_prepare_seconds or 0 for node in nodes),
+        "max_prompt_prepare_seconds": max((node.prompt_prepare_seconds or 0 for node in nodes), default=0),
+        "max_scheduler_lag_seconds": max((node.scheduler_lag_seconds or 0 for node in nodes), default=0),
         "planned_tasks": len(plan.tasks),
         "completed_tasks": sum(task.status == "completed" for task in tasks),
         "failed_tasks": sum(task.status != "completed" for task in tasks),
         "planned_requests": sum(node.node_type == "request" for task in plan.tasks for node in task.requests),
+        "source_zero_output_requests": len(zero_output_nodes),
+        "zero_output_requests_observed_one_token": sum(
+            fact.request_id in zero_output_runtime_ids and fact.status == "success" and fact.output_tokens == 1
+            for fact in facts
+        ),
         "planned_timing_dependency_nodes": sum(
             node.node_type == "timing_dependency" for task in plan.tasks for node in task.requests
         ),
@@ -184,8 +244,14 @@ def _execution_metadata(
         "backend_input_requests_over_tolerance": sum(value > tolerance_tokens for value in backend_residuals),
         "backend_input_max_absolute_residual_tokens": max(backend_residuals, default=0),
         "trimmed_filler_tokens": sum(int(item.get("trimmed_filler_tokens", 0)) for item in adjustments),
+        "source_prefix_tokens": sum(int(item.get("source_prefix_tokens") or 0) for item in calibrations),
+        "effective_prefix_tokens": sum(int(item.get("effective_prefix_tokens") or 0) for item in calibrations),
+        "prefix_shortfall_tokens": sum(int(item.get("prefix_shortfall_tokens") or 0) for item in calibrations),
+        "requests_with_prefix_shortfall": sum(bool(item.get("prefix_shortfall_tokens")) for item in calibrations),
         "cache_usage_coverage_requests": len(cache_facts),
         "observed_cached_tokens": sum(fact.cached_tokens or 0 for fact in cache_facts),
+        "snapshot_cache_usage_coverage": len(cache_facts) if snapshot_mode else 0,
+        "snapshot_observed_cached_tokens": sum(fact.cached_tokens or 0 for fact in cache_facts) if snapshot_mode else 0,
         "first_request_cache_usage_coverage": len(first_cache_facts),
         "first_request_observed_cached_tokens": sum(fact.cached_tokens or 0 for fact in first_cache_facts),
         "continuation_cache_usage_coverage": len(continuation_cache_facts),
@@ -206,9 +272,6 @@ def _prepare_replay_source(
     if trace_type == "agentinfer":
         logger.info("Using AgentInfer Replay trace directly: trace_path=%s", trace_path)
         return trace_path, None, (), None
-    if trace_type == "agentX":
-        raise NotImplementedError(f"trace_type={trace_type} is reserved for future integration")
-
     convert_dir = output_dir / "convert_result"
     started = time.monotonic()
     logger.info(
@@ -217,7 +280,12 @@ def _prepare_replay_source(
         trace_path,
         convert_dir,
     )
-    if trace_type == "tracelab":
+    if trace_type == "agentX":
+        converter = AgentXConverter()
+        summary = converter.convert(trace_path, convert_dir)
+        trace_ir = validate_trace_ir(convert_dir / "requests.jsonl")
+        local_tokenizer = None
+    elif trace_type == "tracelab":
         converter = TraceLabConverter()
         summary = converter.convert(trace_path, convert_dir)
         trace_ir = validate_trace_ir(convert_dir / "requests.jsonl")
@@ -265,6 +333,9 @@ async def _run_replay(
     transport: ReplayTransport | None = None
     writer_started = False
     trace_ir: UnifiedTraceIR | None = None
+    plan: ReplayPlan | None = None
+    measured_started_at = manifest.created_at
+    setup_started = time.monotonic()
     try:
         write_text(requests_path, "")
         captures.append(_capture("request_trace", requests_path))
@@ -272,11 +343,12 @@ async def _run_replay(
         analysis_source, trace_ir, conversion_captures, local_tokenizer = _prepare_replay_source(config, output_dir)
         captures.extend(conversion_captures)
 
-        analysis = (
-            analyze_explicit_trace_ir(trace_ir)
-            if trace_ir is not None and trace_ir.prompt_source_kind == "token_recipe"
-            else analyze_replay_trace(analysis_source)
-        )
+        if trace_ir is not None and trace_ir.prompt_source_kind == "hash_snapshot":
+            analysis = analyze_agentx_trace_ir(trace_ir)
+        elif trace_ir is not None and trace_ir.prompt_source_kind == "token_recipe":
+            analysis = analyze_explicit_trace_ir(trace_ir)
+        else:
+            analysis = analyze_replay_trace(analysis_source)
         analysis_path = output_dir / "replay-source-analysis.json"
         atomic_write_json(analysis_path, replay_analysis_to_dict(analysis))
         captures.append(_capture("replay_source_analysis", analysis_path))
@@ -296,6 +368,48 @@ async def _run_replay(
         atomic_write_json(plan_path, plan.to_dict())
         captures.append(_capture("replay_plan", plan_path))
 
+        writer = RequestTraceWriter(requests_path)
+        await writer.start()
+        writer_started = True
+        tokenizer = TokenizerClient(config, local_tokenizer)
+        prompts = PromptBuilder(config, tokenizer, trace_ir)
+        setup_timeout = config.experiment.run_timeout_seconds or config.replay.request_timeout_seconds
+
+        async def prepare() -> None:
+            nonlocal transport
+            if not config.replay.uses_token_ids:
+                await tokenizer.prepare_local_tokenizer()
+            if config.replay.prompt_shape == "tracelab_synthetic":
+                transport = ReplayTransport(config, output_dir.name, None)
+                warmup_ids = await prompts.prepare_tracelab_warmup(plan)
+                await transport.validate_tracelab_context(plan, len(warmup_ids))
+                warmup = await transport.warmup(warmup_ids)
+                warmup_path = evidence_dir / "tracelab_warmup.json"
+                atomic_write_json(warmup_path, warmup)
+                captures.append(_capture("tracelab_warmup", warmup_path))
+                await transport.close()
+                transport = None
+            await prompts.prepare_tasks(plan)
+
+        await asyncio.wait_for(prepare(), timeout=setup_timeout)
+        setup_seconds = time.monotonic() - setup_started
+        preparation_path = evidence_dir / "replay_preparation.json"
+        atomic_write_json(
+            preparation_path,
+            {
+                "status": "completed",
+                "duration_seconds": setup_seconds,
+                "prompt_transport": "completion_token_ids" if config.replay.uses_token_ids else "chat_text",
+                "tokenizer_max_concurrency": config.replay.tokenizer_max_concurrency,
+                "root_preparation": (
+                    "request_release" if config.replay.prompt_shape == "agentX_snapshot" else "active_tasks"
+                ),
+                "max_concurrent_tasks": config.experiment.max_concurrency,
+                "task_preparation_in_measured_time": True,
+            },
+        )
+        captures.append(_capture("replay_preparation", preparation_path))
+
         vllm_start_capture = await capture_vllm_metrics(config.backend.effective_metrics_url)
         vllm_start = str(vllm_start_capture.metadata.get("text")) if vllm_start_capture.available else None
         vllm_start_path = evidence_dir / "vllm_metrics_start.prom"
@@ -305,16 +419,14 @@ async def _run_replay(
             _capture("vllm_start", vllm_start_path, vllm_start_capture.available, vllm_start_capture.reason)
         )
 
-        writer = RequestTraceWriter(requests_path)
-        await writer.start()
-        writer_started = True
-        tokenizer = TokenizerClient(config, local_tokenizer)
         transport = ReplayTransport(config, output_dir.name, writer)
-        execution = ReplayExecutor(config, plan, PromptBuilder(config, tokenizer, trace_ir), transport).execute()
+        measured_started_at = utc_now()
+        execution = ReplayExecutor(config, plan, prompts, transport).execute()
         if config.experiment.run_timeout_seconds:
             task_results = await asyncio.wait_for(execution, config.experiment.run_timeout_seconds)
         else:
             task_results = await execution
+        measured_finished_at = utc_now()
 
         await transport.close()
         transport = None
@@ -327,7 +439,9 @@ async def _run_replay(
             raise RuntimeError(f"request trace writer failed: {writer_health.writer_error}")
         facts = tuple(load_request_facts(requests_path))
 
-        plan = replace(plan, prompt_calibration={**plan.prompt_calibration, "status": "completed"})
+        complete_replay = _complete_replay(plan, task_results, facts)
+        run_status = "completed" if complete_replay else "failed"
+        plan = replace(plan, prompt_calibration={**plan.prompt_calibration, "status": run_status})
         atomic_write_json(plan_path, plan.to_dict())
         execution_path = output_dir / "replay-execution.json"
         execution_metadata = _execution_metadata(
@@ -335,7 +449,10 @@ async def _run_replay(
             task_results,
             config.replay.prompt_calibration_tolerance_tokens,
             facts,
+            snapshot_mode=config.replay.prompt_shape == "agentX_snapshot",
         )
+        execution_metadata["setup_seconds"] = setup_seconds
+        execution_metadata["complete_replay"] = complete_replay
         atomic_write_json(
             execution_path,
             {
@@ -390,15 +507,19 @@ async def _run_replay(
         captures.append(_capture("vllm_end", vllm_end_path, vllm_end_capture.available, vllm_end_capture.reason))
 
         finished_at = utc_now()
-        run_wall_time = max((finished_at - manifest.created_at).total_seconds(), 1e-9)
+        run_wall_time = max((measured_finished_at - measured_started_at).total_seconds(), 1e-9)
         summary = build_run_summary(
             output_dir.name,
             aggregate_task_results(_task_result(result, config.backend.endpoint) for result in task_results),
             aggregate_request_metrics(facts),
-            aggregate_vllm_metrics(vllm_start, vllm_end),
+            aggregate_vllm_metrics(vllm_start, vllm_end, capture_reason=vllm_capture_reason(captures)),
             {"available": False, "reason": "not applicable to Replay", "metadata": {}},
             evaluate_captures(captures),
-            {"status": "completed", "error": None, "proxy_close": None},
+            {
+                "status": run_status,
+                "error": None if complete_replay else "Replay did not complete all planned requests",
+                "proxy_close": None,
+            },
             run_wall_time,
             execution={"available": True, "reason": None, "metadata": execution_metadata},
         ).to_dict()
@@ -408,10 +529,12 @@ async def _run_replay(
         finalized = finalize_run_manifest(
             manifest,
             tuple(_capture_dict(capture) for capture in captures),
-            status="completed",
+            status=run_status,
             finished_at=finished_at,
         )
         atomic_write_json(manifest_path, finalized.to_dict())
+        if not complete_replay:
+            raise RuntimeError(f"Replay did not complete all planned tasks and requests; evidence: {output_dir}")
         return output_dir
     except BaseException as exc:
         logger.exception(
@@ -426,6 +549,15 @@ async def _run_replay(
             transport,
             writer_started=writer_started,
         )
+        if plan is not None:
+            plan = replace(plan, prompt_calibration={**plan.prompt_calibration, "status": "failed"})
+            atomic_write_json(output_dir / "replay-plan.json", plan.to_dict())
+        preparation_path = evidence_dir / "replay_preparation.json"
+        if not preparation_path.exists():
+            atomic_write_json(
+                preparation_path, {"status": "failed", "duration_seconds": time.monotonic() - setup_started}
+            )
+            captures.append(_capture("replay_preparation", preparation_path))
         error_path = output_dir / "replay-error.json"
         atomic_write_json(
             error_path,
@@ -448,15 +580,24 @@ async def _run_replay(
 
 
 def _resolve_replay_source(config: ReplayBenchConfig) -> ReplayBenchConfig:
-    """Materialize an implicit TraceLab source and return an updated copy."""
+    """Materialize an adapter's implicit source and return an updated copy."""
 
     if config.replay.trace_path is None:
         task_num = config.experiment.task_num
-        if config.replay.trace_type != "tracelab" or task_num is None:
-            raise ValueError("unresolved Replay trace_path")
-        trace_path = materialize_tracelab_source(task_num)
+        if task_num is None:  # Defensive for unchecked model construction.
+            raise ValueError("experiment.task_num is required for Replay")
+        trace_type = config.replay.trace_type
+        if trace_type == "agentinfer":
+            trace_path = builtin_agentinfer_source()
+        elif trace_type == "inferact_codex_swebenchpro":
+            trace_path = materialize_inferact_source(task_num)
+        elif trace_type == "tracelab":
+            trace_path = materialize_tracelab_source(task_num)
+        else:
+            raise NotImplementedError(f"Replay trace_type={trace_type!r} is not implemented")
         logger.info(
-            "Using downloaded TraceLab dataset subset: task_num=%d trace_path=%s",
+            "Using default Replay dataset: trace_type=%s task_num=%d trace_path=%s",
+            trace_type,
             task_num,
             trace_path,
         )
