@@ -23,7 +23,11 @@ pythonpath = ["."]
 include = ["agentinfer*"]
 
 [tool.setuptools.package-data]
-agentinfer = ["agentbench/configs/*.yaml"]
+agentinfer = [
+    "agentbench/configs/*.yaml",
+    "agentcache/patches/*.md",
+    "agentcache/patches/*.patch",
+]
 
 [project.scripts]
 vllm = "agentinfer.agentcache.entrypoints.cli.main:main"

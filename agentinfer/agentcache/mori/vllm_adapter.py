@@ -4,12 +4,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
 from agentinfer.agentcache.mori.hbm_policy import MORIHBMPolicy
 from agentinfer.agentcache.mori.runtime_state import MORI_RUNTIME_STATE
+from agentinfer.agentcache.mori.simple_cpu_policy import MORISimpleCPUOffloadPolicy
 from agentinfer.scheduling.mori import MORIMode, MORIStrategy
 
 
@@ -32,6 +34,7 @@ class VllmMORIAdapter:
     cpu_policy: object | None
     owner: object
     strategy: MORIStrategy
+    cpu_unregister: Callable[[], None] | None = None
     closed: bool = False
 
     def close(self) -> None:
@@ -51,12 +54,16 @@ class VllmMORIAdapter:
                     self.hbm_policy.close()
             finally:
                 try:
-                    close_cpu = getattr(self.cpu_policy, "close", None)
-                    if callable(close_cpu):
-                        close_cpu()
+                    if self.cpu_unregister is not None:
+                        self.cpu_unregister()
                 finally:
-                    MORI_RUNTIME_STATE.unbind_provider(self.strategy)
-                    MORI_RUNTIME_STATE.clear_requests()
+                    try:
+                        close_cpu = getattr(self.cpu_policy, "close", None)
+                        if callable(close_cpu):
+                            close_cpu()
+                    finally:
+                        MORI_RUNTIME_STATE.unbind_provider(self.strategy)
+                        MORI_RUNTIME_STATE.clear_requests()
 
 
 def observe_vllm_offload(owner: object) -> VllmOffloadObservation:
@@ -64,6 +71,9 @@ def observe_vllm_offload(owner: object) -> VllmOffloadObservation:
     scheduler = _offload_scheduler(owner)
     if scheduler is None:
         return VllmOffloadObservation()
+    snapshot = getattr(scheduler, "get_mori_offload_tier_snapshot", None)
+    if callable(snapshot):
+        return _simple_cpu_observation(snapshot())
     manager = getattr(scheduler, "manager", None)
     config = getattr(scheduler, "config", None)
     groups = tuple(getattr(config, "kv_group_configs", ()) or ())
@@ -99,29 +109,66 @@ def install_vllm_mori(owner: object, strategy: MORIStrategy) -> VllmMORIAdapter:
         return VllmMORIAdapter(hbm_policy=None, cpu_policy=None, owner=owner, strategy=strategy)
 
     scheduler = _offload_scheduler(owner)
-    manager = getattr(scheduler, "manager", None) if scheduler is not None else None
-    cpu_policy = getattr(manager, "_policy", None)
-    if not bool(getattr(cpu_policy, "MORI_CPU_POLICY", False)):
-        raise RuntimeError(
-            "full MORI requires vLLM CPU offload configured with "
-            "eviction_policy=MoriCPUCachePolicy and "
-            "cache_policy_module_path=agentinfer.agentcache.mori_cpu_policy"
-        )
+    cpu_policy: object | None
+    cpu_unregister: Callable[[], None] | None = None
+    simple_register = getattr(scheduler, "register_mori_offload_tier_provider", None)
+    simple_unregister = getattr(scheduler, "unregister_mori_offload_tier_provider", None)
+    if callable(simple_register):
+        if not callable(simple_unregister):
+            raise RuntimeError(
+                "full MORI with SimpleCPUOffloadConnector requires unregister_mori_offload_tier_provider(version=1)"
+            )
+        cpu_policy = MORISimpleCPUOffloadPolicy(MORI_RUNTIME_STATE)
+        MORI_RUNTIME_STATE.bind_provider(strategy)
+        try:
+            capabilities = simple_register(cpu_policy.HOOK_API_VERSION, cpu_policy)
+        except BaseException:
+            try:
+                cpu_policy.close()
+            finally:
+                MORI_RUNTIME_STATE.unbind_provider(strategy)
+            raise
+        version = _capability_version(capabilities)
+        if version != cpu_policy.HOOK_API_VERSION:
+            with suppress(Exception):
+                simple_unregister(cpu_policy)
+            try:
+                cpu_policy.close()
+            finally:
+                MORI_RUNTIME_STATE.unbind_provider(strategy)
+            raise RuntimeError(
+                f"unsupported vLLM MORI SimpleCPU hook API version: {version!r}; expected {cpu_policy.HOOK_API_VERSION}"
+            )
+
+        def unregister_simple_cpu() -> None:
+            simple_unregister(cpu_policy)
+
+        cpu_unregister = unregister_simple_cpu
+    else:
+        manager = getattr(scheduler, "manager", None) if scheduler is not None else None
+        cpu_policy = getattr(manager, "_policy", None)
+        if not bool(getattr(cpu_policy, "MORI_CPU_POLICY", False)):
+            raise RuntimeError(
+                "full MORI requires SimpleCPUOffloadConnector with the MORI "
+                "offload-tier hook, or OffloadingConnector configured with "
+                "eviction_policy=MoriCPUCachePolicy and "
+                "cache_policy_module_path=agentinfer.agentcache.mori_cpu_policy"
+            )
+        MORI_RUNTIME_STATE.bind_provider(strategy)
 
     kv_cache_manager = getattr(owner, "kv_cache_manager", None)
     register = getattr(kv_cache_manager, "register_mori_block_selection_provider", None)
     if not callable(register):
-        _close_failed_cpu_policy(cpu_policy)
+        _close_failed_cpu_policy(cpu_policy, strategy, cpu_unregister)
         raise RuntimeError(
             "full MORI requires the vLLM MORI HBM hook API register_mori_block_selection_provider(version=1)"
         )
     unregister = getattr(kv_cache_manager, "unregister_mori_block_selection_provider", None)
     if not callable(unregister):
-        _close_failed_cpu_policy(cpu_policy)
+        _close_failed_cpu_policy(cpu_policy, strategy, cpu_unregister)
         raise RuntimeError(
             "full MORI requires the vLLM MORI HBM hook API unregister_mori_block_selection_provider(version=1)"
         )
-    MORI_RUNTIME_STATE.bind_provider(strategy)
     hbm_policy = MORIHBMPolicy(MORI_RUNTIME_STATE)
     try:
         capabilities = register(hbm_policy)
@@ -130,19 +177,15 @@ def install_vllm_mori(owner: object, strategy: MORIStrategy) -> VllmMORIAdapter:
             unregister(hbm_policy)
         hbm_policy.close()
         MORI_RUNTIME_STATE.unbind_provider(strategy)
-        _close_failed_cpu_policy(cpu_policy)
+        _close_failed_cpu_policy(cpu_policy, strategy, cpu_unregister)
         raise
-    version = (
-        capabilities.get("hook_api_version")
-        if isinstance(capabilities, dict)
-        else getattr(capabilities, "hook_api_version", None)
-    )
+    version = _capability_version(capabilities)
     if version != MORIHBMPolicy.HOOK_API_VERSION:
         with suppress(Exception):
             unregister(hbm_policy)
         hbm_policy.close()
         MORI_RUNTIME_STATE.unbind_provider(strategy)
-        _close_failed_cpu_policy(cpu_policy)
+        _close_failed_cpu_policy(cpu_policy, strategy, cpu_unregister)
         raise RuntimeError(
             f"unsupported vLLM MORI HBM hook API version: {version!r}; expected {MORIHBMPolicy.HOOK_API_VERSION}"
         )
@@ -151,6 +194,7 @@ def install_vllm_mori(owner: object, strategy: MORIStrategy) -> VllmMORIAdapter:
         cpu_policy=cpu_policy,
         owner=owner,
         strategy=strategy,
+        cpu_unregister=cpu_unregister,
     )
 
 
@@ -161,18 +205,67 @@ def _offload_scheduler(owner: object) -> object | None:
     direct = getattr(connector, "connector_scheduler", None)
     if direct is not None:
         return direct
+    simple_cpu = getattr(connector, "scheduler_manager", None)
+    if simple_cpu is not None:
+        return simple_cpu
     try:
         return getattr(connector, "scheduler", None)
     except (AssertionError, AttributeError):
         return None
 
 
-def _close_failed_cpu_policy(cpu_policy: object) -> None:
+def _close_failed_cpu_policy(
+    cpu_policy: object,
+    strategy: MORIStrategy,
+    unregister: Callable[[], None] | None = None,
+) -> None:
     """Rollback a policy that registered process-local indexes during startup."""
-    close = getattr(cpu_policy, "close", None)
-    if callable(close):
-        close()
-    MORI_RUNTIME_STATE.clear_requests()
+    if unregister is not None:
+        with suppress(Exception):
+            unregister()
+    try:
+        close = getattr(cpu_policy, "close", None)
+        if callable(close):
+            close()
+    finally:
+        MORI_RUNTIME_STATE.unbind_provider(strategy)
+        MORI_RUNTIME_STATE.clear_requests()
+
+
+def _capability_version(capabilities: object) -> object:
+    return (
+        capabilities.get("hook_api_version")
+        if isinstance(capabilities, dict)
+        else getattr(capabilities, "hook_api_version", None)
+    )
+
+
+def _simple_cpu_observation(snapshot: object) -> VllmOffloadObservation:
+    """Normalize a native SimpleCPU block snapshot into scheduler tokens."""
+    block_size = _non_negative_int(
+        getattr(snapshot, "scheduler_block_size", None),
+        positive=True,
+    )
+    total = _non_negative_int(getattr(snapshot, "total_blocks", None))
+    resident = _non_negative_int(getattr(snapshot, "resident_blocks", None))
+    pending_store = _non_negative_int(getattr(snapshot, "pending_store_blocks", None))
+    pending_load = _non_negative_int(getattr(snapshot, "pending_load_blocks", None))
+    if None in (block_size, total, resident, pending_store, pending_load):
+        return VllmOffloadObservation()
+    assert block_size is not None
+    assert total is not None
+    assert resident is not None
+    assert pending_store is not None
+    assert pending_load is not None
+    if resident > total or pending_store > total or pending_load > total:
+        return VllmOffloadObservation()
+    return VllmOffloadObservation(
+        total_dram_kv_tokens=total * block_size,
+        used_dram_kv_tokens=resident * block_size,
+        pending_h2d_kv_tokens=pending_load * block_size,
+        pending_d2h_kv_tokens=pending_store * block_size,
+        dram_chunk_size_tokens=block_size,
+    )
 
 
 def _non_negative_int(value: Any, *, positive: bool = False) -> int | None:

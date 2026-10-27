@@ -6,7 +6,8 @@ Reference 和 Explanation；开发者内部设计稿位于仓根目录的 `desig
 ## 中文文档
 
 - **Tutorial**：[快速开始](zh/tutorial/01-quick-start.md)，适合首次安装和运行 AgentInfer。
-- **How-to**：[接入 vLLM](zh/how-to/integrate-vllm.md)和[运行基准测试](zh/how-to/run-benchmark.md)、[Trace Replay](zh/how-to/run-trace-replay.md)、
+- **How-to**：[接入 vLLM](zh/how-to/integrate-vllm.md)、[使用 MORI](zh/how-to/use-mori.md)、
+  [运行基准测试](zh/how-to/run-benchmark.md)、[Trace Replay](zh/how-to/run-trace-replay.md)、
   [vLLM Router 构建与部署](zh/how-to/deploy-vllm-router.md)（Windows 构建见 [deploy-vllm-router-on-windows](zh/how-to/deploy-vllm-router-on-windows.md)）、
   [Semantic Router 构建与部署](zh/how-to/deploy-semantic-router.md)（Windows 构建见 [deploy-semantic-router-on-windows](zh/how-to/deploy-semantic-router-on-windows.md)），
   用于完成具体任务。
@@ -20,7 +21,7 @@ Reference 和 Explanation；开发者内部设计稿位于仓根目录的 `desig
 ## English Documentation
 
 - **Tutorial**: [Quick start](en/tutorial/01-quick-start.md) for first-time installation and execution.
-- **How-to**: [Integrate with vLLM](en/how-to/integrate-vllm.md) and
+- **How-to**: [Integrate with vLLM](en/how-to/integrate-vllm.md), [use MORI](en/how-to/use-mori.md), and
   [run a benchmark](en/how-to/run-benchmark.md), [Trace Replay](en/how-to/run-trace-replay.md) to complete specific
   tasks.
 - **Integrations**: [AgentRouter WASM affinity + native patch](../agentinfer/agentrouter/README.md).

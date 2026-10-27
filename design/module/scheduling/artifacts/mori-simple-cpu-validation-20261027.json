@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-27",
+  "branch": "codex/mori-formal",
+  "scope": "MORI full-mode support for vLLM 0.31 SimpleCPUOffloadConnector",
+  "environment": {
+    "vllm_source": "/data/zx-envs/agentinfer-vllm-0.31.0/lib/python3.12/site-packages/vllm",
+    "gpu_serve_run": false,
+    "gpu_serve_not_run_reason": "This change was validated as CPU-only adapter, patch, and regression coverage; a patched GPU vLLM rebuild was not installed into the shared host environment."
+  },
+  "checks": [
+    {
+      "name": "focused_mori",
+      "command": "python -m pytest -q tests/agentcache/test_mori_simple_cpu_policy.py tests/agentcache/core/test_mori_vllm_adapter.py tests/agentcache/test_mori_typed_lru.py tests/agentcache/test_mori_cpu_policy.py tests/agentcache/core/test_mori_controller.py",
+      "result": "24 passed, 16 warnings in 11.21s"
+    },
+    {
+      "name": "scheduling_agentcache_regression",
+      "command": "python -m pytest -q tests/scheduling tests/agentcache --ignore=tests/agentcache/core/test_vllm_api_adapter.py --ignore=tests/agentcache/entrypoints/test_serve_flag_e2e.py",
+      "result": "308 passed, 16 warnings in 23.55s"
+    },
+    {
+      "name": "native_patch_apply_and_compile",
+      "command": "Apply vllm-0.31-mori-hbm-provider.patch then vllm-0.31-mori-simple-cpu-provider.patch to a temporary copy of block_pool.py, kv_cache_manager.py, and simple_kv_offload/manager.py; run python -m py_compile on all three files.",
+      "result": "passed"
+    },
+    {
+      "name": "native_hook_smoke",
+      "command": "Import the patched SimpleCPU manager, exercise _MoriSimpleCPUProviderBridge removal/proposal, and validate an 8-block/1-resident/16-token snapshot.",
+      "result": "passed"
+    },
+    {
+      "name": "example_shell_syntax",
+      "command": "bash -n examples/serve-mori.sh",
+      "result": "passed"
+    },
+    {
+      "name": "wheel_contents",
+      "command": "python -m pip wheel . --no-deps, then inspect the wheel for agentinfer/agentcache/patches",
+      "result": "passed; README.md and both vLLM 0.31 MORI patches are present"
+    },
+    {
+      "name": "pre_commit",
+      "command": "pre-commit run --files <all MORI SimpleCPU implementation, tests, docs, patches, example, and packaging files>",
+      "result": "ruff check, ruff format, typos, markdownlint-cli2, and Suggestion passed"
+    }
+  ]
+}

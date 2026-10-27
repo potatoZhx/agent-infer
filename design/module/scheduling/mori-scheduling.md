@@ -14,16 +14,18 @@ related_code_paths:
   - agentinfer/agentcache/core/controller.py
   - agentinfer/agentcache/core/scheduler.py
   - agentinfer/agentcache/patches/vllm-0.31-mori-hbm-provider.patch
+  - agentinfer/agentcache/patches/vllm-0.31-mori-simple-cpu-provider.patch
 decision_refs:
   - https://arxiv.org/html/2606.00866
 validation_paths:
   - tests/scheduling/test_mori_strategy.py
   - tests/scheduling/test_mori_runtime.py
   - tests/agentcache/test_mori_typed_lru.py
+  - tests/agentcache/test_mori_simple_cpu_policy.py
   - tests/agentcache/core/test_mori_controller.py
   - tests/agentcache/core/test_mori_vllm_adapter.py
 upstream_refs: []
-last_reviewed: 2026-10-26
+last_reviewed: 2026-10-27
 ---
 
 ## MORI scheduling and typed KV replacement
@@ -41,8 +43,10 @@ DRAM 的 replacement policy 使用同一份已提交 cache class。实现不依�
 generation-safe identity、fail-closed capability negotiation、单 Program 单 in-flight request 以及 native safety ownership
 是 AgentInfer 的工程化约束，不应被描述为论文原文机制。
 
-首版范围是单个 embedded backend rank、单 full-attention KV group 和 full-KV CPU offload。一个 subagent 必须有
-独立的服务端 Program ID；同一 Program generation 不允许重叠的 inference request。
+首版范围是单个 embedded backend rank、单 full-attention KV group 和 full-KV CPU offload。推荐数据面是 vLLM
+`SimpleCPUOffloadConnector` 的 CPU backend 与 eager 模式；原 `OffloadingConnector + MoriCPUCachePolicy` 保留为
+policy-backed 兼容路径。一个 subagent 必须有独立的服务端 Program ID；同一 Program generation 不允许重叠的
+inference request。
 
 ## 组件静态关系
 
@@ -70,6 +74,8 @@ classDiagram
     class MORIHBMPolicy
     class CPUOffloadingManager
     class MoriCPUCachePolicy
+    class SimpleCPUOffloadScheduler
+    class MORISimpleCPUOffloadPolicy
     class TypedLRUIndex
 
     AgentCacheSchedulerBridge --|> NativeScheduler : inherits one native object
@@ -85,11 +91,15 @@ classDiagram
     NativeScheduler *-- CPUOffloadingManager
     BlockPool o-- MORIHBMPolicy : optional provider v1
     CPUOffloadingManager o-- MoriCPUCachePolicy : external native policy
+    NativeScheduler *-- SimpleCPUOffloadScheduler
+    SimpleCPUOffloadScheduler o-- MORISimpleCPUOffloadPolicy : provider v1
     MORIHBMPolicy *-- TypedLRUIndex
     MoriCPUCachePolicy *-- TypedLRUIndex
+    MORISimpleCPUOffloadPolicy *-- TypedLRUIndex
     MORIStrategy --> MORIRuntimeState : committed class observer
     MORIRuntimeState --> MORIHBMPolicy : request owner and reclass delta
     MORIRuntimeState --> MoriCPUCachePolicy : request owner and reclass delta
+    MORIRuntimeState --> MORISimpleCPUOffloadPolicy : request owner and reclass delta
 ```
 
 Progress-TTL 与 MORI 复用相同 bridge、hooks、`ProgramScheduler` 和 transition contract。差异是 MORI 选择
@@ -112,16 +122,19 @@ flowchart TB
     end
 
     NATIVE -->|batch allocate preempt| HBM[KVCacheManager and BlockPool]
-    NATIVE -->|native offload and on-demand reload| CPU[CPUOffloadingManager]
+    NATIVE -->|native offload and on-demand reload| CPU[SimpleCPU scheduler or CPUOffloadingManager]
     HBM <-->|native jobs and connector state| CPU
 
     MORI -->|committed GPU CPU Waiting class| STATE[MORIRuntimeState]
     STATE --> HP[MORIHBMPolicy]
     STATE --> CP[MoriCPUCachePolicy]
+    STATE --> SP[MORISimpleCPUOffloadPolicy]
     HP -->|ordered block IDs only| HBM
     CP -->|ordered OffloadKeys only| CPU
+    SP -->|ordered SimpleCPU block IDs only| CPU
     HBM -->|readiness owner and native LRU deltas| HP
     CPU -->|insert touch pin unpin remove| CP
+    CPU -->|owner ready LRU remove reset| SP
 
     NATIVE -->|outputs and capacity observations| HOOK
 ```
@@ -133,8 +146,9 @@ flowchart TB
 - native `BlockPool` 拥有 HBM queue、hash、refcount、allocation 和最终 block removal。MORI 的 HBM provider
   仅提供完整、有序的 block-ID proposal；native 在任何 mutation 前验证范围、唯一性、free-queue membership、
   null block 和 `ref_cnt == 0`。
-- native CPU manager 拥有 chunk、protected set、transfer job、fence 和最终释放。`MoriCPUCachePolicy` 只实现
-  native `CachePolicy` 的 replacement order。
+- native SimpleCPU scheduler/BlockPool 拥有 CPU block、hash、refcount、transfer completion 和最终释放；
+  `MORISimpleCPUOffloadPolicy` 只返回 block-ID proposal。兼容的 OffloadingConnector 路径仍由 CPU manager 拥有
+  chunk、protected set、job/fence，并由 `MoriCPUCachePolicy` 实现 replacement order。
 - MORI 不发起 proactive prefetch。CPU Program 被 promotion 后，请求进入 native scheduler，由 vLLM 的既有
   on-demand load 路径执行 H2D；D2H 也由 native offload connector 触发。
 
@@ -324,14 +338,22 @@ owner observation 首次看到一个 request residency 时扫描该 request 的�
 后续 decode 只观察 newly allocated blocks。因而一个 residency 的 bootstrap 是 `O(Bp)`，稳态是 allocation delta，
 不是每个 decode step 全量扫描。
 
-## CPU native policy
+## CPU offload typed replacement
 
-vLLM 0.31 已支持通过 `cache_policy_module_path` 加载外部 `CachePolicy`。`MoriCPUCachePolicy` 直接实现该协议，
+推荐的 SimpleCPU 路径通过版本化 `register_mori_offload_tier_provider(1, provider)` 接入该 scheduler 自己的 CPU
+BlockPool。D2H destination 分配时记录 request owner，但 entry 在 copy 期间保持 non-evictable；copy 放弃时先清 owner，
+commit 后 native `free_blocks()` 再发布 ready 与其真实 LRU sequence。load hit 与 already-cached store 追加共享 owner。
+`get_mori_offload_tier_snapshot()` 暴露 total/resident/pending block 数和 scheduler block size，adapter 再统一换算成
+token。provider 只支持 `kv_offload_backend=cpu` 与 `lazy_offload=false`，其他模式在注册期 fail closed。
+
+兼容的 policy-backed 路径中，vLLM 0.31 已支持通过 `cache_policy_module_path` 加载外部 `CachePolicy`。
+
+`MoriCPUCachePolicy` 直接实现该协议，
 在 `insert/touch/on_request_finished/mark_evictable/mark_non_evictable/remove` 回调中维护 owner、recency 和 ready
 delta。`evict(n, protected)` 返回 exactly `n` 个 `(OffloadKey, ChunkStatus)` 或 `None`；返回前再次检查
 `ref_cnt == 0` 和 native protected set，失败时不做 partial eviction。
 
-CPU manager 继续决定何时 store/load、哪些 keys 被 job/fence 保护、chunk allocation 以及传输完成。这里无需修改
+OffloadingConnector 的 CPU manager 继续决定何时 store/load、哪些 keys 被 job/fence 保护、chunk allocation 以及传输完成。这里无需修改
 native manager，更不应运行时替换其 `LRUCachePolicy.evict` bound method。
 CPU policy 另外维护 pending-owner 反向索引；Program release 以 `O(Bp)` 删除 live 与尚未 insert 的 owner，
 避免已终止 generation 在后续 store completion 时被重新挂回 typed index。ownerless cached chunk 仍是可淘汰的
@@ -358,9 +380,10 @@ MORI 沿用现有 `agentinfer.agentcache.core.controller` 构造模块，不新�
 }
 ```
 
-`decode_buffer_tokens=100` 是实现固定值，不能从部署配置覆盖。`full` 模式同时检查 CPU policy marker、HBM hook
-register/unregister 和 hook API version；任何能力缺失都在启动期 fail closed。`placement_only` 是显式消融，只运行
-Program placement，不安装两层 native policy，也不宣称完成 MORI cache management。
+`decode_buffer_tokens=100` 是实现固定值，不能从部署配置覆盖。`full` 模式同时检查 HBM hook 和 offload-tier
+capability：SimpleCPU 路径检查 snapshot、register/unregister 与 API version；兼容路径检查 CPU policy marker。
+任何能力缺失都在启动期 fail closed。`placement_only` 是显式消融，只运行 Program placement，不安装两层 native
+policy，也不宣称完成 MORI cache management。
 
 ## Cache hit 与调度开销报告
 
@@ -368,7 +391,7 @@ Program placement，不安装两层 native policy，也不宣称完成 MORI cach
 token 数。MORI diagnostics 累积请求数、四类 token counter，并输出 prefix/HBM token hit ratio；这些值来自真实
 native lookup 后的服务端观察，不来自 replay plan。`decision_cpu_seconds`、schedule cycles、tier counts、logical
 reservation、physical used 和 pending H2D/D2H 同时输出，以便 benchmark 区分“策略效果”和“调度实现开销”。
-CPU offload lookup/store/load 的 hit、job 与 transfer 指标继续使用 vLLM `OffloadingConnector` 原生 metrics；结果
+CPU offload lookup/store/load 的 hit、job 与 transfer 指标继续使用所选 connector 的 vLLM 原生 metrics；结果
 收集器应把 MORI diagnostics 和 native offload metrics 放入同一份 cache report，不能用 HBM prefix hit 代替 CPU hit。
 
 ## 源码目录
@@ -387,12 +410,16 @@ CPU offload lookup/store/load 的 hit、job 与 transfer 指标继续使用 vLLM
 | `agentinfer/agentcache/mori/runtime_state.py` | request ID 到 ProgramRef、class observer 与 index fan-out |
 | `agentinfer/agentcache/mori/typed_lru.py` | 两层复用的 incremental typed-LRU |
 | `agentinfer/agentcache/mori/hbm_policy.py` | HBM provider v1 |
+| `agentinfer/agentcache/mori/simple_cpu_policy.py` | SimpleCPU BlockPool provider v1 |
 | `agentinfer/agentcache/mori/vllm_adapter.py` | full-mode capability check 与 DRAM observation |
-| `agentinfer/agentcache/mori_cpu_policy.py` | vLLM external CPU `CachePolicy` |
+| `agentinfer/agentcache/mori_cpu_policy.py` | OffloadingConnector 兼容路径的 external CPU `CachePolicy` |
 | `agentinfer/agentcache/patches/vllm-0.31-mori-hbm-provider.patch` | 窄 HBM hook；不含 MORI strategy |
+| `agentinfer/agentcache/patches/vllm-0.31-mori-simple-cpu-provider.patch` | SimpleCPU 注册、快照和 owner 事件 |
 | `tools/benchmark_mori_typed_lru.py` | 从既有 D2H trace 重建 CPU eviction batches 的受控比较器 |
 
 受控开销结果、原始命令和限制见 [MORI typed-LRU performance](mori-performance.md)。
+组件时序、数据结构、逐文件代码走读以及与隔离 replay 原型的差异见
+[MORI 正式实现完整走读](mori-implementation.zh-CN.md)。
 
 ## 安全不变量与验证边界
 
@@ -400,10 +427,11 @@ CPU offload lookup/store/load 的 hit、job 与 transfer 指标继续使用 vLLM
 - pending lazy relief 在 pause event 前仍按 GPU reservation 计费。
 - shared entry 永远取最受保护 live owner；Program release 使用 generation-safe reverse index 清 owner。
 - HBM/CPU proposal 都是原子的 exact-count proposal；native safety check 失败则不 partial evict。
-- full mode 不允许 identity-less request、缺 DRAM quota、缺 CPU policy 或缺 HBM hook。
+- full mode 不允许 identity-less request、缺 DRAM quota、缺 connector-specific offload hook/policy 或缺 HBM hook。
 - shutdown 必须 unregister provider、detach observers 并清 process-local request bindings，支持同进程重启。
 
 当前单元测试覆盖 placement order、capacity debt、lazy demotion、固定 buffer rounding、server output accounting、
-overlap rejection、subagent isolation、shared-owner protection、两层 eviction order、heap compaction、capability failure
-和 idempotent cleanup。真实 GPU replay 仍是独立验收阶段；CPU 单元测试和 native patch smoke 不能替代 D2H/H2D、
+overlap rejection、subagent isolation、shared-owner protection、两层 eviction order、heap compaction、SimpleCPU
+snapshot/capability failure 和 idempotent cleanup。真实 GPU replay 仍是独立验收阶段；CPU 单元测试和 native patch
+smoke 不能替代 D2H/H2D、
 cache hit 与端到端时延报告。

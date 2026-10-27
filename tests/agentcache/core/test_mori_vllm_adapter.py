@@ -10,7 +10,7 @@ import pytest
 
 from agentinfer.agentcache.core.scheduler import _VllmAdmissionHooks
 from agentinfer.agentcache.mori.runtime_state import MORI_RUNTIME_STATE
-from agentinfer.agentcache.mori.vllm_adapter import install_vllm_mori
+from agentinfer.agentcache.mori.vllm_adapter import install_vllm_mori, observe_vllm_offload
 from agentinfer.scheduling import ProgramRef
 from agentinfer.scheduling.mori import MORIConfig, MORIMode, build_mori_strategy
 
@@ -96,6 +96,117 @@ def test_full_adapter_unregisters_hbm_and_cpu_indexes_on_close() -> None:
     adapter.close()
 
     assert [name for name, _ in calls] == ["register", "unregister", "cpu_close"]
+
+
+def test_full_adapter_installs_and_uninstalls_simple_cpu_provider() -> None:
+    full = build_mori_strategy(MORIConfig(mode=MORIMode.FULL)).strategy
+    calls: list[tuple[str, object]] = []
+
+    class SimpleCPUScheduler:
+        def register_mori_offload_tier_provider(self, version, provider):
+            calls.append(("cpu_register", (version, provider)))
+            return {"hook_api_version": version}
+
+        def unregister_mori_offload_tier_provider(self, provider):
+            calls.append(("cpu_unregister", provider))
+
+    class KVManager:
+        def register_mori_block_selection_provider(self, provider):
+            calls.append(("hbm_register", provider))
+            return {"hook_api_version": provider.HOOK_API_VERSION}
+
+        def unregister_mori_block_selection_provider(self, provider):
+            calls.append(("hbm_unregister", provider))
+
+    owner = SimpleNamespace(
+        connector=SimpleNamespace(scheduler_manager=SimpleCPUScheduler()),
+        kv_cache_manager=KVManager(),
+    )
+
+    adapter = install_vllm_mori(owner, full)
+    cpu_policy = adapter.cpu_policy
+    assert getattr(cpu_policy, "HOOK_API_VERSION", None) == 1
+    adapter.close()
+    adapter.close()
+
+    assert [name for name, _ in calls] == [
+        "cpu_register",
+        "hbm_register",
+        "hbm_unregister",
+        "cpu_unregister",
+    ]
+
+
+def test_simple_cpu_snapshot_is_normalized_to_tokens() -> None:
+    snapshot = SimpleNamespace(
+        total_blocks=100,
+        resident_blocks=40,
+        pending_store_blocks=3,
+        pending_load_blocks=2,
+        scheduler_block_size=16,
+    )
+    owner = SimpleNamespace(
+        connector=SimpleNamespace(
+            scheduler_manager=SimpleNamespace(
+                get_mori_offload_tier_snapshot=lambda: snapshot,
+            )
+        )
+    )
+
+    observed = observe_vllm_offload(owner)
+
+    assert observed.total_dram_kv_tokens == 1600
+    assert observed.used_dram_kv_tokens == 640
+    assert observed.pending_d2h_kv_tokens == 48
+    assert observed.pending_h2d_kv_tokens == 32
+    assert observed.dram_chunk_size_tokens == 16
+
+
+def test_simple_cpu_snapshot_rejects_impossible_residency() -> None:
+    snapshot = SimpleNamespace(
+        total_blocks=4,
+        resident_blocks=5,
+        pending_store_blocks=0,
+        pending_load_blocks=0,
+        scheduler_block_size=16,
+    )
+    owner = SimpleNamespace(
+        connector=SimpleNamespace(
+            scheduler_manager=SimpleNamespace(
+                get_mori_offload_tier_snapshot=lambda: snapshot,
+            )
+        )
+    )
+
+    assert observe_vllm_offload(owner).total_dram_kv_tokens is None
+
+
+def test_simple_cpu_registration_rolls_back_on_hbm_failure() -> None:
+    full = build_mori_strategy(MORIConfig(mode=MORIMode.FULL)).strategy
+    calls: list[str] = []
+
+    class SimpleCPUScheduler:
+        def register_mori_offload_tier_provider(self, version, provider):
+            calls.append("cpu_register")
+            return {"hook_api_version": version}
+
+        def unregister_mori_offload_tier_provider(self, provider):
+            calls.append("cpu_unregister")
+
+    owner = SimpleNamespace(
+        connector=SimpleNamespace(scheduler_manager=SimpleCPUScheduler()),
+        kv_cache_manager=SimpleNamespace(),
+    )
+
+    with pytest.raises(RuntimeError, match="register_mori_block_selection_provider"):
+        install_vllm_mori(owner, full)
+
+    assert calls == ["cpu_register", "cpu_unregister"]
+    rebound = install_vllm_mori(
+        SimpleNamespace(kv_cache_manager=None),
+        build_mori_strategy(MORIConfig(mode=MORIMode.PLACEMENT_ONLY)).strategy,
+    )
+    rebound.close()
 
 
 def test_full_adapter_cleans_process_state_when_native_unregister_fails() -> None:

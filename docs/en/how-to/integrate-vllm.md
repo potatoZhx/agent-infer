@@ -111,8 +111,8 @@ The policy rejects removed legacy keys instead of silently ignoring them. Replac
 
 ### Select MORI (vLLM 0.31)
 
-MORI uses the same scheduler bridge, but full mode requires the narrow vLLM 0.31 HBM provider patch and the native
-`OffloadingConnector`. Apply the patch as described in
+MORI uses the same scheduler bridge. Full mode primarily supports the native `SimpleCPUOffloadConnector` and requires
+the narrow vLLM 0.31 HBM and SimpleCPU provider patches. Apply both patches in order as described in
 [`agentinfer/agentcache/patches/README.md`](../../../agentinfer/agentcache/patches/README.md), then use
 [`examples/serve-mori.sh`](../../../examples/serve-mori.sh). The core AgentInfer configuration is:
 
@@ -126,12 +126,12 @@ MORI uses the same scheduler bridge, but full mode requires the narrow vLLM 0.31
 }
 ```
 
-CPU offload must select `MoriCPUCachePolicy` with
-`cache_policy_module_path=agentinfer.agentcache.mori_cpu_policy`. The 100-token decode buffer is a fixed reservation,
-not an operator setting. MORI accepts only server-resolved Program identity and never consumes a replay plan. Full mode
-fails during startup when the HBM hook, rank-local DRAM quota, or MORI CPU policy is missing. See the
-[MORI design](../../../design/module/scheduling/mori-scheduling.md) for the architecture, capacity formulas,
-typed-LRU complexity, and source map.
+SimpleCPU must use `kv_offload_backend=cpu`, `lazy_offload=false`, and prefix caching. MORI registers the CPU typed
+victim provider at startup and obtains the rank-local DRAM quota from the connector's physical snapshot. The 100-token
+decode buffer is a fixed reservation, not an operator setting. MORI accepts only server-resolved Program identity and
+never consumes a replay plan. Full mode fails during startup when the HBM hook, SimpleCPU hook, or DRAM quota is
+missing. See [Use MORI](use-mori.md) for the complete configuration, request example, and troubleshooting, and the
+[MORI design](../../../design/module/scheduling/mori-scheduling.md) for architecture and complexity.
 
 ## Understand CLI Delegation
 

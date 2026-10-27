@@ -105,9 +105,10 @@ deadline：用请求前方剩余轮数除以近期聚合请求吞吐，乘以 `f
 
 ### 选择 MORI（vLLM 0.31）
 
-MORI 通过同一个 scheduler bridge 接入，但 full 模式要求 vLLM 0.31 的窄 HBM provider patch 和原生
-`OffloadingConnector`。先按 [`agentinfer/agentcache/patches/README.md`](../../../agentinfer/agentcache/patches/README.md)
-应用 patch，再使用 [`examples/serve-mori.sh`](../../../examples/serve-mori.sh) 启动。核心配置为：
+MORI 通过同一个 scheduler bridge 接入。full 模式优先支持原生 `SimpleCPUOffloadConnector`，并要求 vLLM 0.31
+的 HBM 与 SimpleCPU 两个窄 provider patch。先按
+[`agentinfer/agentcache/patches/README.md`](../../../agentinfer/agentcache/patches/README.md) 依次应用 patch，再使用
+[`examples/serve-mori.sh`](../../../examples/serve-mori.sh) 启动。核心配置为：
 
 ```json
 {
@@ -119,11 +120,11 @@ MORI 通过同一个 scheduler bridge 接入，但 full 模式要求 vLLM 0.31 �
 }
 ```
 
-CPU offload 需选择 `MoriCPUCachePolicy`，并把
-`cache_policy_module_path` 设为 `agentinfer.agentcache.mori_cpu_policy`。`decode_buffer_tokens=100` 是固定的
-实现 reservation，不能从配置覆盖。MORI 只接受服务端从请求解析出的 Program identity，不读取 replay plan，
-且 full 模式缺少 HBM hook、DRAM quota 或 MORI CPU policy 时会在启动期失败。架构、容量公式、typed-LRU
-复杂度和源码目录见 [MORI 设计文档](../../../design/module/scheduling/mori-scheduling.md)。
+SimpleCPU 必须使用 `kv_offload_backend=cpu`、`lazy_offload=false` 并启用 prefix caching；MORI 在启动期注册 CPU
+typed-victim provider，并从 connector 的物理快照获得 DRAM quota。`decode_buffer_tokens=100` 是固定的实现
+reservation，不能从配置覆盖。MORI 只接受服务端从请求解析出的 Program identity，不读取 replay plan；缺少 HBM
+hook、SimpleCPU hook 或 DRAM quota 时 full 模式会启动失败。完整配置、请求示例和排障步骤见
+[使用 MORI](use-mori.md)，架构和复杂度见 [MORI 设计文档](../../../design/module/scheduling/mori-scheduling.md)。
 
 ## 了解 CLI 委托行为
 

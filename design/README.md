@@ -16,6 +16,7 @@ user documentation lives under [`docs/`](../docs/README.md).
 - [Program state machine](module/scheduling/program-state-machine.md)
 - [Progress-TTL scheduling](module/scheduling/progress-ttl-scheduling.md)
 - [MORI scheduling and typed KV replacement](module/scheduling/mori-scheduling.md)
+- [MORI formal implementation walkthrough (zh-CN)](module/scheduling/mori-implementation.zh-CN.md)
 - [MORI typed-LRU controlled performance comparison](module/scheduling/mori-performance.md)
 - [vLLM runtime integration](module/scheduling/vllm-runtime-integration.md)
 - [AgentInfer serve flag](module/scheduling/agentinfer-serve-flag.md) (draft)
