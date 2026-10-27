@@ -36,16 +36,12 @@ last_reviewed: 2026-10-27
 按需 H2D/D2H、job/fence 和最终物理安全。MORI 不预测未来返回、不主动预取，也没有第二个与 vLLM 并列的 token
 scheduler。证据索引：`agentinfer/scheduling/mori/strategy.py:26-33`、`agentinfer/agentcache/core/scheduler.py:3-7`。
 
-本文对应的已验证源码提交为 `83ee3205710d24fa4ec6ea23afa64ef936d78c63`；验证收据记录了 27 项 MORI focused
-tests、302 项 scheduling/agentcache tests、pre-commit，以及 vLLM 0.31 HBM patch 与 CPU external policy smoke。
-真实 GPU serve 和 1,290-request 全链路 simulator 未在该收据中重跑，本文不会把受控 CPU policy benchmark 外推为
-真实端到端性能。证据索引：`design/module/scheduling/artifacts/mori-validation-20261026.json:1-51`、
+本文描述的 SimpleCPU 正式实现源码基线为 `4bc02a818e91673e60220e9c706aee3fc6913b5d`。当前验证收据记录了
+24 项 MORI/SimpleCPU 聚焦测试、308 项 scheduling/agentcache 回归、两个 native patch 顺序应用与编译、hook smoke、
+示例 shell 语法、wheel 内容和 pre-commit 检查。共享主机上没有安装打过补丁的 vLLM 后启动 GPU serve，因此本文
+不宣称完成真实 D2H/H2D 验证，也不把受控 CPU policy benchmark 外推为真实端到端性能。证据索引：
+`design/module/scheduling/artifacts/mori-simple-cpu-validation-20261027.json:1-48`、
 `design/module/scheduling/artifacts/mori-validation-20261026.json:54-65`。
-
-2026-10-27 的 SimpleCPU 扩展另有独立收据：24 项聚焦测试、308 项 scheduling/agentcache 回归、两个 native patch
-顺序应用与编译、hook smoke、示例 shell 语法和 wheel 内容检查均通过；共享主机上没有安装新 patch 后启动 GPU serve，
-因此本文不宣称完成真实 D2H/H2D 验证。证据索引：
-`design/module/scheduling/artifacts/mori-simple-cpu-validation-20261027.json:1-48`。
 
 ## 1. 术语、边界与三组正交状态
 
@@ -133,10 +129,10 @@ classDiagram
 
     NativeVllmScheduler *-- KVCacheManager
     KVCacheManager *-- BlockPool
-    NativeVllmScheduler *-- OffloadingConnectorScheduler
+    NativeVllmScheduler *-- OffloadingConnectorScheduler : compatibility connector
     OffloadingConnectorScheduler *-- CPUOffloadingManager
     CPUOffloadingManager o-- MoriCPUCachePolicy : external CachePolicy
-    NativeVllmScheduler *-- SimpleCPUOffloadScheduler
+    NativeVllmScheduler *-- SimpleCPUOffloadScheduler : recommended connector
     SimpleCPUOffloadScheduler o-- MORISimpleCPUOffloadPolicy : provider v1
 
     VllmAdmissionHooks --> MORIRuntimeState : request-to-Program bind
@@ -179,21 +175,31 @@ flowchart LR
     subgraph CACHE[Native cache replacement plane]
       BP[HBM BlockPool]
       HP[MORIHBMPolicy]
-      OM[CPUOffloadingManager]
-      CP[MoriCPUCachePolicy]
+      SS[SimpleCPUOffloadScheduler]
+      SBP[SimpleCPU CPU BlockPool]
+      SCP[MORISimpleCPUOffloadPolicy]
+      OM[CPUOffloadingManager compatibility]
+      CP[MoriCPUCachePolicy compatibility]
       IDX1[HBM TypedLRUIndex]
       IDX2[CPU TypedLRUIndex]
+      IDX3[Compatibility CPU TypedLRUIndex]
       BP <--> HP --> IDX1
-      OM <--> CP --> IDX2
+      SS --> SBP
+      SBP <--> SCP --> IDX2
+      OM <--> CP --> IDX3
     end
 
     BR -->|composes| HOOKS
     BR -- inherits / super calls --> NS
     KVM --> BP
-    NS --> OM
+    NS --> SS
+    NS -. optional compatibility connector .-> OM
     MS -- committed class --> IDX1
     MS -- committed class --> IDX2
+    MS -. committed class .-> IDX3
     BP -. native safety authority .-> KVM
+    SBP -. queue/refcount authority .-> SS
+    SS -. D2H/H2D job authority .-> NS
     OM -. job/fence/refcount authority .-> NS
 ```
 
@@ -201,11 +207,13 @@ flowchart LR
 
 1. Program control plane 只做 identity、retention、logical capacity、tier 和 transition。
 2. Native execution plane 继续决定 batch、token step、preemption、block allocation 和 model execution。
-3. Cache replacement plane 只改变可回收条目的**选择顺序**；HBM BlockPool 与 CPU manager 仍执行合法性校验和物理操作。
+3. Cache replacement plane 只改变可回收条目的**选择顺序**。推荐路径是 SimpleCPU CPU BlockPool 上的
+   `MORISimpleCPUOffloadPolicy`；`MoriCPUCachePolicy` 仅保留为旧 `OffloadingConnector` 兼容路径。两条路径的 native
+   BlockPool/manager 都继续执行合法性校验和物理操作，同一部署不会同时启用两个 CPU provider。
 
 证据索引：`agentinfer/agentcache/core/scheduler.py:38-103`、`agentinfer/scheduling/runtime.py:69-100`、
 `agentinfer/agentcache/patches/vllm-0.31-mori-hbm-provider.patch:19-36`、
-`agentinfer/agentcache/mori_cpu_policy.py:19-26`。
+`agentinfer/agentcache/mori/simple_cpu_policy.py:14-82`、`agentinfer/agentcache/mori_cpu_policy.py:19-26`。
 
 ### 2.3 与 Progress-TTL 的接入关系
 
@@ -245,18 +253,19 @@ sequenceDiagram
 ```
 
 证据索引：`agentinfer/agentcache/core/scheduler.py:106-151`、
-`agentinfer/agentcache/core/controller.py:101-137`、`agentinfer/agentcache/mori/vllm_adapter.py:101-201`、
+`agentinfer/agentcache/core/controller.py:101-137`、`agentinfer/agentcache/mori/vllm_adapter.py:105-214`、
 `agentinfer/agentcache/patches/vllm-0.31-mori-hbm-provider.patch:176-203`、
-`agentinfer/agentcache/patches/vllm-0.31-mori-simple-cpu-provider.patch:62-177`。
+`agentinfer/agentcache/patches/vllm-0.31-mori-simple-cpu-provider.patch:88-224`。
 
 ### 3.2 full 与 placement-only
 
 `full` 模式启动时必须同时满足：单 embedded backend rank、rank-local DRAM quota 与 block/chunk size、HBM provider
 register/unregister、hook API version 1，以及一个完整 offload-tier capability。推荐的 SimpleCPU 路径要求 snapshot、
 register/unregister、CPU backend 和 eager mode；兼容的 OffloadingConnector 路径要求外部 CPU policy marker。任何条件
-不满足都会 fail closed；不会静默退化到 native LRU。`placement_only` 是显式消融：只绑定 Program placement，不安装
-HBM/CPU policy，也不能宣称完成三层 cache management。证据索引：
-`agentinfer/agentcache/core/controller.py:115-137`、`agentinfer/agentcache/mori/vllm_adapter.py:101-201`。
+不满足都会 fail closed；不会静默退化到 native LRU。adapter 通过 `connector.scheduler_manager` 定位
+`SimpleCPUOffloadScheduler`，通过版本化 register/unregister 完成实例级接线，不读取进程全局 connector。`placement_only`
+是显式消融：只绑定 Program placement，不安装 HBM/CPU policy，也不能宣称完成三层 cache management。证据索引：
+`agentinfer/agentcache/core/controller.py:115-137`、`agentinfer/agentcache/mori/vllm_adapter.py:105-214`。
 
 ## 4. 服务端 identity 与生命周期
 
@@ -785,7 +794,10 @@ bridge 仍会为 cache hit metrics 包装 `get_computed_blocks()`，但这个 ob
 SimpleCPU 没有 external `CachePolicy` slot，因此正式支持使用第二个版本化 native hook，而不是替换 scheduler 或
 `BlockPool` bound method。`SimpleCPUOffloadScheduler.register_mori_offload_tier_provider(1, provider)` 把
 `MORISimpleCPUOffloadPolicy` 注册到该实例的 CPU BlockPool；未注册时不维护 sequence/index，也不改变 native
-`popleft_n()`。
+`popleft_n()`。该 connector 的 worker 在普通 CPU tensor 上分配 KV cache；推荐路径不经过旧 `OffloadingConnector`
+的共享内存 allocator，因此不要求 `/dev/shm` 承载这部分 CPU KV cache。证据索引：
+`agentinfer/agentcache/patches/vllm-0.31-mori-simple-cpu-provider.patch:88-99`、
+`/data/zx-envs/agentinfer-vllm-0.31.0/lib/python3.12/site-packages/vllm/v1/simple_kv_offload/worker.py:220-233`。
 
 ```mermaid
 sequenceDiagram
@@ -818,8 +830,26 @@ load hit 和 already-cached store 会为同一 block 追加 owner；Program gene
 继续按剩余 owner 中最受保护者分类。connector snapshot 报告可用总 block、已有有效 hash 的 resident block、pending
 store/load block 和 scheduler block size；adapter 换算为 rank-local token quota。当前注册明确拒绝 disk backend 与 lazy
 offload，防止把未实现的成本和 owner 语义伪装成 full 支持。证据索引：
-`agentinfer/agentcache/mori/simple_cpu_policy.py:15-91`、`agentinfer/agentcache/mori/vllm_adapter.py:62-91`、
-`agentinfer/agentcache/patches/vllm-0.31-mori-simple-cpu-provider.patch:62-177`。
+`agentinfer/agentcache/mori/simple_cpu_policy.py:14-82`、`agentinfer/agentcache/mori/vllm_adapter.py:69-102`、
+`agentinfer/agentcache/mori/vllm_adapter.py:243-268`、
+`agentinfer/agentcache/patches/vllm-0.31-mori-simple-cpu-provider.patch:100-224`。
+
+SimpleCPU hook 的状态维护不是在每次 snapshot 扫描整个 CPU pool：bridge 用 `_mori_resident_block_ids` 增量维护已提交
+resident block，snapshot 直接读取集合大小；pending store/load 则从 connector 自己的在途 request/transfer 容器去重。
+注册时先让通用 BlockPool hook 发出 reset/bootstrap，再扫描一次已有 hash block 初始化 resident set，避免 bootstrap
+reset 清掉初值。关键事件与 MORI index 的关系如下：
+
+| native 事件 | MORI 动作 | 仍由谁最终决定 |
+| --- | --- | --- |
+| CPU load hit / already-cached store | 为已有 block 追加 request owner | SimpleCPU hash lookup |
+| eager D2H 分配 destination | 添加 owner，保持 `ready=false` | CPU BlockPool allocation |
+| D2H commit + `free_blocks()` | 加入 resident set，发布 native LRU sequence 和 ready | SimpleCPU transfer completion |
+| abandoned transfer | 先移除 owner/index/resident，再释放空 block | SimpleCPU abandonment path |
+| CPU pool 需要 block | 按 `INACTIVE -> BUSY -> IDLE` 提议 exact IDs | BlockPool 复验并实际回收 |
+
+证据索引：`agentinfer/agentcache/patches/vllm-0.31-mori-simple-cpu-provider.patch:49-82`、
+`agentinfer/agentcache/patches/vllm-0.31-mori-simple-cpu-provider.patch:104-224`、
+`agentinfer/agentcache/patches/vllm-0.31-mori-simple-cpu-provider.patch:228-350`。
 
 ### 12.2 兼容路径：OffloadingConnector external policy
 
@@ -928,16 +958,20 @@ flowchart TB
       FPS[ProgramScheduler + MORIStrategy]
       FRS[MORIRuntimeState]
       FHP[versioned HBM provider]
-      FCP[external CPU CachePolicy]
-      FTI[shared TypedLRUIndex]
+      FSCP[SimpleCPU provider v1 recommended]
+      FCP[external CPU CachePolicy compatibility]
+      FHI[HBM TypedLRUIndex]
+      FSI[SimpleCPU TypedLRUIndex]
+      FCI[Compatibility CPU TypedLRUIndex]
       FR --> FB --> FPS --> FRS
-      FRS --> FHP --> FTI
-      FRS --> FCP --> FTI
+      FRS --> FHP --> FHI
+      FRS --> FSCP --> FSI
+      FRS -. alternate connector .-> FCP --> FCI
     end
 ```
 
 证据索引：`/data/zx/agent-kvc/research/studies/kvc_theory/mori-reproduction-20261022/candidate/joint/launch.py:78-127`、
-`agentinfer/agentcache/core/controller.py:86-137`、`agentinfer/agentcache/mori/vllm_adapter.py:95-154`。
+`agentinfer/agentcache/core/controller.py:86-137`、`agentinfer/agentcache/mori/vllm_adapter.py:105-214`。
 
 ### 15.2 逐项差异
 
@@ -950,11 +984,11 @@ flowchart TB
 | generation | 多处以 `str program_id` 建 tier/owner 索引 | 全链路 `ProgramRef(id,generation)` | 避免释放后 ID 复用污染 |
 | overlap | replay trace 隐含串行 Program 段 | 显式拒绝同 Program overlap；subagent 独立 ID | 并发语义可验证 |
 | GPU reservation | `estimated - shared_prefix + decode_buffer(默认256)`，无 block rounding | `round_up(estimated + 100, block_size)` | 正式版固定保守 buffer 并匹配 native quantum；两者容量数值不完全等价 |
-| DRAM quota | 启动时读取 manager 私有 `_num_chunks` | 每次 snapshot 从 adapter observation 传播 rank-local quota | 消除长期抓取私有字段的 policy 依赖 |
+| DRAM quota | 启动时读取 manager 私有 `_num_chunks` | SimpleCPU public snapshot 报告 total/resident/pending block 并换算 rank-local token quota | 消除策略长期抓取 manager 私有字段的依赖 |
 | promotion | 可为候选立即 swap Acting，并对更 idle Reasoning 做 lazy mark | no-fit admission 先排队；仅 aggregate capacity debt 触发 demotion | 正式策略更保守；不能声称两者完整 placement 序列等价 |
 | HBM selection | 复用 `GapFarthestEviction` safe-tail/content graph，替换 queue/pool/KVM 多个方法 | 窄 provider v1 + block-level incremental typed-LRU | class/LRU 意图一致，owner/content 数据结构与 backend safety 路径不同 |
 | HBM native safety | 原型 `_pop()` 手动检查 hash/ref/queue link | BlockPool 批量验证 ID、refcnt、membership 后原生分配 | 正式版把安全权留给 native owner |
-| CPU selection | 替换 `LRUCachePolicy.evict`；每次扫描全部 `_evictable` | 外部 `CachePolicy`；持久 reverse index + class heaps | 消除 eviction hot-path 全量扫描 |
+| CPU selection | 替换 `LRUCachePolicy.evict`；每次扫描全部 `_evictable` | 推荐 SimpleCPU provider v1；旧 OffloadingConnector 可用 external `CachePolicy`；二者共享持久 reverse index + class heaps | 消除 eviction hot-path 全量扫描，同时保留 connector 原生传输路径 |
 | shared owner | HBM 通过 content owner deadline；CPU 通过 key owner + max priority | 两层都用 generation-safe owner set 与各自 strongest rank | 保护语义保留，表示法统一 |
 | prefetch | full-mori preset 的 P=false | strategy 明确不 prefetch | 两者都依赖 native on-demand load |
 | cleanup | close 时恢复被替换方法 | unregister provider、close policy、unbind observer | 正式生命周期可重复启动且能力可协商 |
@@ -981,11 +1015,13 @@ flowchart TB
   `INACTIVE -> BUSY -> IDLE`，同类中都以 native LRU 为 tie-break，shared entry 都采用最受保护 owner。
 - **物理映射实现不一致**：隔离 HBM 建 content/hash/parent safe-tail index，并在原型中接管多个 native 方法；正式 HBM
   直接维护 block ID owner/ready/LRU delta，由 BlockPool 负责 hash 与合法性。隔离 CPU 在 request completion 重建
-  OffloadKey owner，正式 CPU 从 native `CachePolicy` lifecycle 增量接收 owner/touch/ready。
+  OffloadKey owner；正式 SimpleCPU 从 load hit、store allocation/commit/abandon 与 CPU BlockPool delta 增量维护 block
+  owner、ready 和 recency，兼容 OffloadingConnector 才从 external `CachePolicy` lifecycle 接收 key 级 delta。
 - **不能由受控 benchmark 证明完整等价**：现有 identical digest 只验证 CPU typed-LRU 的给定 owner/class/recency
   workload，不验证两套 placement、HBM content dependency 或真实传输时序完全一致。
 
-证据索引：`agentinfer/agentcache/mori/hbm_policy.py:15-76`、`agentinfer/agentcache/mori_cpu_policy.py:19-129`、
+证据索引：`agentinfer/agentcache/mori/hbm_policy.py:15-76`、
+`agentinfer/agentcache/mori/simple_cpu_policy.py:14-82`、`agentinfer/agentcache/mori_cpu_policy.py:19-129`、
 `design/module/scheduling/mori-performance.md:5-13`。
 
 ## 16. 为什么正式 CPU policy 更快
@@ -1039,9 +1075,18 @@ agentinfer/
     └── patches/
         ├── vllm-0.31-mori-hbm-provider.patch
         └── vllm-0.31-mori-simple-cpu-provider.patch
+examples/
+└── serve-mori.sh                     # SimpleCPU full-mode 可执行启动示例
+docs/zh/how-to/use-mori.md            # 用户部署、请求和排障指南
+tests/agentcache/
+├── test_mori_simple_cpu_policy.py    # CPU typed victim provider 单测
+└── core/test_mori_vllm_adapter.py    # connector discovery/capability/snapshot 单测
+design/module/scheduling/artifacts/
+└── mori-simple-cpu-validation-20261027.json  # reviewer-readable 验证收据
 ```
 
-证据索引：`design/module/scheduling/mori-scheduling.md:374-393`。
+证据索引：`design/module/scheduling/mori-scheduling.md:374-393`、`examples/serve-mori.sh:1-17`、
+`design/module/scheduling/artifacts/mori-simple-cpu-validation-20261027.json:1-48`。
 
 ### 17.1 从入口到核心方法的阅读顺序
 
@@ -1152,21 +1197,23 @@ framework session/agent headers。证据索引：`agentinfer/scheduling/identity
 
 ```bash
 pytest -q \
-  tests/scheduling/test_mori_strategy.py \
-  tests/scheduling/test_mori_runtime.py \
+  tests/agentcache/test_mori_simple_cpu_policy.py \
+  tests/agentcache/core/test_mori_vllm_adapter.py \
   tests/agentcache/test_mori_typed_lru.py \
   tests/agentcache/test_mori_cpu_policy.py \
-  tests/agentcache/core/test_mori_controller.py \
-  tests/agentcache/core/test_mori_vllm_adapter.py
+  tests/agentcache/core/test_mori_controller.py
 
 pytest -q tests/scheduling tests/agentcache \
   --ignore=tests/agentcache/core/test_vllm_api_adapter.py \
   --ignore=tests/agentcache/entrypoints/test_serve_flag_e2e.py
+
+bash -n examples/serve-mori.sh
 ```
 
-收据结果分别为 27 passed 和 302 passed；两个 ignore 的宿主依赖原因以及未运行的真实 GPU/全链路范围已显式记录。
-证据索引：`design/module/scheduling/artifacts/mori-validation-20261026.json:7-20`、
-`design/module/scheduling/artifacts/mori-validation-20261026.json:54-65`。
+收据结果分别为 24 passed 和 308 passed；此外两个 vLLM patch 已在临时的 0.31 源码副本上按部署顺序完成
+`git apply --check`、应用、`py_compile` 和 native hook smoke，wheel 也确认包含 README 与两个 patch。真实 GPU serve
+未运行的原因在同一收据中显式记录。证据索引：
+`design/module/scheduling/artifacts/mori-simple-cpu-validation-20261027.json:6-45`。
 
 ## 19. 已知限制与后续扩展点
 
