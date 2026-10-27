@@ -119,10 +119,12 @@ def install_vllm_mori(owner: object, strategy: MORIStrategy) -> VllmMORIAdapter:
                 "full MORI with SimpleCPUOffloadConnector requires unregister_mori_offload_tier_provider(version=1)"
             )
         cpu_policy = MORISimpleCPUOffloadPolicy(MORI_RUNTIME_STATE)
-        MORI_RUNTIME_STATE.bind_provider(strategy)
         try:
+            MORI_RUNTIME_STATE.bind_provider(strategy)
             capabilities = simple_register(cpu_policy.HOOK_API_VERSION, cpu_policy)
         except BaseException:
+            with suppress(Exception):
+                simple_unregister(cpu_policy)
             try:
                 cpu_policy.close()
             finally:

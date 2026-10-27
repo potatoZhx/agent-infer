@@ -1,0 +1,8 @@
+[
+  "Auto-merging docs/README.md",
+  "Auto-merging docs/en/how-to/integrate-vllm.md",
+  "Auto-merging docs/zh/how-to/integrate-vllm.md",
+  "Auto-merging pyproject.toml",
+  "CONFLICT (content): Merge conflict in pyproject.toml",
+  "Automatic merge failed; fix conflicts and then commit the result."
+]

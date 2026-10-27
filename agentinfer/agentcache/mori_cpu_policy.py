@@ -120,7 +120,10 @@ class MoriCPUCachePolicy(CachePolicy):
                 if chunk is None or chunk.ref_cnt != 0 or key in protected:
                     # Native state changed without the expected callback. Fail
                     # closed; the reservation restores every live selection.
-                    if chunk is not None:
+                    if chunk is None:
+                        self.remove(key)
+                        self.index.stats["missing_native_entries"] += 1
+                    else:
                         self.index.mark_ready(key, chunk.ref_cnt == 0)
                     return None
                 result.append((key, chunk))

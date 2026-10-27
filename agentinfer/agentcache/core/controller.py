@@ -79,7 +79,7 @@ _REMOVED_PROGRESS_TTL_SETTINGS = frozenset(
     }
 )
 
-_CONFIGURABLE_MORI_SETTINGS = frozenset({"mode", "window_size"})
+_CONFIGURABLE_MORI_SETTINGS = frozenset({"mode", "window_size", "starvation_timeout_seconds"})
 _FIXED_MORI_SETTINGS = frozenset({"decode_buffer_tokens"})
 
 
@@ -115,6 +115,7 @@ def build_mori_controller(
     config = MORIConfig(
         mode=_mori_mode_setting(raw, "mode", MORIMode.FULL),
         window_size=_int_setting(raw, "window_size", 5, scope="mori"),
+        starvation_timeout_seconds=_float_setting(raw, "starvation_timeout_seconds", 60.0, scope="mori"),
     )
     if config.mode is MORIMode.FULL:
         if len(backend_pool_info.backends) != 1 or len(backend_pool_info.backends[0].dp_ranks) != 1:

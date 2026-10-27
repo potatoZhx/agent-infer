@@ -13,8 +13,9 @@ D2H/H2D 搬运，不依赖 `OffloadingConnector` 的共享内存分配器。
 - `lazy_offload=false`；
 - 每个请求能由服务端 middleware 解析出 Program identity。
 
-full 模式会 fail closed。HBM hook、SimpleCPU hook、DRAM 容量快照或请求 identity 任一缺失时，服务不会静默
-降级为 native LRU。需要只验证 placement 时，应显式配置 `"mode":"placement_only"`。
+full 模式在缺少 HBM hook、SimpleCPU hook 或 DRAM 容量快照时拒绝启动。运行期缺失或格式错误的 identity、
+同一 Program 的重叠请求仅返回该请求的终止错误。无效 victim 建议会回退到 native free queue 顺序，并记录告警和
+回退次数。需要只验证 placement 时，应显式配置 `"mode":"placement_only"`。
 
 ## 给 vLLM 应用两个窄补丁
 
@@ -87,7 +88,7 @@ Program；客户端不应复用 lead Program ID 表示并行 subagent。
 
 ## 运行期行为
 
-SimpleCPU adapter 在启动时完成以下闭环：
+SimpleCPU adapter 在启动和运行期间完成以下闭环：
 
 1. 从 `SimpleCPUOffloadScheduler` 快照读取 total/resident/pending block 数并换算成 token；
 2. 在 CPU BlockPool 注册 typed victim provider，淘汰顺序为 `INACTIVE -> BUSY -> IDLE`；
@@ -98,6 +99,12 @@ SimpleCPU adapter 在启动时完成以下闭环：
 
 MORI 当前不主动 prefetch。CPU tier 表示保护优先级；需要再次推理时仍由 SimpleCPU 的 native on-demand load
 触发 H2D。
+
+等待超过 `mori.starvation_timeout_seconds`（默认 `60.0`，要求有限正数）的请求跨 promotion 组按等待时间从长到短
+优先处理。若最早的可行请求无法立即 fit，MORI 会暂停 Acting GPU resident，或标记 Reasoning resident 在完成后
+降级，为该请求保留下一轮容量。新到达请求进入已有等待队列。这是服务公平性扩展，会在超时后改变 sticky placement，
+不代表响应时间上界；仍要求请求完整 fit GPU quota，且正在推理的请求最终完成。diagnostics 增加 `max_wait_seconds`，
+超时前仍沿用正常的 MORI priority 和 idleness 顺序。
 
 ## 启动检查和排障
 

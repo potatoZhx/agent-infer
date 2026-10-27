@@ -13,9 +13,10 @@ asynchronous D2H/H2D transfers; it does not use the `OffloadingConnector` shared
 - `lazy_offload=false`; and
 - the server middleware can resolve a Program identity for every request.
 
-Full mode fails closed. The service does not silently fall back to native LRU when the HBM hook, SimpleCPU hook, DRAM
-capacity snapshot, or request identity is missing. To evaluate placement alone, explicitly set
-`"mode":"placement_only"`.
+Full mode fails startup if the HBM hook, SimpleCPU hook, or DRAM capacity snapshot is missing. At runtime, missing or
+malformed identity and overlapping requests for one Program receive a terminal request error. Invalid victim advice
+falls back to the native free-queue order with a warning and a fallback counter. To evaluate placement alone,
+explicitly set `"mode":"placement_only"`.
 
 ## Apply both narrow vLLM patches
 
@@ -100,6 +101,13 @@ The SimpleCPU adapter closes the following loop at startup and runtime:
 
 MORI does not actively prefetch. CPU tier is a protection priority; a later inference still triggers SimpleCPU's native
 on-demand H2D load.
+
+Queued requests older than `mori.starvation_timeout_seconds` (default `60.0`, finite and positive) take precedence
+across all promotion groups, oldest first. If the oldest feasible request cannot fit, MORI reserves its next turn by
+demoting idle GPU residents or marking reasoning residents for demotion after completion. New arrivals join the
+pending queue. This serving fairness extension can change sticky placement after the timeout; it is not a bound on
+response time. It still requires a request to fit the full GPU quota and in-flight reasoning requests to complete.
+Diagnostics include `max_wait_seconds`; normal MORI priority and idleness ordering apply before the timeout.
 
 ## Startup checks and troubleshooting
 

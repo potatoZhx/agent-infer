@@ -20,6 +20,11 @@ and uniqueness before it mutates the queue. Hash eviction and allocation remain
 native. After bootstrap, readiness, owner, and LRU-sequence deltas maintain the
 AgentInfer typed index.
 
+If runtime advice is incomplete, invalid, duplicated, non-evictable, or raises an exception, the pool uses native LRU
+after rejecting the entire advice batch. Both paths publish the same removal callbacks. The per-pool
+`_mori_fallback_count` records every fallback; warnings are emitted at powers of two to bound repeated logging.
+Startup hook capability checks remain strict.
+
 The second patch exposes that same instance-local contract through
 `SimpleCPUOffloadScheduler`. It also reports rank-local capacity, resident
 blocks, and pending D2H/H2D blocks. Request ownership is observed while an

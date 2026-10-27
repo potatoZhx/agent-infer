@@ -249,3 +249,71 @@ def test_completion_accumulates_cache_hit_report_from_server_observations() -> N
     assert report["cache_hbm_ref_zero_hit_tokens"] == 50
     assert report["cache_prefix_hit_ratio"] == pytest.approx(0.75)
     assert report["cache_hbm_hit_ratio"] == pytest.approx(0.625)
+
+
+@pytest.mark.parametrize("tier,steps", [(MORITier.CPU, 1), (MORITier.WAITING, 1), (MORITier.WAITING, 0)])
+def test_overdue_waiter_precedes_each_normal_promotion_group(tier, steps) -> None:
+    components = build_mori_strategy()
+    old = replace(
+        view("old", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=700),
+        wait_started_at_monotonic_s=0.0,
+    )
+    young = replace(
+        view("young", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=600, step_count=steps),
+        wait_started_at_monotonic_s=99.0,
+    )
+    set_tier(components, old, MORITier.WAITING, idleness=1.0)
+    set_tier(components, young, tier)
+    calls = []
+    fixed = snapshot(old, young)
+    components.strategy.schedule_resume(
+        fixed, components.initial_factors, accepting_controller(components.strategy, components.initial_factors, calls)
+    )
+    assert [call.program for call in calls] == [old.ref]
+    assert dict(components.strategy.diagnostics(fixed, components.initial_factors)[0].fields)["max_wait_seconds"] == 100
+
+
+def test_normal_promotion_preserves_mori_decision_table() -> None:
+    components = build_mori_strategy()
+    programs = [
+        view("new-large", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=200),
+        view("new-small", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=100),
+        view("return-idle", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=100, step_count=1),
+        view("return-busy", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=100, step_count=1),
+        view("cpu", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=300, step_count=1),
+    ]
+    for program in programs:
+        set_tier(
+            components,
+            program,
+            MORITier.CPU if program.ref.program_id == "cpu" else MORITier.WAITING,
+            idleness=0.9 if program.ref.program_id == "return-idle" else 0.1,
+        )
+    calls = []
+    components.strategy.schedule_resume(
+        snapshot(*programs, hbm=10000),
+        components.initial_factors,
+        accepting_controller(components.strategy, components.initial_factors, calls),
+    )
+    assert [call.program.program_id for call in calls] == [
+        "cpu",
+        "return-busy",
+        "return-idle",
+        "new-small",
+        "new-large",
+    ]
+
+
+def test_new_arrival_cannot_bypass_pending_work_between_ticks() -> None:
+    components = build_mori_strategy()
+    old = view("old", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=500)
+    new = view("new", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=100)
+    calls = []
+    outcome = components.strategy.handle_admission(
+        snapshot(old, new),
+        components.initial_factors,
+        accepting_controller(components.strategy, components.initial_factors, calls),
+        new.ref,
+    )
+    assert outcome.disposition is AdmissionDisposition.QUEUED
+    assert [call.kind for call in calls] == [TransitionKind.QUEUE]

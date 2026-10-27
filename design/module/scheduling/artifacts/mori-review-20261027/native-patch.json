@@ -1,0 +1,17 @@
+[
+  "..........                                                               [100%]",
+  "=============================== warnings summary ===============================",
+  "tests/agentcache/test_mori_native_patch.py::test_invalid_advice_falls_back_atomically_and_updates_provider[None]",
+  "  <frozen importlib._bootstrap>:488: DeprecationWarning: builtin type SwigPyPacked has no __module__ attribute",
+  "",
+  "tests/agentcache/test_mori_native_patch.py::test_invalid_advice_falls_back_atomically_and_updates_provider[None]",
+  "  <frozen importlib._bootstrap>:488: DeprecationWarning: builtin type SwigPyObject has no __module__ attribute",
+  "",
+  "tests/agentcache/test_mori_native_patch.py: 14 warnings",
+  "  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.",
+  "    warnings.warn(",
+  "",
+  "-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html",
+  "10 passed, 16 warnings in 11.49s",
+  "sys:1: DeprecationWarning: builtin type swigvarlink has no __module__ attribute"
+]

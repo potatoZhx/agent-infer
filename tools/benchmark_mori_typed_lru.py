@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AgentInfer project
 """Compare formal and isolated MORI CPU replacement on a bounded real trace.
 
-The D2H submissions from an existing replay reconstruct the native CPU cache
-fill and exact eviction batch sizes. The benchmark keeps the recorded cache
+The D2H submissions model CPU cache fill and eviction batch sizes, assuming
+each submitted block inserts a distinct resident chunk without failed stores
+or independent removals. This is not a reconstruction of native victim events.
+The benchmark keeps the recorded cache
 capacity, executes a bounded prefix, and compares three implementations:
 
 * the isolated MORI ``MORICPUTypedPolicy`` loaded from its frozen source;

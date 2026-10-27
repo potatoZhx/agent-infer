@@ -54,6 +54,11 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         return False
 
     @property
+    def observes_streaming_context_growth(self) -> bool:
+        """Account for generated tokens when repairing MORI reservations."""
+        return True
+
+    @property
     def cache_class_epoch(self) -> int:
         return self._cache_class_epoch
 
@@ -115,7 +120,12 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                 )
 
             available = self._remaining_gpu_tokens(snapshot, strategy_factors)
-            if available >= required:
+            waiting_refs = set(snapshot.waiting_programs)
+            has_waiters = any(
+                program.ref != candidate and program.ref in waiting_refs and program.status is ProgramStatus.REASONING
+                for program in snapshot.programs
+            )
+            if available >= required and not has_waiters:
                 result = (
                     transitions.resume(candidate, reason="mori_promote_gpu", backend_id=snapshot.backend_id)
                     if view.step_count > 0
@@ -164,6 +174,27 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                 and not program.marked_for_pause
             ]
             candidates.sort(key=lambda program: self._promotion_key(program, strategy_factors, snapshot, now))
+            oldest = next(
+                (
+                    program
+                    for program in candidates
+                    if self._wait_seconds(program, now) >= self.config.starvation_timeout_seconds
+                    and self._gpu_target(program, snapshot) <= self._gpu_quota(snapshot)
+                ),
+                None,
+            )
+            if oldest is not None and self._gpu_target(oldest, snapshot) > available:
+                # Reserve the next turn for the oldest feasible overdue waiter.
+                # Reasoning victims finish before their reservation is released;
+                # do not fill that promised capacity with smaller newcomers.
+                self._repair_gpu_capacity(
+                    snapshot,
+                    strategy_factors,
+                    transitions,
+                    waiting_reservation=self._gpu_target(oldest, snapshot),
+                )
+                self.counters["starvation_capacity_reclaims"] += 1
+                return
             for candidate in candidates:
                 required = self._gpu_target(candidate, snapshot)
                 if required > available:
@@ -254,6 +285,17 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                     ("cache_prefix_hit_ratio", prefix_hit_tokens / prompt_tokens if prompt_tokens else 0.0),
                     ("cache_hbm_hit_ratio", hbm_hit_tokens / prompt_tokens if prompt_tokens else 0.0),
                     ("mean_idleness", mean_idleness),
+                    (
+                        "max_wait_seconds",
+                        max(
+                            (
+                                self._wait_seconds(program, now)
+                                for program in snapshot.programs
+                                if program.state is ProgramState.PAUSED and program.status is ProgramStatus.REASONING
+                            ),
+                            default=0.0,
+                        ),
+                    ),
                     ("cache_class_epoch", self.cache_class_epoch),
                     ("decision_cpu_seconds", self.decision_cpu_seconds),
                 ),
@@ -378,8 +420,11 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         snapshot: SchedulingSnapshot,
         factors: MORIFactors,
         transitions: TransitionController,
+        *,
+        waiting_reservation: int = 0,
     ) -> None:
-        deficit = max(0, self._gpu_reserved_tokens(snapshot, factors) - self._gpu_quota(snapshot))
+        """Reclaim quota debt or a feasible overdue waiter's next turn, without early relief."""
+        deficit = max(0, self._gpu_reserved_tokens(snapshot, factors) + waiting_reservation - self._gpu_quota(snapshot))
         if deficit == 0:
             return
         promised = sum(
@@ -471,17 +516,28 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         factors: MORIFactors,
         snapshot: SchedulingSnapshot,
         now: float,
-    ) -> tuple[int, int, float, str, int]:
+    ) -> tuple[int, float, int, int, float, str, int]:
+        """Use oldest-first priority after the wait bound, then the normal MORI order."""
         tier = self._factor(factors, program.ref).tier
         priority = 0 if tier is MORITier.CPU else 1 if program.step_count > 0 else 2
         new_context = self._gpu_target(program, snapshot) if priority == 2 else 0
+        waited = self._wait_seconds(program, now)
+        overdue = waited >= self.config.starvation_timeout_seconds
         return (
+            0 if overdue else 1,
+            -waited if overdue else 0.0,
             priority,
             new_context,
             self._idleness(self._factor(factors, program.ref), now),
             program.ref.program_id,
             program.ref.generation,
         )
+
+    @staticmethod
+    def _wait_seconds(program: ProgramView, now: float) -> float:
+        """Measure only the current pending request's wait, excluding idle time."""
+        started = program.wait_started_at_monotonic_s
+        return max(0.0, now - started) if started is not None else 0.0
 
     def _demotion_key(
         self,

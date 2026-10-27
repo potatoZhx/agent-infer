@@ -159,3 +159,36 @@ def test_hbm_owner_callback_resolves_request_only_inside_server_runtime() -> Non
 
     policy.close()
     state.unbind_provider(components.strategy)
+
+
+def test_large_stale_heap_recovers_without_losing_lru_order() -> None:
+    policy = MORIHBMPolicy(MORIRuntimeState())
+    for key in range(5000):
+        policy.on_block_ready(key, key)
+    for key in range(4999):
+        policy.on_block_touched(key, 5000 + key)
+
+    expected = (4999, *range(4999))
+    assert policy.propose(5000) == expected
+    assert policy.propose(5000) == expected
+    assert policy.index.stats["stale_repair_limit"] == 1
+    policy.close()
+
+
+def test_stale_rebuild_preserves_reserved_and_protected_entries_exactly_once() -> None:
+    index = TypedLRUIndex[int](
+        eviction_order=(CacheClass.INACTIVE, CacheClass.IDLE, CacheClass.BUSY),
+        protection_rank={CacheClass.INACTIVE: 0, CacheClass.IDLE: 1, CacheClass.BUSY: 2},
+        class_for_program=lambda program: CacheClass.INACTIVE,
+        max_stale_repairs_per_proposal=2,
+    )
+    for key in range(10):
+        index.upsert(key, owners=(), native_lru_seq=key, ready=True)
+    for key in range(2, 9):
+        index.touch(key, 10 + key)
+
+    with index.reserve_exact(3, protected=(1,)) as proposed:
+        assert proposed == (0, 9, 2)
+        index.remove(0)
+    assert index.propose_exact(9) == (1, 9, *range(2, 9))
+    assert index.propose_exact(10) is None

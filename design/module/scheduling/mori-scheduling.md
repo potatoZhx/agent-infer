@@ -228,6 +228,11 @@ offload manager 的 `num_chunks * tokens_per_chunk` 归一化得到，并经 `Dp
 
 ## Admission、promotion 与 demotion
 
+2026-10-27 服务安全修订：下述首版 sticky 顺序保留用于未超时请求。当前实现对等待超过
+`mori.starvation_timeout_seconds`（默认 60 秒）的请求使用跨组 oldest-first 顺序，并在必要时为最早可行请求
+回收 GPU reservation；Reasoning 仍只在完成后释放容量。新请求不能从 admission 快径绕过正在等待的请求。
+这是防饿死的工程扩展，不归因于论文算法；用法与边界见 [MORI 使用指南](../../../docs/zh/how-to/use-mori.md)。
+
 ```mermaid
 flowchart TD
     E[request arrival or periodic tick] --> S[refresh committed context and rank quotas]
@@ -322,7 +327,8 @@ classDiagram
 
 同时声称“精确 class 顺序”“proposal 不扫描”且“任意 Program class change 为 O(1)”是不成立的。本实现选择
 eager reverse-index reclassification，明确支付 `O(Bp log N)`，换取 eviction hot path 不再像实验原型一样
-遍历全部 CPU keys。stale repair 超过上限时 fail closed，不回退为无界全扫。
+遍历全部 CPU keys。2026-10-27 修订后，stale repair 超过上限时重建当前 class 的堆，自愈后继续精确 proposal；
+该异常恢复分支额外支付 `O(Nc)`，不再抛出运行期异常。上表 proposal/reservation 复杂度适用于未触发恢复的常规路径。
 
 ## HBM native hook
 

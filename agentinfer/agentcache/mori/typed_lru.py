@@ -18,7 +18,7 @@ EntryT = TypeVar("EntryT", bound=Hashable)
 
 
 class StaleRepairLimitExceeded(RuntimeError):
-    """Raised when a proposal cannot repair its lazy heap state within its bound."""
+    """Legacy exception retained for imports; stale heaps now rebuild in place."""
 
 
 @dataclass
@@ -38,7 +38,8 @@ class TypedLRUIndex(Generic[EntryT]):
     Program. That costs ``O(B_p log N)`` for a Program owning ``B_p`` entries;
     claiming both exact ordering and ``O(1)`` class change would be incorrect.
     Proposal work is proportional to selected entries, protected heads, and a
-    bounded number of amortized stale heap records.
+    bounded number of stale heap pops, followed by a class-local rebuild when
+    necessary. All mutations and reservations must run on the engine thread.
     """
 
     def __init__(
@@ -252,7 +253,11 @@ class TypedLRUIndex(Generic[EntryT]):
                         stale_repairs += 1
                         if stale_repairs > self._max_stale_repairs:
                             self.stats["stale_repair_limit"] += 1
-                            raise StaleRepairLimitExceeded("typed LRU stale repair limit exceeded")
+                            # Keep already popped live records out of the rebuilt
+                            # heap: the reservation restores those exactly once.
+                            excluded = selected_keys | {record[3] for _, record in deferred}
+                            self._rebuild_heap(cache_class, excluded)
+                            heap = self._heaps[cache_class]
                         continue
                     key = item[3]
                     if key in selected_keys:
@@ -312,10 +317,15 @@ class TypedLRUIndex(Generic[EntryT]):
         ready = self._ready_counts[cache_class]
         if len(heap) < max(64, 2 * ready):
             return
+        self._rebuild_heap(cache_class)
+
+    def _rebuild_heap(self, cache_class: CacheClass, excluded: Iterable[EntryT] = ()) -> None:
+        """Discard stale records, preserving any live records held by a reservation."""
+        excluded_keys = set(excluded)
         rebuilt = [
             (entry.native_lru_seq, self._new_ticket(), entry.version, entry.key)
             for key in self._class_entries[cache_class]
-            if (entry := self._entries.get(key)) is not None and entry.ready
+            if key not in excluded_keys and (entry := self._entries.get(key)) is not None and entry.ready
         ]
         heapq.heapify(rebuilt)
         self._heaps[cache_class] = rebuilt

@@ -59,6 +59,11 @@ class SchedulingStrategy(Generic[StrategyGlobalFactorsT, StrategyProgramFactorsT
         """Return whether one Program may own multiple simultaneous requests."""
         return True
 
+    @property
+    def observes_streaming_context_growth(self) -> bool:
+        """Opt into using streamed output tokens in placement capacity estimates."""
+        return False
+
     _EVENT_CALLBACKS: ClassVar[dict[SchedulingEventKind, str]] = {
         SchedulingEventKind.REQUEST_PENDING: "on_request_pending",
         SchedulingEventKind.REQUEST_ADMITTED: "on_program_admitted",

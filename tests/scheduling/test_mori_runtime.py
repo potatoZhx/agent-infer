@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 
 from agentinfer.scheduling.backend import BackendInfo, BackendPoolInfo, DpRankInfo
@@ -95,3 +97,33 @@ def test_same_program_cannot_overlap_but_subagent_is_a_distinct_program() -> Non
     assert lead_ref.program_id == "task:lead"
     assert child_ref.program_id == "task:child"
     assert runtime.registry.require(lead_ref).expected_resume is True
+
+
+@pytest.mark.parametrize("resident_finished", [True, False])
+def test_overdue_waiter_eventually_reclaims_a_sticky_gpu_reservation(resident_finished) -> None:
+    runtime = scheduler()
+    capacity = backend(208)
+    with patch("agentinfer.scheduling.runtime.time.monotonic", return_value=0.0) as clock:
+        assert runtime.on_request_arrival("resident", AgentIdentity("resident"), 100, capacity, "resident")
+        if resident_finished:
+            runtime.on_request_completion("resident", 100)
+        clock.return_value = 1.0
+        assert not runtime.on_request_arrival("old", AgentIdentity("old"), 100, capacity, "old")
+        old = runtime.program_ref_for_request("old")
+        for tick in range(2, 62, 5):
+            clock.return_value = float(tick)
+            runtime.schedule_cycle(capacity)
+            assert runtime.consume_admitted_requests() == ()
+        clock.return_value = 62.0
+        assert not runtime.on_request_arrival("young", AgentIdentity("young"), 1, capacity, "young")
+        runtime.schedule_cycle(capacity)
+        assert runtime.consume_admitted_requests() == ()
+        assert runtime.registry.require(old).wait_started_at_monotonic_s == 1.0
+        if not resident_finished:
+            resident = runtime.program_ref_for_request("resident")
+            assert runtime.registry.require(resident).marked_for_pause
+            runtime.on_request_completion("resident", 100)
+        clock.return_value = 68.0
+        runtime.schedule_cycle(capacity)
+        assert [entry.request_id for entry, _ in runtime.consume_admitted_requests()] == ["old"]
+        assert runtime.registry.require(old).wait_started_at_monotonic_s is None

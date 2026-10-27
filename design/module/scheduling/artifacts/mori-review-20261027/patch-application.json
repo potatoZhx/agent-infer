@@ -1,0 +1,13 @@
+[
+  "$ git apply --check /data/zx/agent-kvc/.worktrees/mori/agentinfer/agentcache/patches/vllm-0.31-mori-hbm-provider.patch",
+  "$ patch --dry-run -p1 -i /data/zx/agent-kvc/.worktrees/mori/agentinfer/agentcache/patches/vllm-0.31-mori-hbm-provider.patch",
+  "checking file vllm/v1/core/block_pool.py",
+  "checking file vllm/v1/core/kv_cache_manager.py",
+  "$ git apply /data/zx/agent-kvc/.worktrees/mori/agentinfer/agentcache/patches/vllm-0.31-mori-hbm-provider.patch",
+  "exit=0",
+  "$ git apply --check /data/zx/agent-kvc/.worktrees/mori/agentinfer/agentcache/patches/vllm-0.31-mori-simple-cpu-provider.patch",
+  "$ patch --dry-run -p1 -i /data/zx/agent-kvc/.worktrees/mori/agentinfer/agentcache/patches/vllm-0.31-mori-simple-cpu-provider.patch",
+  "checking file vllm/v1/simple_kv_offload/manager.py",
+  "$ git apply /data/zx/agent-kvc/.worktrees/mori/agentinfer/agentcache/patches/vllm-0.31-mori-simple-cpu-provider.patch",
+  "exit=0"
+]

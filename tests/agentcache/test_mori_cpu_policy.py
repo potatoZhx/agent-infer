@@ -56,3 +56,35 @@ def test_cpu_policy_resolves_server_owners_and_uses_typed_order() -> None:
     assert policy.evict(3, set()) == inserted
     policy.close()
     MORI_RUNTIME_STATE.unbind_provider(components.strategy)
+
+
+def test_large_cpu_touch_batch_does_not_abort_native_eviction() -> None:
+    policy = MoriCPUCachePolicy(5000)
+    keys = [make_offload_key(str(i).encode(), 0) for i in range(5000)]
+    for i, key in enumerate(keys):
+        chunk = ChunkStatus(i)
+        chunk.ref_cnt = 0
+        policy.insert(key, chunk)
+    policy.touch(keys[:-1], ReqContext("unbound"))
+
+    result = policy.evict(2, set())
+    assert result is not None
+    assert [key for key, _ in result] == [keys[-1], keys[-2]]
+    assert len(policy.chunks) == 4998
+    policy.close()
+
+
+def test_missing_native_chunk_is_removed_and_next_eviction_recovers() -> None:
+    policy = MoriCPUCachePolicy(2)
+    keys = [make_offload_key(str(i).encode(), 0) for i in range(2)]
+    for i, key in enumerate(keys):
+        chunk = ChunkStatus(i)
+        chunk.ref_cnt = 0
+        policy.insert(key, chunk)
+    policy.chunks.pop(keys[0])
+
+    assert policy.evict(2, set()) is None
+    assert policy.index.cache_class(keys[0]) is None
+    assert policy.get(keys[1]) is not None
+    assert [key for key, _ in policy.evict(1, set())] == [keys[1]]
+    policy.close()

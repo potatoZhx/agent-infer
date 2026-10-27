@@ -111,6 +111,8 @@ The policy rejects removed legacy keys instead of silently ignoring them. Replac
 
 ### Select MORI (vLLM 0.31)
 
+This section requires a patched vLLM 0.31.0 environment; the vLLM 0.23.0 environment above cannot run full MORI.
+
 MORI uses the same scheduler bridge. Full mode primarily supports the native `SimpleCPUOffloadConnector` and requires
 the narrow vLLM 0.31 HBM and SimpleCPU provider patches. Apply both patches in order as described in
 [`agentinfer/agentcache/patches/README.md`](../../../agentinfer/agentcache/patches/README.md), then use

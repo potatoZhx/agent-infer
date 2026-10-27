@@ -47,6 +47,10 @@ from agentinfer.scheduling.transitions import (
 logger = logging.getLogger(__name__)
 
 
+class RequestAdmissionError(ValueError):
+    """Reject one request before admission has mutated any Program state."""
+
+
 @dataclass
 class _RequestBinding:
     """Exact Program, output, and backend cache observations for one request attempt."""
@@ -173,7 +177,7 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
             and not self.strategy.allows_overlapping_program_requests
             and self._program_requests.get(current_ref)
         ):
-            raise ValueError(
+            raise RequestAdmissionError(
                 f"strategy forbids overlapping requests for Program {current_ref.program_id}@{current_ref.generation}"
             )
         self._cycle_dirty = True
@@ -187,6 +191,8 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
         )
         previous_status = self.registry.mark_request_started(program.ref)
         now = time.monotonic()
+        if program.state is ProgramState.PAUSED and program.wait_started_at_monotonic_s is None:
+            program.wait_started_at_monotonic_s = now
         if created:
             self._shared_prefix_freshness_anchor_at[program.ref] = now
         last_finished_at = self._last_request_finished_at.get(program.ref)
@@ -300,7 +306,7 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
                 binding.first_output_at_monotonic_s = time.monotonic()
             previous_output = binding.output_tokens
             binding.output_tokens = max(binding.output_tokens, max(0, total_output_tokens))
-            if binding.output_tokens > previous_output:
+            if self.strategy.observes_streaming_context_growth and binding.output_tokens > previous_output:
                 program = self.registry.get(binding.program)
                 if program is not None:
                     program.tokens = replace(
@@ -503,6 +509,8 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
                 program.status = (
                     ProgramStatus.REASONING if self._program_requests.get(binding.program) else ProgramStatus.ACTING
                 )
+                if not self._program_requests.get(binding.program):
+                    program.wait_started_at_monotonic_s = None
                 if previous_status is not program.status:
                     self._dispatch_event(
                         self._event(
@@ -537,6 +545,7 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
             program.state = ProgramState.ACTIVE
             program.backend_id = request.backend_id
             program.marked_for_pause = False
+            program.wait_started_at_monotonic_s = None
             self._admit_program_requests(program.ref)
         elif request.kind is TransitionKind.QUEUE:
             if program.state is not ProgramState.PAUSED:

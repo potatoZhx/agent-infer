@@ -105,6 +105,8 @@ deadline：用请求前方剩余轮数除以近期聚合请求吞吐，乘以 `f
 
 ### 选择 MORI（vLLM 0.31）
 
+本节需要切换到已应用补丁的 vLLM 0.31.0 环境；上文的 vLLM 0.23.0 环境不能运行 full MORI。
+
 MORI 通过同一个 scheduler bridge 接入。full 模式优先支持原生 `SimpleCPUOffloadConnector`，并要求 vLLM 0.31
 的 HBM 与 SimpleCPU 两个窄 provider patch。先按
 [`agentinfer/agentcache/patches/README.md`](../../../agentinfer/agentcache/patches/README.md) 依次应用 patch，再使用

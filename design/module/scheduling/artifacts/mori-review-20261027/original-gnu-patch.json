@@ -1,0 +1,24 @@
+{
+  "command": [
+    "patch",
+    "--dry-run",
+    "-p1",
+    "-i",
+    "/tmp/mori-review-fixes-20261027/baseline/agentinfer/agentcache/patches/vllm-0.31-mori-simple-cpu-provider.patch"
+  ],
+  "returncode": 1,
+  "stdout": [
+    "checking file vllm/v1/simple_kv_offload/manager.py",
+    "Hunk #1 succeeded at 6 (offset -1 lines).",
+    "Hunk #2 succeeded at 87 (offset -1 lines).",
+    "Hunk #4 succeeded at 406 (offset 1 line).",
+    "Hunk #6 succeeded at 890 (offset -4 lines).",
+    "Hunk #8 succeeded at 963 (offset -1 lines).",
+    "Hunk #9 succeeded at 1076 (offset -1 lines).",
+    "Hunk #11 FAILED at 1282.",
+    "Hunk #14 succeeded at 1497 (offset -10 lines).",
+    "Hunk #15 succeeded at 1508 (offset -12 lines).",
+    "1 out of 15 hunks FAILED"
+  ],
+  "stderr": []
+}

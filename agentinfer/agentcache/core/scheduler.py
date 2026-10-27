@@ -14,11 +14,11 @@ import math
 import os
 import time
 from collections.abc import Callable, Iterable, Mapping
-from typing import Protocol, cast
+from typing import Protocol, cast, get_args, get_type_hints
 
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.engine import EngineCoreEventType
+from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.request import Request, RequestStatus
 
 from agentinfer.agentcache.core.api_adapter import LIFECYCLE_SOCKET_ENV, UnixLifecycleReceiver
@@ -27,12 +27,19 @@ from agentinfer.agentcache.core.vllm_logging import attach_agentinfer_to_vllm_lo
 from agentinfer.agentcache.mori.runtime_state import MORI_RUNTIME_STATE
 from agentinfer.agentcache.mori.vllm_adapter import install_vllm_mori, observe_vllm_offload
 from agentinfer.scheduling.backend import BackendInfo, BackendPoolInfo, DispatchTarget, DpRankInfo
-from agentinfer.scheduling.identity import AgentIdentity, JsonMapping, JsonObject, parse_agent_identity
+from agentinfer.scheduling.identity import AgentIdentity, JsonMapping, JsonObject, MetadataError, parse_agent_identity
 from agentinfer.scheduling.lifecycle import ProgramLifecycle
 from agentinfer.scheduling.mori import MORIStrategy
 from agentinfer.scheduling.request_pool import RequestPoolEntry, RetainedRequestT
+from agentinfer.scheduling.runtime import RequestAdmissionError
 
 logger = logging.getLogger(__name__)
+
+# vLLM 0.23 returns (request_id, client_index); 0.31 returns Request objects.
+# Inspect the native public contract once, so retained-only aborts also use the
+# host's format even when native_finish returns an empty list.
+_NATIVE_FINISH_RETURNS_REQUESTS = get_args(get_type_hints(Scheduler.finish_requests)["return"]) == (Request,)
+NativeFinishedRequest = Request | tuple[str, int]
 
 
 class EmbeddedSchedulerController(Protocol[RetainedRequestT]):
@@ -133,6 +140,7 @@ class _VllmAdmissionHooks:
         self.block_size = int(block_size)
         self.local_hbm_kv_tokens = int(kv_cache_config.num_blocks) * self.block_size
         self.tracked_native: set[str] = set()
+        self._rejected_requests: list[Request] = []
         self._local_prefix_observations: dict[str, tuple[int, int]] = {}
         self._prefix_refresh_pending = False
         self.controller = (
@@ -140,9 +148,9 @@ class _VllmAdmissionHooks:
             if settings.get("strategy", "progress_ttl") == "progress_ttl"
             else build_controller(self.backend_pool_info(owner), settings)
         )
-        self._install_prefix_lookup_observer(owner)
         strategy = getattr(self.controller, "strategy", None)
         self._mori_adapter = install_vllm_mori(owner, strategy) if isinstance(strategy, MORIStrategy) else None
+        self._install_prefix_lookup_observer(owner)
         self.lifecycle_receiver: UnixLifecycleReceiver | None = None
         socket_path = settings.get("lifecycle_socket_path") or os.environ.get(LIFECYCLE_SOCKET_ENV)
         if socket_path is not None:
@@ -153,20 +161,29 @@ class _VllmAdmissionHooks:
     def add_request(self, owner: Scheduler, request: Request, native_add: Callable[[Request], None]) -> None:
         """Retain agentic work or pass compatibility traffic directly to vLLM."""
         self._drain_lifecycle_signals()
-        metadata = _metadata_from_request(request)
+        try:
+            metadata = _metadata_from_request(request)
+        except MetadataError:
+            self._reject_request(request, "invalid_program_identity")
+            return
         if metadata is None:
             if bool(getattr(self.controller, "requires_program_identity", False)):
-                raise ValueError("selected AgentInfer strategy requires server-resolved Program identity")
+                self._reject_request(request, "missing_program_identity")
+                return
             native_add(request)
             return
         retained_at_monotonic_s = time.monotonic()
-        dispatch_now = self.controller.on_request_arrival(
-            request.request_id,
-            metadata,
-            request.num_prompt_tokens,
-            self.backend_pool_info(owner),
-            request,
-        )
+        try:
+            dispatch_now = self.controller.on_request_arrival(
+                request.request_id,
+                metadata,
+                request.num_prompt_tokens,
+                self.backend_pool_info(owner),
+                request,
+            )
+        except RequestAdmissionError:
+            self._reject_request(request, "overlapping_program_requests")
+            return
         if isinstance(getattr(self.controller, "strategy", None), MORIStrategy):
             program = self.controller.program_ref_for_request(request.request_id)
             if program is None:
@@ -175,6 +192,29 @@ class _VllmAdmissionHooks:
         if dispatch_now:
             self.tracked_native.add(request.request_id)
             self._add_to_native_waiting(request, retained_at_monotonic_s, native_add)
+
+    def _reject_request(self, request: Request, reason: str) -> None:
+        """Finish an unadmitted request and retain its error until EngineCore polls outputs.
+
+        No native queue, KV allocation, or connector has observed this request,
+        so native finish_requests would be a no-op. Keep the engine live until
+        the normal output channel delivers a terminal result to this client.
+        """
+        request.status = RequestStatus.FINISHED_ERROR
+        self._rejected_requests.append(request)
+        logger.warning("AgentInfer rejected request=%s reason=%s", request.request_id, reason)
+
+    def publish_rejections(self, outputs: dict[int, EngineCoreOutputs]) -> None:
+        """Append terminal admission errors to native output batches, exactly once."""
+        for request in self._rejected_requests:
+            batch = outputs.setdefault(request.client_index, EngineCoreOutputs())
+            batch.outputs.append(
+                EngineCoreOutput(request_id=request.request_id, new_token_ids=[], finish_reason=FinishReason.ERROR)
+            )
+            if batch.finished_requests is None:
+                batch.finished_requests = set()
+            batch.finished_requests.add(request.request_id)
+        self._rejected_requests.clear()
 
     def before_schedule(self, owner: Scheduler, native_add: Callable[[Request], None]) -> None:
         """Run one AgentCache cycle and transfer admitted requests to native waiting."""
@@ -296,19 +336,26 @@ class _VllmAdmissionHooks:
                         max(0, local_observation[0] - local_observation[1]),
                     )
 
-    def cancel_retained(self, request_ids: str | Iterable[str] | None) -> list[tuple[str, int]]:
+    def cancel_retained(
+        self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
+    ) -> list[NativeFinishedRequest]:
         """Cancel attempts that have not entered native vLLM yet."""
         normalized = (
             self.controller.retained_request_ids
             if request_ids is None
             else ((request_ids,) if isinstance(request_ids, str) else tuple(request_ids))
         )
-        cancelled: list[tuple[str, int]] = []
+        cancelled: list[NativeFinishedRequest] = []
         for request_id in normalized:
             entry = self.controller.cancel_request(request_id)
             if entry is not None:
                 MORI_RUNTIME_STATE.unbind_request(request_id)
-                cancelled.append((request_id, entry.retained_request.client_index))
+                entry.retained_request.status = finished_status
+                cancelled.append(
+                    entry.retained_request
+                    if _NATIVE_FINISH_RETURNS_REQUESTS
+                    else (request_id, entry.retained_request.client_index)
+                )
         return cancelled
 
     def finish_requests(
@@ -316,20 +363,21 @@ class _VllmAdmissionHooks:
         owner: Scheduler,
         request_ids: str | Iterable[str] | None,
         finished_status: RequestStatus,
-        native_finish: Callable[[str | Iterable[str] | None, RequestStatus], list[tuple[str, int]]],
-    ) -> list[tuple[str, int]]:
+        native_finish: Callable[[str | Iterable[str] | None, RequestStatus], list[NativeFinishedRequest]],
+    ) -> list[NativeFinishedRequest]:
         """Finish retained and native attempts while reporting only terminal lifecycle facts."""
         normalized_request_ids = (
             request_ids if request_ids is None or isinstance(request_ids, str) else tuple(request_ids)
         )
-        retained = self.cancel_retained(normalized_request_ids)
+        retained = self.cancel_retained(normalized_request_ids, finished_status)
         token_counts = {
             request_id: request.num_tokens
             for request_id, request in owner.requests.items()
             if request_id in self.tracked_native
         }
         native = native_finish(normalized_request_ids, finished_status)
-        for request_id, _ in native:
+        for request in native:
+            request_id = request[0] if isinstance(request, tuple) else request.request_id
             if request_id in self.tracked_native:
                 self.controller.on_request_completion(request_id, token_counts.get(request_id, 0))
                 self.tracked_native.discard(request_id)
@@ -377,7 +425,7 @@ class _VllmAdmissionHooks:
 
     def unfinished_count(self, native_count: int) -> int:
         """Merge retained and native liveness without exposing request objects to EngineCore."""
-        return native_count + self.controller.retained_request_count
+        return native_count + self.controller.retained_request_count + len(self._rejected_requests)
 
     def close(self) -> None:
         """Release process-local MORI hooks and the lifecycle socket idempotently."""
@@ -503,6 +551,7 @@ class AgentCacheAsyncSchedulerBridge(AsyncScheduler):
         }
         outputs = super().update_from_output(scheduler_output, model_runner_output)
         self._agentcache.after_output(self, outputs, before)
+        self._agentcache.publish_rejections(outputs)
         return outputs
 
     def finish_requests(self, request_ids, finished_status: RequestStatus):
@@ -547,6 +596,7 @@ class AgentCacheSyncSchedulerBridge(Scheduler):
         }
         outputs = super().update_from_output(scheduler_output, model_runner_output)
         self._agentcache.after_output(self, outputs, before)
+        self._agentcache.publish_rejections(outputs)
         return outputs
 
     def finish_requests(self, request_ids, finished_status: RequestStatus):

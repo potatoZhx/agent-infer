@@ -62,3 +62,14 @@ def test_placement_only_is_an_explicit_ablation_without_dram() -> None:
 def test_decode_buffer_cannot_be_overridden() -> None:
     with pytest.raises(ValueError, match="fixed implementation"):
         build_mori_controller(backend(), {"mori": {"decode_buffer_tokens": 999}})
+
+
+def test_controller_accepts_finite_positive_starvation_timeout() -> None:
+    controller = build_mori_controller(backend(), {"mori": {"starvation_timeout_seconds": 12.5}})
+    assert controller.strategy.config.starvation_timeout_seconds == 12.5
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan"), True])
+def test_controller_rejects_invalid_starvation_timeout(timeout) -> None:
+    with pytest.raises(ValueError, match="starvation_timeout_seconds"):
+        build_mori_controller(backend(), {"mori": {"starvation_timeout_seconds": timeout}})

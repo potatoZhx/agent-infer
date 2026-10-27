@@ -1,5 +1,4 @@
 diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
-index 664804d..5906dee 100644
 --- a/vllm/v1/core/block_pool.py
 +++ b/vllm/v1/core/block_pool.py
 @@ -1,7 +1,7 @@
@@ -11,10 +10,11 @@ index 664804d..5906dee 100644
  
  from vllm.distributed.kv_events import (
      MEDIUM_GPU,
-@@ -29,6 +29,27 @@ from vllm.v1.core.kv_cache_utils import (
+@@ -28,6 +28,27 @@
+     to_event_extra_keys,
  )
  from vllm.v1.request import Request
- 
++
 +
 +class MoriBlockSelectionProvider(Protocol):
 +    """Narrow advisory contract; BlockPool remains the safety authority."""
@@ -35,11 +35,10 @@ index 664804d..5906dee 100644
 +        self, count: int, protected_block_ids: Iterable[int] = ()
 +    ) -> tuple[int, ...] | None: ...
 +
-+
+ 
  logger = init_logger(__name__)
  
- 
-@@ -195,6 +216,15 @@ class BlockPool:
+@@ -195,6 +216,16 @@
          # are still being read until the pool reuses them.
          self._reuse_watchers: dict[int, Callable[[KVCacheBlock], None]] = {}
  
@@ -49,13 +48,14 @@ index 664804d..5906dee 100644
 +        # Build the sequence index lazily on registration so disabled MORI
 +        # adds no steady-state bookkeeping to the native allocation path.
 +        self._mori_free_lru_seq: dict[int, int] | None = None
++        self._mori_fallback_count = 0
 +        self._mori_next_front_seq = -1
 +        self._mori_next_back_seq = 0
 +
      def get_cached_block(
          self, block_hash: BlockHash, kv_cache_group_ids: list[int]
      ) -> list[KVCacheBlock] | None:
-@@ -681,7 +711,41 @@ class BlockPool:
+@@ -681,7 +712,52 @@
          if num_blocks > self.get_num_free_blocks():
              raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
  
@@ -64,41 +64,52 @@ index 664804d..5906dee 100644
 +        if provider is None:
 +            ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
 +        else:
-+            proposed = provider.propose(num_blocks, ())
-+            if proposed is None or len(proposed) != num_blocks:
-+                raise RuntimeError(
-+                    "MORI block provider could not return an exact victim set"
-+                )
-+            if len(set(proposed)) != len(proposed):
-+                raise RuntimeError("MORI block provider returned duplicate block IDs")
-+            ret = []
-+            for block_id in proposed:
-+                if not 0 <= block_id < len(self.blocks):
-+                    raise RuntimeError(
-+                        f"MORI block provider returned invalid block ID {block_id}"
++            try:
++                proposed = provider.propose(num_blocks, ())
++                if proposed is None or len(proposed) != num_blocks:
++                    raise ValueError("incomplete victim advice")
++                if len(set(proposed)) != num_blocks:
++                    raise ValueError("duplicate victim IDs")
++                advised = []
++                for block_id in proposed:
++                    if type(block_id) is not int or not 0 <= block_id < len(
++                        self.blocks
++                    ):
++                        raise ValueError("invalid victim ID")
++                    block = self.blocks[block_id]
++                    if (
++                        block.is_null
++                        or block.ref_cnt != 0
++                        or block.prev_free_block is None
++                        or block.next_free_block is None
++                    ):
++                        raise ValueError("non-evictable victim ID")
++                    advised.append(block)
++            except Exception:
++                # Advice never owns safety or availability. Validate the whole
++                # batch before touching the queue, then use native LRU on failure.
++                self._mori_fallback_count += 1
++                if self._mori_fallback_count & (self._mori_fallback_count - 1) == 0:
++                    logger.warning(
++                        "MORI victim advice rejected; using native LRU (fallbacks=%d)",
++                        self._mori_fallback_count,
++                        exc_info=True,
 +                    )
-+                block = self.blocks[block_id]
-+                if (
-+                    block.is_null
-+                    or block.ref_cnt != 0
-+                    or block.prev_free_block is None
-+                    or block.next_free_block is None
-+                ):
-+                    raise RuntimeError(
-+                        f"MORI block provider returned non-evictable block ID {block_id}"
-+                    )
-+                ret.append(block)
-+            # Validate the complete proposal before mutating native state.
++                ret = self.free_block_queue.popleft_n(num_blocks)
++            else:
++                ret = advised
++                for block in ret:
++                    self.free_block_queue.remove(block)
++            # Publish identical deltas for native fallback and accepted advice.
++            assert self._mori_free_lru_seq is not None
 +            for block in ret:
-+                self.free_block_queue.remove(block)
-+                assert self._mori_free_lru_seq is not None
 +                self._mori_free_lru_seq.pop(block.block_id, None)
 +                provider.on_block_evictability_changed(block.block_id, False)
 +                provider.on_block_removed(block.block_id)
  
          if self._reuse_watchers:
              self._notify_reuse(ret)
-@@ -727,7 +791,14 @@ class BlockPool:
+@@ -727,7 +803,14 @@
              self._reuse_watchers[block.block_id] = on_reuse
              if block.ref_cnt == 0:
                  released.append(block)
@@ -113,7 +124,7 @@ index 664804d..5906dee 100644
  
      def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
          """If a block is cached in `cached_block_hash_to_block`, we reset its hash
-@@ -766,6 +837,10 @@ class BlockPool:
+@@ -766,6 +849,10 @@
              # candidate), so remove it.
              if block.ref_cnt == 0 and not block.is_null:
                  self.free_block_queue.remove(block)
@@ -124,7 +135,7 @@ index 664804d..5906dee 100644
              block.ref_cnt += 1
              if self.metrics_collector:
                  self.metrics_collector.on_block_accessed(block)
-@@ -800,13 +875,28 @@ class BlockPool:
+@@ -800,12 +887,27 @@
                      # FIFO reuse of cached blocks for LRU eviction behavior.
                      blocks_to_evict_last.append(block)
  
@@ -142,18 +153,17 @@ index 664804d..5906dee 100644
 +                )
          for pool, blocks in other_pools.items():
              pool.free_blocks(blocks)
- 
++
 +    def observe_mori_block_owner(
 +        self, request_id: str, blocks: Iterable[KVCacheBlock]
 +    ) -> None:
 +        if (provider := self._mori_block_selection_provider) is not None:
 +            for block_id in {block.block_id for block in blocks if not block.is_null}:
 +                provider.on_block_owner_added(block_id, request_id)
-+
+ 
      def evict_blocks(self, block_ids: set[int]) -> None:
          """Evict blocks from the prefix cache by their block IDs.
- 
-@@ -858,6 +948,14 @@ class BlockPool:
+@@ -858,6 +960,14 @@
          for block in self.blocks:
              block.reset_hash()
  
@@ -168,7 +178,7 @@ index 664804d..5906dee 100644
          if self.metrics_collector:
              self.metrics_collector.reset()
  
-@@ -902,3 +1000,46 @@ class BlockPool:
+@@ -902,3 +1012,46 @@
          events = self.kv_event_queue
          self.kv_event_queue = []
          return events
@@ -216,10 +226,9 @@ index 664804d..5906dee 100644
 +            self._mori_free_lru_seq[block.block_id] = self._mori_next_back_seq
 +            self._mori_next_back_seq += 1
 diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
-index 2d39a38..56d32f9 100644
 --- a/vllm/v1/core/kv_cache_manager.py
 +++ b/vllm/v1/core/kv_cache_manager.py
-@@ -201,6 +201,7 @@ class KVCacheManager:
+@@ -201,6 +201,7 @@
              if manager.retains_longer_hit
          )
          self.kv_cache_config = kv_cache_config
@@ -227,7 +236,7 @@ index 2d39a38..56d32f9 100644
  
          # Watermark: minimum number of KV cache blocks to keep free when
          # admitting waiting/preempted requests, to avoid frequent preemptions.
-@@ -598,6 +599,7 @@ class KVCacheManager:
+@@ -598,6 +599,7 @@
          # P/D: delay caching blocks if we have to recv from
          # remote. Update state for locally cached blocks.
          if delay_cache_blocks:
@@ -235,7 +244,7 @@ index 2d39a38..56d32f9 100644
              return self.create_kv_cache_blocks(new_blocks)
  
          # NOTE(woosuk): We want to commit (cache) up to num_local_computed_tokens
-@@ -611,6 +613,7 @@ class KVCacheManager:
+@@ -611,6 +613,7 @@
          )
          self.coordinator.cache_blocks(request, num_tokens_to_cache)
  
@@ -243,7 +252,7 @@ index 2d39a38..56d32f9 100644
          return self.create_kv_cache_blocks(new_blocks)
  
      def free(self, request: Request) -> None:
-@@ -622,6 +625,7 @@ class KVCacheManager:
+@@ -622,6 +625,7 @@
              request: The request to free the blocks.
  
          """
@@ -251,7 +260,7 @@ index 2d39a38..56d32f9 100644
          self.coordinator.free(request.request_id)
  
      def remove_skipped_blocks(
-@@ -656,6 +660,7 @@ class KVCacheManager:
+@@ -656,6 +660,7 @@
              The request's blocks in allocation order.
  
          """
@@ -259,10 +268,11 @@ index 2d39a38..56d32f9 100644
          return self.coordinator.pop_blocks_for_free(request.request_id)
  
      def evict_blocks(self, block_ids: set[int]) -> None:
-@@ -750,6 +755,34 @@ class KVCacheManager:
+@@ -749,6 +754,34 @@
+     def get_blocks(self, request_id: str) -> KVCacheBlocks:
          """Get the blocks of a request."""
          return self.create_kv_cache_blocks(self.coordinator.get_blocks(request_id))
- 
++
 +    def register_mori_block_selection_provider(
 +        self, provider: object
 +    ) -> dict[str, int]:
@@ -290,7 +300,6 @@ index 2d39a38..56d32f9 100644
 +        else:
 +            blocks = (block for group in newly_allocated for block in group)
 +        self.block_pool.observe_mori_block_owner(request_id, blocks)
-+
+ 
      def get_block_ids(self, request_id: str) -> tuple[list[int], ...]:
          """Get the block ids of a request."""
-         return self.get_blocks(request_id).get_block_ids()

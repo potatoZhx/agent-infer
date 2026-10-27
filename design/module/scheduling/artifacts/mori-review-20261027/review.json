@@ -1,0 +1,322 @@
+{
+  "date": "2026-10-27",
+  "mode": "quick",
+  "readiness": "WARN: local fixes verified; production E2E/performance validation not complete",
+  "summary": "原报告四项高危均有可达问题且已修复；复审新增并修复取消请求返回值契约错误。本次复审范围内无剩余高危发现。",
+  "worktree": "/data/zx/agent-kvc/.worktrees/mori",
+  "branch": "codex/mori-formal",
+  "main_sync": {
+    "original_head": "ea00f1b9d0eec4b485d6326c82acbd4ea8c9fcf9",
+    "original_base": "ea34e35611ded89ac875c7e3d0939634d8c5b084",
+    "latest_fetched_origin_main": "6dd68e5e72ef841fd1d855b4ce1e4e64f96b088b",
+    "missing_main_commits_before": 24,
+    "missing_main_commits_after": 0,
+    "signed_merge_commit": "a77512fc5237d14c13238118be62de9db8cb4fb5",
+    "conflict_resolution": "pyproject.toml retains main version 0.2.0, replay JSONL data and MORI patch resources.",
+    "pushed": false,
+    "fixes_committed": false,
+    "evidence": [
+      "design/module/scheduling/artifacts/mori-review-20261027/main-sync.json:2-11",
+      "design/module/scheduling/artifacts/mori-review-20261027/main-sync.json:37-49",
+      "pyproject.toml:5-33"
+    ]
+  },
+  "findings": [
+    {
+      "id": "H1",
+      "severity": "P1",
+      "status": "fixed",
+      "note": "超限异常真实可达：5000 项中的 4999 项 touch 后触发。改为类局部重建，正确排除并恢复已选和 protected 项。恢复分支额外 O(Nc)，不是严格有界 pop 成本。",
+      "evidence": [
+        "agentinfer/agentcache/mori/typed_lru.py:247-286",
+        "tests/agentcache/test_mori_typed_lru.py:164-194"
+      ]
+    },
+    {
+      "id": "H2",
+      "severity": "P1",
+      "status": "fixed",
+      "note": "None、无效或重复建议、占用块和建议异常均整体回退 native LRU；完整验证前不修改队列，两条路径同步回调，记录限频日志与次数。",
+      "evidence": [
+        "agentinfer/agentcache/patches/vllm-0.31-mori-hbm-provider.patch:62-108",
+        "tests/agentcache/test_mori_native_patch.py:42-79"
+      ]
+    },
+    {
+      "id": "H3",
+      "severity": "P1",
+      "status": "fixed",
+      "note": "饿死真实。默认等待 60 秒后跨组 oldest-first，禁止 admission 插队，并为超时可行请求回收 sticky GPU reservation；Reasoning 完成前不提前释放容量。仅老化 idleness 不能跨越 tier/context 优先级或永久占位。",
+      "evidence": [
+        "agentinfer/scheduling/mori/strategy.py:122-212",
+        "agentinfer/scheduling/mori/strategy.py:514-540",
+        "tests/scheduling/test_mori_runtime.py:103-129"
+      ]
+    },
+    {
+      "id": "H4",
+      "severity": "P1",
+      "status": "fixed",
+      "note": "缺失/畸形 identity 和重叠 Program 请求只返回该请求的 ERROR。尚未进入原生队列的请求没有资源可 finish，改走正常 EngineCore 输出通道，并保持 liveness 到回包。",
+      "evidence": [
+        "agentinfer/agentcache/core/scheduler.py:161-217",
+        "tests/agentcache/core/test_mori_vllm_adapter.py:280-347"
+      ]
+    },
+    {
+      "id": "NEW-H5",
+      "severity": "P1",
+      "status": "fixed",
+      "note": "vLLM 0.31 finish_requests 返回 Request，0.23 返回二元组。原桥接在 0.31 取消原生请求时会崩溃。现支持两种原生返回格式，retained-only abort 按已安装 Scheduler 的公开返回注解选择格式，保持旧 Progress-TTL 兼容。",
+      "evidence": [
+        "agentinfer/agentcache/core/scheduler.py:339-386",
+        "tests/agentcache/core/test_vllm_adapter.py:358-393",
+        "tests/agentcache/core/test_mori_vllm_adapter.py:372-397",
+        "/tmp/mori-review-fixes-20261027/upstream/vllm/v1/core/sched/scheduler.py:2585-2599",
+        "/tmp/mori-review-fixes-20261027/vllm-v023-scheduler.py:1825-1827",
+        "design/module/scheduling/artifacts/mori-review-20261027/final-compatibility.json:2-15"
+      ]
+    },
+    {
+      "id": "M1",
+      "severity": "P2",
+      "status": "fixed",
+      "note": "CPU ghost 项真实；缺失 native chunk 时移除索引和 owner，记录 missing_native_entries，下一次驱逐可恢复。",
+      "evidence": [
+        "agentinfer/agentcache/mori_cpu_policy.py:114-132",
+        "tests/agentcache/test_mori_cpu_policy.py:77-90"
+      ]
+    },
+    {
+      "id": "M2",
+      "severity": "P2",
+      "status": "fixed",
+      "note": "Admission 插队真实，与 H3 一并修复。",
+      "evidence": [
+        "agentinfer/scheduling/mori/strategy.py:122-150",
+        "tests/scheduling/test_mori_strategy.py:307-319"
+      ]
+    },
+    {
+      "id": "M3",
+      "severity": "P2",
+      "status": "fixed",
+      "note": "SimpleCPU bind 失败泄漏和 prefix observer 残留真实；绑定纳入回滚，能力校验通过后才安装 observer。",
+      "evidence": [
+        "agentinfer/agentcache/mori/vllm_adapter.py:121-132",
+        "agentinfer/agentcache/core/scheduler.py:150-153",
+        "tests/agentcache/core/test_mori_vllm_adapter.py:51-69",
+        "tests/agentcache/core/test_mori_vllm_adapter.py:351-370"
+      ]
+    },
+    {
+      "id": "M4",
+      "severity": "P2",
+      "status": "fixed",
+      "note": "Streaming 增长原本影响 Progress-TTL；现通过 observes_streaming_context_growth 能力仅让 MORI 启用。",
+      "evidence": [
+        "agentinfer/scheduling/runtime.py:307-326",
+        "tests/scheduling/test_progress_ttl_runtime.py:20-30"
+      ]
+    },
+    {
+      "id": "M5",
+      "severity": "P2",
+      "status": "confirmed_deferred",
+      "note": "vLLM 版本依赖仍未声明。本次不改变默认部署依赖；后续需梳理 0.23/0.31 支持矩阵与 MORI extra。启动 hook 校验不等于版本兼容保证。",
+      "evidence": [
+        "pyproject.toml:5-17",
+        "design/module/scheduling/artifacts/mori-review-20261027/full-cpu.json:109-195"
+      ]
+    },
+    {
+      "id": "M6",
+      "severity": "P2",
+      "status": "partially_confirmed",
+      "note": "零 observer 测试不准确，原有类变化传播测试。已补 promotion 决策表、老化及桥接 bind/unbind/abort 测试；未穷尽 observer/epoch 协议状态空间。",
+      "evidence": [
+        "tests/agentcache/test_mori_typed_lru.py:139-161",
+        "tests/scheduling/test_mori_strategy.py:254-319",
+        "tests/agentcache/core/test_mori_vllm_adapter.py:280-397"
+      ]
+    },
+    {
+      "id": "L1",
+      "severity": "P3",
+      "status": "confirmed_deferred",
+      "note": "未使用 helper/字段存在，暂保留回调兼容面。",
+      "evidence": [
+        "agentinfer/agentcache/mori/hbm_policy.py:55-62",
+        "agentinfer/agentcache/mori/typed_lru.py:76-78",
+        "agentinfer/scheduling/mori/factors.py:38-42"
+      ]
+    },
+    {
+      "id": "L2",
+      "severity": "P3",
+      "status": "confirmed_deferred",
+      "note": "两个 provider 有重复实现，公共基类重构留待后续。",
+      "evidence": [
+        "agentinfer/agentcache/mori/hbm_policy.py:15-83",
+        "agentinfer/agentcache/mori/simple_cpu_policy.py:14-85"
+      ]
+    },
+    {
+      "id": "L3",
+      "severity": "P3",
+      "status": "not_a_current_crash_path",
+      "note": "ready 命名易误读，但已有 evictability 文档；HBM 合法递减序号走 on_block_ready/upsert，不走 monotonic touch，当前 patch 不会因该点崩溃。",
+      "evidence": [
+        "agentinfer/agentcache/mori/typed_lru.py:125-146",
+        "agentinfer/agentcache/mori/hbm_policy.py:33-37"
+      ]
+    },
+    {
+      "id": "L4",
+      "severity": "P3",
+      "status": "fixed",
+      "note": "类文档明确仅限 engine-thread。",
+      "evidence": [
+        "agentinfer/agentcache/mori/typed_lru.py:34-43"
+      ]
+    },
+    {
+      "id": "L5",
+      "severity": "P3",
+      "status": "fixed",
+      "note": "GNU patch 第 11 hunk 失败已复现；重新生成最小 diff，两个补丁均通过 git apply 与 GNU patch 检查。",
+      "evidence": [
+        "design/module/scheduling/artifacts/mori-review-20261027/patch-application.json:2-12",
+        "design/module/scheduling/artifacts/mori-review-20261027/original-gnu-patch.json:2-20"
+      ]
+    },
+    {
+      "id": "L6",
+      "severity": "P3",
+      "status": "fixed",
+      "note": "修正文档运行期观察、0.23/0.31 环境冲突和 benchmark 精确重建的过强措辞，保留历史数值工件。",
+      "evidence": [
+        "docs/zh/how-to/use-mori.md:87-108",
+        "docs/en/how-to/integrate-vllm.md:112-120",
+        "tools/benchmark_mori_typed_lru.py:3-16"
+      ]
+    },
+    {
+      "id": "L7",
+      "severity": "P3",
+      "status": "confirmed_deferred",
+      "note": "空会话的 ordered[0]/max(empty) 确会失败。离线筛选工具问题未纳入高危 serving 修复。",
+      "evidence": [
+        "tools/select_agentx_traces.py:51-60",
+        "tools/select_agentx_traces.py:78-85"
+      ]
+    }
+  ],
+  "validation": {
+    "environment": {
+      "python": "3.12.13",
+      "installed_vllm": "0.32.0",
+      "platform": "Linux-5.10.134-16.103.al8.x86_64-x86_64-with-glibc2.35"
+    },
+    "baseline": "a77512fc5237d14c13238118be62de9db8cb4fb5 (latest main merged, before fixes)",
+    "commands": [
+      {
+        "command": "MORI_VLLM_SOURCE=/tmp/mori-review-fixes-20261027/upstream python -m pytest -q tests/scheduling/ tests/agentcache/ -m 'not gpu_test' --ignore=tests/agentcache/core/test_vllm_api_adapter.py",
+        "result": "343 passed, 5 deselected",
+        "evidence": "design/module/scheduling/artifacts/mori-review-20261027/final-focused.json:2-20"
+      },
+      {
+        "command": "python -m pytest -q tests/agentcache/core/test_mori_vllm_adapter.py",
+        "result": [
+          "17 passed, 16 warnings in 10.18s",
+          "sys:1: DeprecationWarning: builtin type swigvarlink has no __module__ attribute"
+        ],
+        "evidence": "design/module/scheduling/artifacts/mori-review-20261027/final-lifecycle.json:2-17"
+      },
+      {
+        "command": "MORI_VLLM_SOURCE=/tmp/mori-review-fixes-20261027/upstream python -m pytest -q tests/ --ignore=tests/e2e -m 'not gpu_test'",
+        "result": "1174 passed, 4 failed, 6 skipped, 5 deselected; collected before final additional lifecycle/config tests",
+        "evidence": "design/module/scheduling/artifacts/mori-review-20261027/full-cpu.json:211-217"
+      },
+      {
+        "command": "MORI_VLLM_SOURCE=/tmp/mori-review-fixes-20261027/upstream python -m pytest -q tests/agentcache/test_mori_native_patch.py",
+        "result": "10 passed",
+        "evidence": "design/module/scheduling/artifacts/mori-review-20261027/native-patch.json:2-15"
+      },
+      {
+        "command": "pre-commit run --all-files; pre-commit run --files <all changed/new paths>; git diff --check",
+        "result": "passed",
+        "evidence": [
+          "design/module/scheduling/artifacts/mori-review-20261027/precommit.json:2-6",
+          "design/module/scheduling/artifacts/mori-review-20261027/final-static.json:2-15",
+          "design/module/scheduling/artifacts/mori-review-20261027/final-precommit.json:2-14"
+        ]
+      },
+      {
+        "command": "PYTHONPATH=/tmp/mori-review-fixes-20261027/test-deps python -m pytest -q tests/agentbench/agents/dsh/test_dsh_transcript.py::test_load_session_log_decodes_zstd",
+        "result": "1 passed after isolated zstandard install",
+        "evidence": "design/module/scheduling/artifacts/mori-review-20261027/zstandard-retest.json:2-3"
+      },
+      {
+        "command": "python -m pytest -q tests/agentcache/core/test_mori_vllm_adapter.py tests/agentcache/core/test_vllm_adapter.py",
+        "result": "33 passed, 16 warnings in 10.56s",
+        "evidence": "design/module/scheduling/artifacts/mori-review-20261027/final-compatibility.json:2-15"
+      }
+    ],
+    "red_green": {
+      "result": "Pre-fix sources with new regressions: 29 related failures plus 2 existing vLLM 0.32 Anthropic failures (31 failed, 76 passed). Fixed targeted suites pass.",
+      "evidence": "design/module/scheduling/artifacts/mori-review-20261027/baseline-reproductions.json:1778-1813"
+    },
+    "unrelated_failures": [
+      {
+        "case": "test_load_session_log_decodes_zstd",
+        "cause": "missing zstandard; passed after isolated dependency install",
+        "evidence": [
+          "design/module/scheduling/artifacts/mori-review-20261027/full-cpu.json:21-28",
+          "design/module/scheduling/artifacts/mori-review-20261027/zstandard-retest.json:2-3"
+        ]
+      },
+      {
+        "case": "test_runtime_converter_counts_each_turn_with_full_backend_history",
+        "cause": "existing replay test counts template-probe requests; reproduced on pre-fix baseline",
+        "evidence": [
+          "design/module/scheduling/artifacts/mori-review-20261027/full-cpu.json:29-107",
+          "design/module/scheduling/artifacts/mori-review-20261027/baseline-unrelated.json:88-97"
+        ]
+      },
+      {
+        "case": "two Anthropic tests in test_vllm_api_adapter.py",
+        "cause": "vLLM 0.32 removed _convert_anthropic_to_openai_request; baseline also fails",
+        "evidence": [
+          "design/module/scheduling/artifacts/mori-review-20261027/full-cpu.json:109-195",
+          "design/module/scheduling/artifacts/mori-review-20261027/baseline-reproductions.json:1810-1813"
+        ]
+      }
+    ],
+    "full_serving_e2e_completed": false,
+    "not_run_reason": "No isolated patched vLLM 0.31.0 serving environment provisioned. Initial unfiltered tests entered GPU serve tests; process exited and wait was interrupted. Subsequent suites exclude GPU/E2E. No full serving, cold TTFT, throughput or SWE-bench claim.",
+    "native_patch_limit": "Tests load downloaded v0.31.0 BlockPool with installed 0.32 supporting modules; this is not full v0.31.0 engine validation.",
+    "native_sources": "design/module/scheduling/artifacts/mori-review-20261027/native-source-manifest.json:2-45",
+    "performance_limits": "Starvation fairness changes sticky placement after timeout. Heap recovery adds O(Nc). No performance claim; unmeasured impact remains."
+  },
+  "second_review": {
+    "scope": [
+      "merged main and package resources",
+      "heap order/protection/rebuild",
+      "native fallback/refcounts",
+      "waiting age/lazy release",
+      "runtime rejection/output liveness",
+      "cancellation and binding cleanup",
+      "registration rollback",
+      "Progress-TTL isolation"
+    ],
+    "remaining_high_risk_findings": [],
+    "remaining_followups": [
+      "M5 dependency/version matrix",
+      "L7 empty trace sessions",
+      "L1/L2 dead code and duplication",
+      "broader observer/epoch coverage and patched 0.31 serving/performance validation"
+    ],
+    "pr": "No PR requested or opened; no push. Merge is signed; repairs remain in working tree for review."
+  }
+}
