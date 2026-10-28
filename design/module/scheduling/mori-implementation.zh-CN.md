@@ -6,1130 +6,526 @@ owners:
   - potatoZhx
 primary_code_paths:
   - agentinfer/scheduling/mori/**
+  - agentinfer/scheduling/lineage.py
   - agentinfer/agentcache/mori/**
   - agentinfer/agentcache/mori_cpu_policy.py
 related_code_paths:
   - agentinfer/scheduling/runtime.py
-  - agentinfer/agentcache/core/controller.py
   - agentinfer/agentcache/core/scheduler.py
-  - agentinfer/agentcache/patches/vllm-0.31-mori-hbm-provider.patch
-  - agentinfer/agentcache/patches/vllm-0.31-mori-simple-cpu-provider.patch
+  - agentinfer/agentcache/core/api_adapter.py
+  - agentinfer/agentcache/patches/**
 validation_paths:
-  - tests/scheduling/test_mori_strategy.py
-  - tests/scheduling/test_mori_runtime.py
-  - tests/agentcache/test_mori_typed_lru.py
-  - tests/agentcache/test_mori_simple_cpu_policy.py
-  - tests/agentcache/test_mori_cpu_policy.py
-  - tests/agentcache/core/test_mori_controller.py
-  - tests/agentcache/core/test_mori_vllm_adapter.py
-last_reviewed: 2026-10-27
+  - tests/scheduling/**
+  - tests/agentcache/**
+  - tests/agentbench/request_proxy/**
+last_reviewed: 2026-10-28
+code_commit: d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc
 ---
 
-## MORI 正式实现完整走读
+## MORI 在 AgentInfer + vLLM 0.31 上的正式实现
 
-本文面向准备维护、评审或继续优化 MORI 的开发者，描述 `codex/mori-formal` 分支上的**实际实现**。规范性边界见
-[MORI scheduling and typed KV replacement](mori-scheduling.md)，受控性能数据见
-[MORI typed-LRU 受控性能对比](mori-performance.md)。本文重点回答四个问题：组件真实如何连接、一次请求如何流过系统、
-两层 typed-LRU 如何维护、正式实现相对隔离实验究竟改变了什么。
+本文描述 `codex/mori-formal` 在源码提交 `d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc` 的实际行为。
+2026-10-28 全面更新身份、重叠请求、迁移触发、容量账本、原生接线和验证说明；不把隔离回放或旧版正式实现的结果移作本次重构的性能结果。
+本次重构的动机、备选方案和验收边界另见 [重构设计](https://github.com/potatoZhx/agent-infer/blob/codex/mori-formal/design/module/scheduling/mori-redesign-20261028.zh-CN.md)。
+源码基线及原实验工作区差异见 [design/module/scheduling/artifacts/mori-redesign-20261028/validation.json:1-23](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/design/module/scheduling/artifacts/mori-redesign-20261028/validation.json#L1-L23)、[design/module/scheduling/artifacts/mori-redesign-20261028/before.patch:1-39](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/design/module/scheduling/artifacts/mori-redesign-20261028/before.patch#L1-L39)。
 
-正式实现的核心分工是：`MORIStrategy` 决定 Program 的逻辑保护层；vLLM 仍决定请求 batch、KV block/chunk 分配、
-按需 H2D/D2H、job/fence 和最终物理安全。MORI 不预测未来返回、不主动预取，也没有第二个与 vLLM 并列的 token
-scheduler。证据索引：`agentinfer/scheduling/mori/strategy.py:26-33`、`agentinfer/agentcache/core/scheduler.py:3-7`。
+本文同时保存于 Git 的 `design/module/scheduling/mori-implementation.zh-CN.md` 和研究目录的
+`/data/zx/agent-kvc/research/studies/kvc_theory/mori-real-v031-20261022/MORI-REAL-IMPLEMENTATION.zh-CN.md`。
+两份正文保持一致。源码和仓库内验证证据使用固定提交的 GitHub 行号链接，便于在本地和远端交叉审查；
+历史隔离结果仍使用其原始绝对路径，未随本文上传实验数据。
 
-本文描述的 SimpleCPU 正式实现源码基线为 `4bc02a818e91673e60220e9c706aee3fc6913b5d`。当前验证收据记录了
-24 项 MORI/SimpleCPU 聚焦测试、308 项 scheduling/agentcache 回归、两个 native patch 顺序应用与编译、hook smoke、
-示例 shell 语法、wheel 内容和 pre-commit 检查。共享主机上没有安装打过补丁的 vLLM 后启动 GPU serve，因此本文
-不宣称完成真实 D2H/H2D 验证，也不把受控 CPU policy benchmark 外推为真实端到端性能。证据索引：
-`design/module/scheduling/artifacts/mori-simple-cpu-validation-20261027.json:1-48`、
-`design/module/scheduling/artifacts/mori-validation-20261026.json:54-65`。
+## 1. 阅读入口与实现边界
 
-## 1. 术语、边界与三组正交状态
+正式 MORI 是嵌入 vLLM scheduler 的 Program 级准入与缓存保护策略。它决定哪些串行推理链获得 GPU/CPU 的逻辑预算、何时停止授权下一请求、何时改变 KV 淘汰优先级。
+vLLM 继续负责 token batch、物理 block 分配、prefix lookup、原生 preemption、D2H/H2D job 和 fence。
+系统只有一个 native token scheduler；没有读未来调用计划的调度器，也没有因改变逻辑 tier 就立即复制全量 KV 的独立执行器。
+证据：[agentinfer/agentcache/core/scheduler.py:562-604](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/core/scheduler.py#L562-L604)、[agentinfer/agentcache/mori/vllm_adapter.py:105-200](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/vllm_adapter.py#L105-L200)、[agentinfer/scheduling/mori/strategy.py:681-716](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L681-L716)。
 
-| 概念 | 值 | 所有者 | 含义 |
+建议按以下顺序阅读：
+
+| 要回答的问题 | 入口与证据 |
+| --- | --- |
+| 请求从哪里进入、谁实际执行 | [agentinfer/agentcache/core/scheduler.py:167-214](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/core/scheduler.py#L167-L214)、[agentinfer/agentcache/core/scheduler.py:607-649](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/core/scheduler.py#L607-L649) |
+| 重叠请求如何区分上下文 | [agentinfer/scheduling/lineage.py:14-72](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/lineage.py#L14-L72)、[agentinfer/scheduling/runtime.py:170-291](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/runtime.py#L170-L291) |
+| 谁能改变 Program 状态 | [agentinfer/scheduling/transitions.py:102-169](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/transitions.py#L102-L169)、[agentinfer/scheduling/runtime.py:682-743](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/runtime.py#L682-L743) |
+| 为什么没有立即迁移 | [agentinfer/scheduling/mori/strategy.py:223-345](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L223-L345)、[agentinfer/scheduling/runtime.py:536-576](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/runtime.py#L536-L576) |
+| 预算如何扣除共享块 | [agentinfer/scheduling/mori/capacity.py:30-80](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/capacity.py#L30-L80)、[agentinfer/agentcache/mori/footprints.py:10-54](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/footprints.py#L10-L54) |
+| 物理缓存如何得到 typed 顺序 | [agentinfer/agentcache/mori/runtime_state.py:24-121](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/runtime_state.py#L24-L121)、[agentinfer/agentcache/mori/typed_lru.py:34-361](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/typed_lru.py#L34-L361) |
+| 结果覆盖什么、还缺什么 | [design/module/scheduling/artifacts/mori-redesign-20261028/validation.json:24-88](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/design/module/scheduling/artifacts/mori-redesign-20261028/validation.json#L24-L88)、[design/module/scheduling/artifacts/mori-redesign-20261028/validation.json:107-121](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/design/module/scheduling/artifacts/mori-redesign-20261028/validation.json#L107-L121) |
+
+## 2. 身份与运行状态不能混用
+
+| 层次 | 值或身份 | 管理者 | 精确含义 |
 | --- | --- | --- | --- |
-| Program forwarding state | `ACTIVE / PAUSED / TERMINATED` | `ProgramScheduler` | 是否允许该 Program 的请求进入 native scheduler |
-| Program activity status | `REASONING / ACTING` | `ProgramScheduler` | 正在模型推理，还是处于工具/环境调用间隙 |
-| MORI logical tier | `GPU / CPU / WAITING` | `MORIStrategy` | KV 应获得哪一层保护，不等于某一时刻所有物理 KV 都已完成搬迁 |
-| Cache class | `BUSY / IDLE / INACTIVE` | `MORIStrategy` 导出 | 给 HBM/CPU replacement index 使用的统一逻辑标签 |
-| Native residency | block/chunk/job/fence | vLLM | 当前实际物理位置、引用计数、传输与可淘汰性 |
+| 外部业务身份 | `program_id`，可带 `lineage_id` | API / `LineageRegistry` | 家族与可延续串行链的声明 |
+| 内部调度身份 | `ProgramRef(program_id, generation)` | `ProgramRegistry` | 本代 owner；缓存所有权和迟到事件按此隔离 |
+| 转发状态 | `ACTIVE / PAUSED / TERMINATED` | `ProgramScheduler` | 是否允许新请求转交 native |
+| 活动状态 | `REASONING / ACTING` | runtime 与观测事件 | 当前推理步骤或工具间隙；PAUSED 的待运行请求也可标 REASONING |
+| 逻辑保护层 | `GPU / CPU / WAITING` | `MORIStrategy` | 调度预算与缓存保护意图 |
+| 物理状态 | resident / refcount / READY / pending transfer | vLLM | 实际副本位置及能否安全使用或驱逐 |
 
-`ProgramState`、`ProgramStatus` 与 `MORITier` 不能合并。例如一个 in-flight Reasoning Program 被 lazy demotion
-时仍是 `ACTIVE + REASONING + tier=GPU`，只额外记录 `pending_tier=CPU/WAITING`；请求完成后，runtime 才能 pause，
-随后 tier 才真正提交。证据索引：`agentinfer/scheduling/domain.py:18-30`、
-`agentinfer/scheduling/mori/factors.py:12-41`、`agentinfer/scheduling/mori/strategy.py:376-423`。
+证据：[agentinfer/scheduling/domain.py:18-58](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/domain.py#L18-L58)、[agentinfer/scheduling/mori/factors.py:14-19](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/factors.py#L14-L19)、[agentinfer/scheduling/mori/factors.py:40-67](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/factors.py#L40-L67)、[agentinfer/scheduling/lineage.py:27-43](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/lineage.py#L27-L43)。
+
+Cache class 固定由 tier 导出：`GPU → BUSY`、`CPU → IDLE`、`WAITING → INACTIVE`。
+因此工具阶段仍留在 GPU 的 Program 仍是 BUSY；CPU 上属于 GPU Program 的备份也仍是 BUSY。
+不能把 class 当作“当前模型是否正在运行”或“这一份 KV 的实际位置”。
+证据：[agentinfer/scheduling/mori/strategy.py:894-899](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L894-L899)、[agentinfer/agentcache/mori/runtime_state.py:92-94](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/runtime_state.py#L92-L94)。
+
+被选中 lazy demotion 的推理请求仍是 `ACTIVE + REASONING + GPU`，额外记录 `pending_tier` 和 pause 标记。
+GPU claim 在完成之前不减少。`CPU` 意味着愿意为它保留 CPU 预算并提高 CPU cache 优先级，不保证全上下文 READY；
+`WAITING` 意味着没有相应保护，原生缓存残留仍可命中，不会同步清空所有 block。
+证据：[agentinfer/scheduling/mori/strategy.py:668-679](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L668-L679)、[agentinfer/scheduling/mori/strategy.py:681-716](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L681-L716)、[agentinfer/agentcache/mori/typed_lru.py:200-217](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/typed_lru.py#L200-L217)。
+
+## 3. 架构与组件职责
+
+```mermaid
+flowchart TD
+    API[API identity 与生命周期解析] --> BR[继承 native scheduler 的 Bridge]
+    BR --> PS[ProgramScheduler]
+    PS --> LIN[LineageRegistry]
+    PS --> REG[ProgramRegistry]
+    PS --> POOL[RequestPool]
+    PS --> ST[MORIStrategy 与 factors]
+    ST --> TR[TransitionController]
+    TR --> PS
+    PS -->|已授权 Request| NAT[vLLM token scheduler]
+    NAT -->|输出 / 完成 / preemption| PS
+    ST -->|tier 与 owner 变化| RS[MORIRuntimeState]
+    RS --> H[HBM typed index]
+    RS --> C[CPU typed index]
+    NAT --> KH[原生 KV cache / offload hooks]
+    KH --> H
+    KH --> C
+    KH --> FB[FootprintBook 与物理 snapshot]
+    FB --> ST
+```
+
+图中的 bridge 本身继承 native sync/async scheduler，并通过 `super().schedule()` 执行原生调度。
+`_VllmAdmissionHooks` 是 bridge 的组合对象，内部再持有 `ProgramScheduler`。生命周期接收器、容量观测、请求转发都在这一层接线。
+证据：[agentinfer/agentcache/core/scheduler.py:116-165](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/core/scheduler.py#L116-L165)、[agentinfer/agentcache/core/scheduler.py:577-581](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/core/scheduler.py#L577-L581)、[agentinfer/agentcache/core/scheduler.py:622-626](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/core/scheduler.py#L622-L626)。
+
+### 3.1 Registry、RequestPool 和 factors 为什么同时存在
+
+`ProgramRegistry` 保存跨请求的事实：本代身份、父子关系、token estimate、step count、转发状态和活动状态。
+它不保存完整的 vLLM Request，也不实现 MORI 排名。release 后再出现相同 ID 会产生新的 generation，旧缓存 owner 不会自动继承新身份。
+证据：[agentinfer/scheduling/program_registry.py:55-92](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/program_registry.py#L55-L92)、[agentinfer/scheduling/program_registry.py:137-164](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/program_registry.py#L137-L164)、[agentinfer/scheduling/program_registry.py:166-185](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/program_registry.py#L166-L185)。
+
+`RequestPool` 保存尚未交给 native 的实际请求对象及 `WAITING/ADMITTED` 状态，并用 `_by_program` 按 owner 索引。
+`consume_admitted_requests()` 只转交一次请求；此后 native waiting/running 队列负责 token 调度。
+runtime 的 request binding 在交接后仍保留，直到完成或取消确认，用来计算上下文、识别 lease、归属 cache owner。
+所以“RequestPool 已经没有条目”并不意味着当前推理已经结束。
+证据：[agentinfer/scheduling/request_pool.py:49-133](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/request_pool.py#L49-L133)、[agentinfer/scheduling/runtime.py:319-326](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/runtime.py#L319-L326)、[agentinfer/scheduling/runtime.py:525-534](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/runtime.py#L525-L534)。
+
+`MORIProgramFactors` 保存策略历史：tier、最近 cycles、部分 Reasoning 时间、Acting 起点、pending destination、GPU 驻留起点和置换受益者。
+`MORIGlobalFactors` 保存轮数、下次唤醒时间与正在等待释放空间的受益者。
+这些因素与通用 Program 事实分开，使 Progress-TTL 继续走原来的策略接口；只有 `uses_serial_lineages` 的策略启用新分支语义。
+证据：[agentinfer/scheduling/mori/factors.py:23-36](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/factors.py#L23-L36)、[agentinfer/scheduling/mori/factors.py:40-67](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/factors.py#L40-L67)、[agentinfer/scheduling/mori/strategy.py:47-49](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L47-L49)、[agentinfer/scheduling/runtime.py:170-291](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/runtime.py#L170-L291)。
+
+### 3.2 TransitionController 与快照
+
+策略通过 `admit / queue / mark_for_pause / pause / cancel_pause / resume / release` 请求状态变化。
+`TransitionController` 记录实际接受的 transition；runtime 再按 ledger 推进不可变快照，供同一轮后续阶段使用。
+策略不能直接改 registry，也不能把“计划成功”当作“状态已经提交”。
+证据：[agentinfer/scheduling/transitions.py:113-124](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/transitions.py#L113-L124)、[agentinfer/scheduling/transitions.py:126-130](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/transitions.py#L126-L130)、[agentinfer/scheduling/runtime.py:753-782](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/runtime.py#L753-L782)。
+
+MORI 使用 `REPAIR_THEN_RESUME`：先处理过期受益者及 CPU/GPU 债务，再让等待者消费剩余预算。
+若先 resume 再 repair，新请求可能使用尚未排空的空间；先 repair 仍不代表可以花掉 pending GPU relief。
+证据：[agentinfer/scheduling/mori/strategy.py:95-96](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L95-L96)、[agentinfer/scheduling/mori/strategy.py:385-397](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L385-L397)、[agentinfer/scheduling/runtime.py:293-317](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/runtime.py#L293-L317)。
+
+## 4. Identity、重叠请求与上下文归属
+
+### 4.1 请求元数据
+
+API 层接受 `vllm_xargs.agentic_context`、`agent_hint` 和已支持的 framework headers，并归一化成 `AgentIdentity`。
+MORI 要求有效 program identity；不要求客户端给完整未来计划。API 会为每次请求生成新的 `lifecycle_token`，覆盖传入值，用作本次响应的生命周期回执。
+证据：[agentinfer/scheduling/identity.py:105-184](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/identity.py#L105-L184)、[agentinfer/agentcache/core/api_adapter.py:234-276](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/core/api_adapter.py#L234-L276)、[agentinfer/scheduling/mori/strategy.py:99-100](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L99-L100)。
+
+```json
+{
+  "vllm_xargs": {
+    "agentic_context": {
+      "program_id": "task-42:lead",
+      "task_id": "task-42",
+      "agent_id": "lead",
+      "agent_role": "lead",
+      "lineage_id": "main",
+      "expected_resume": true
+    }
+  }
+}
+```
+
+`lineage_id` 是可选客户端声明；`lifecycle_token` 不需要客户端自行构造。
+真实 subagent 应使用独立 Program 身份，并按业务提供 `parent_program_id / blocks_parent`。
+这些字段与“同一 Program 的两个重叠 HTTP 请求”不是一回事。
+证据：[agentinfer/scheduling/identity.py:28-95](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/identity.py#L28-L95)、[agentinfer/scheduling/lineage.py:27-43](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/lineage.py#L27-L43)、[agentinfer/agentcache/core/api_adapter.py:234-276](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/core/api_adapter.py#L234-L276)。
+
+### 4.2 三种请求形态
+
+| 输入形态 | 内部 owner 与调度 | 完成后的保护 |
+| --- | --- | --- |
+| 无 `lineage_id`，默认 owner 无未结束工作 | 继续使用外部 `program_id` 的默认串行链 | 进入 Acting，按容量和生命周期保留 |
+| 无 `lineage_id`，默认 owner 已有未结束工作 | 创建独立临时 owner，不覆盖默认链 | 最后接受的工作结束后 release 保护 |
+| 显式 `(program_id, lineage_id)` | 映射为稳定内部 owner；同 lineage 的重叠请求依次排队 | 可跨工具阶段延续；终止回执或容量处理作用于本分支 |
+
+这里“未结束工作”包括已经接受但仍排队的请求。内部 lineage 不自动建立父子阻塞边；分支解析会清除自动分支的 `parent_program_id / blocks_parent`。
+临时 owner 和已结束家族的 named owner 槽位可复用，generation 递增；这避免为每次临时请求永久新增内部 ID。
+它不等于所有外部 Program 元数据都已有 TTL 回收上界。
+证据：[agentinfer/scheduling/lineage.py:14-72](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/lineage.py#L14-L72)、[agentinfer/scheduling/runtime.py:170-291](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/runtime.py#L170-L291)、[tests/scheduling/test_mori_lineages.py:238-256](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/tests/scheduling/test_mori_lineages.py#L238-L256)。
+
+### 4.3 不猜哪个回答会进入未来上下文
+
+请求 A 和 B 重叠时，二者的完成只更新各自 owner；不会以最后完成、最大长度、请求编号推断哪个是主分支。
+下一条真实请求激活时，其 prompt 长度替换该串行链的 estimate，允许上下文缩短，并撤销旧 prompt 的共享块证据。
+如果客户端希望 B 在工具调用后继续获得独立保护，应从一开始提供稳定 `lineage_id`；临时分支完成后不保证替未来续接保存保护。
+证据：[agentinfer/scheduling/runtime.py:170-291](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/runtime.py#L170-L291)、[agentinfer/scheduling/runtime.py:536-576](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/runtime.py#L536-L576)、[agentinfer/scheduling/mori/strategy.py:55-60](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L55-L60)。
+
+例如，默认链 A 的长请求尚未结束时到达短请求 B，B 的结束不会缩小 A 的预算，也不会把 A 改为 Acting。
+若 C 显式属于同一 named lineage，它仅排队；激活前不覆盖当前推理的 context、phase 或生命周期 receipt。
+若后续 prompt 采用了 B 的文本，原生 prefix cache 可按实际 block 匹配复用；这次实现没有把 B 的历史 idleness 或保护权自动“合并回”默认链。
+证据：[tests/scheduling/test_mori_lineages.py:32-45](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/tests/scheduling/test_mori_lineages.py#L32-L45)、[tests/scheduling/test_mori_lineages.py:48-59](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/tests/scheduling/test_mori_lineages.py#L48-L59)。
+
+## 5. 一次请求的完整流转
+
+### 5.1 到达与准入
+
+1. API 解析业务 identity 并生成本次 receipt；bridge 读取 prompt 和 native 配额。
+2. 检查请求自身容量上界；超界仅拒绝该请求并发布终止输出，不让整个服务崩溃。
+3. runtime 解析 lineage，创建/复用 ProgramRef，保存 binding 和完整请求。
+4. 若是同 lineage 后继，只入 deferred 队列；否则替换当前 prompt、进入 Reasoning、调用策略准入。
+5. 有空余预算且没有其他待选 Reasoning 时可立即准入；否则排队并请求一次规划。
+6. bridge 消费已授权请求，绑定 native request→ProgramRef，然后加入 native waiting。
+
+证据：[agentinfer/agentcache/core/api_adapter.py:234-276](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/core/api_adapter.py#L234-L276)、[agentinfer/agentcache/core/scheduler.py:167-214](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/core/scheduler.py#L167-L214)、[agentinfer/scheduling/runtime.py:170-291](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/runtime.py#L170-L291)、[agentinfer/agentcache/core/scheduler.py:260-276](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/core/scheduler.py#L260-L276)。
+
+已有 GPU owner 的下一串行请求也必须重算预算。新 prompt 变长且整体预算不再满足时，尚未开始的步骤会暂停排队。
+这个 pause 没有中断已运行 Reasoning；它阻止新 lease 错用上一轮较小工作集的授权。
+证据：[agentinfer/scheduling/mori/strategy.py:141-209](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L141-L209)、[tests/scheduling/test_mori_lineages.py:86-96](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/tests/scheduling/test_mori_lineages.py#L86-L96)。
+
+### 5.2 调度周期与事件唤醒
+
+`before_schedule()` 接收生命周期事实、观测容量和 retained prefix，然后在需要时执行 Program 调度周期，最后转交新授权请求。
+到达、pending、完成、release、预算取整跨界等事件使下一轮尽快发生；维护周期负责没有新事件时的检查。
+多个事件可合并成一次规划。事件提供新事实，不是“无条件回收当前 Acting”的命令。
+证据：[agentinfer/agentcache/core/scheduler.py:239-257](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/core/scheduler.py#L239-L257)、[agentinfer/scheduling/runtime.py:146-157](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/runtime.py#L146-L157)、[agentinfer/scheduling/mori/strategy.py:422-427](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L422-L427)、[agentinfer/scheduling/mori/strategy.py:506-509](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L506-L509)。
+
+### 5.3 Streaming、完成与下一请求
+
+Streaming 输出递增当前 owner 的 context estimate。容量唤醒依据 `round_up(context + decode_buffer)` 是否跨 block，
+因此不能只检查原始 context 的 block 边界。native schedule/output 还提供开始执行、preemption 和完成观测。
+证据：[agentinfer/scheduling/runtime.py:334-364](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/runtime.py#L334-L364)、[agentinfer/scheduling/mori/strategy.py:62-70](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L62-L70)、[agentinfer/agentcache/core/scheduler.py:344-367](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/core/scheduler.py#L344-L367)、[agentinfer/agentcache/core/scheduler.py:310-342](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/core/scheduler.py#L310-L342)。
+
+完成时记录实际 total tokens、命中与时长，撤销该 binding；若已标记降层，先提交 pause。
+`_finish_lineage_step()` 再激活同 lineage 队首，按它自己的 prompt 重新取得预算。
+临时 lineage 没有后继时 release；默认与 named lineage 通常进入工具阶段等待继续。
+证据：[agentinfer/scheduling/runtime.py:444-519](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/runtime.py#L444-L519)、[agentinfer/scheduling/runtime.py:536-576](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/runtime.py#L536-L576)。
+
+## 6. 有限 lease 与 Reasoning 完成后的迁移保证
+
+lease 表示一个已获准、可能尚在 native waiting 或正在运行的请求；它不是可超时抢占的租约。
+即使 RequestPool 已移交对象，binding 仍证明 lease 存在。runtime 的 PAUSE 分支独立检查是否还有授权请求，
+不能只相信 `status=ACTING`。同 lineage 后继没有获得 lease，不能延长当前 drain。
+证据：[agentinfer/scheduling/runtime.py:525-534](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/runtime.py#L525-L534)、[agentinfer/scheduling/runtime.py:682-743](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/runtime.py#L682-L743)、[tests/scheduling/test_mori_lineages.py:78-83](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/tests/scheduling/test_mori_lineages.py#L78-L83)。
 
 ```mermaid
 stateDiagram-v2
-    state "Program forwarding state" as F {
-        [*] --> PAUSED
-        PAUSED --> ACTIVE: ADMIT / RESUME
-        ACTIVE --> PAUSED: PAUSE
-        PAUSED --> TERMINATED: RELEASE
-        ACTIVE --> TERMINATED: RELEASE when idle
-    }
-
-    state "Activity status" as A {
-        ACTING --> REASONING: request started
-        REASONING --> ACTING: last request completed
-    }
-
-    state "MORI placement" as M {
-        WAITING --> GPU: admission / promotion
-        CPU --> GPU: promotion
-        GPU --> CPU: committed demotion
-        GPU --> WAITING: committed demotion
-        CPU --> WAITING: DRAM repair
-    }
+    GPU_Reasoning --> GPU_Draining: 硬债务或老等待者选择
+    GPU_Draining --> CPU_Intent: 当前 lease 完成且 CPU 预算可用
+    GPU_Draining --> Waiting: 当前 lease 完成且 CPU 预算不足
+    GPU_Draining --> GPU_Reasoning: 受益者撤销且尚未提交
+    GPU_Acting --> CPU_Intent: 合法置换或债务修复
+    GPU_Acting --> Waiting: 降层但无 CPU 预算
+    CPU_Intent --> GPU_Reasoning: 新请求取得预算
+    Waiting --> GPU_Reasoning: 新请求取得预算
 ```
 
-Cache class 的映射固定为：`GPU -> BUSY`、`CPU -> IDLE`、`WAITING -> INACTIVE`。类名表达保护意图，
-不是物理位置证明。证据索引：`agentinfer/scheduling/mori/strategy.py:580-586`。
+降层分为“选中 → 标记并预留目标 → 当前请求结束 → 提交 tier”。Reasoning 期间保留全部 GPU claim，CPU 目标若已预留也进入 CPU ledger。
+不能先把 GPU claim 扣掉再等待推理结束。正常 Acting 无授权 lease 时可立即降层。
+证据：[agentinfer/scheduling/mori/strategy.py:681-716](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L681-L716)、[agentinfer/scheduling/mori/strategy.py:668-679](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L668-L679)、[agentinfer/scheduling/runtime.py:536-576](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/runtime.py#L536-L576)。
 
-## 2. 总体架构：一个 native scheduler，三个协作面
+该保证是 MORI placement 的提交条件。原生 vLLM 仍可能因实际容量不足 preempt；eager D2H 也可以在 Reasoning 期间创建 CPU 备份。
+备份不代表 MORI 已迁移，native 的 source pin、destination pin、fence 和最终分配合法性仍由原生实现负责。
+证据：[agentinfer/agentcache/mori/simple_cpu_policy.py:14-24](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/simple_cpu_policy.py#L14-L24)、[agentinfer/agentcache/core/scheduler.py:577-581](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/core/scheduler.py#L577-L581)、[agentinfer/scheduling/mori/strategy.py:681-716](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L681-L716)。
 
-### 2.1 组件关系
+## 7. Idleness 的计算与时间口径
 
-`AgentCacheAsyncSchedulerBridge` 或 `AgentCacheSyncSchedulerBridge` **继承** native vLLM scheduler；它不是 native
-scheduler 前面的独立服务。bridge 组合 `_VllmAdmissionHooks`，hooks 再组合一个 `ProgramScheduler`；
-`MORIStrategy` 是这个 Program-level controller 的策略对象。同一个 bridge 对象通过 `super().schedule()` 继续运行
-原生 token-level scheduler。证据索引：`agentinfer/agentcache/core/scheduler.py:477-518`、
-`agentinfer/agentcache/core/scheduler.py:521-562`。
+策略使用最近 `window_size=5` 个 cycle 的 `Acting / (Reasoning + Acting)`；当前尚未结束的部分 cycle 也占窗口位置。
+工具间隙越长，idleness 越大；等待准入的时间不应成为 Acting 或有效 Reasoning。
+证据：[agentinfer/scheduling/mori/strategy.py:851-872](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L851-L872)、[agentinfer/scheduling/mori/strategy.py:511-558](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L511-L558)、[agentinfer/scheduling/mori/strategy.py:566-612](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L566-L612)。
 
-```mermaid
-classDiagram
-    class NativeVllmScheduler {
-      +add_request(Request)
-      +schedule()
-      +update_from_output()
-      +finish_requests()
-    }
-    class AgentCacheSchedulerBridge
-    class VllmAdmissionHooks
-    class ProgramScheduler
-    class SchedulingStrategy
-    class MORIStrategy
-    class MORIFactors
-    class MORIRuntimeState
-    class KVCacheManager
-    class BlockPool
-    class MORIHBMPolicy
-    class SimpleCPUOffloadScheduler
-    class MORISimpleCPUOffloadPolicy
-    class OffloadingConnectorScheduler
-    class CPUOffloadingManager
-    class MoriCPUCachePolicy
-    class TypedLRUIndex
+有 native 执行观测后，策略累积已调度区间，并在 native waiting / preemption 间隔暂停累积。
+这仍是调度观测的时间，不是 CUDA kernel 独占运行时间。没有执行观测的兼容路径使用请求时长减去 Program queue 时间，精度较弱。
+新 lineage 没有历史时 idleness 为零；临时分支不会继承默认链的统计。
+证据：[agentinfer/scheduling/mori/strategy.py:72-92](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L72-L92)、[agentinfer/scheduling/mori/strategy.py:566-612](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L566-L612)、[tests/scheduling/test_mori_lineages.py:222-235](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/tests/scheduling/test_mori_lineages.py#L222-L235)。
 
-    AgentCacheSchedulerBridge --|> NativeVllmScheduler : one native scheduler object
-    AgentCacheSchedulerBridge *-- VllmAdmissionHooks : composition
-    VllmAdmissionHooks *-- ProgramScheduler : controller
-    ProgramScheduler o-- SchedulingStrategy : strategy slot
-    MORIStrategy --|> SchedulingStrategy
-    MORIStrategy *-- MORIFactors
+## 8. Sticky placement、容量修复与等待进展
 
-    NativeVllmScheduler *-- KVCacheManager
-    KVCacheManager *-- BlockPool
-    NativeVllmScheduler *-- OffloadingConnectorScheduler : compatibility connector
-    OffloadingConnectorScheduler *-- CPUOffloadingManager
-    CPUOffloadingManager o-- MoriCPUCachePolicy : external CachePolicy
-    NativeVllmScheduler *-- SimpleCPUOffloadScheduler : recommended connector
-    SimpleCPUOffloadScheduler o-- MORISimpleCPUOffloadPolicy : provider v1
+### 8.1 规划顺序
 
-    VllmAdmissionHooks --> MORIRuntimeState : request-to-Program bind
-    MORIStrategy --> MORIRuntimeState : class provider/observer
-    BlockPool --> MORIHBMPolicy : callback + victim advice
-    MORIHBMPolicy *-- TypedLRUIndex
-    MoriCPUCachePolicy *-- TypedLRUIndex
-    MORISimpleCPUOffloadPolicy *-- TypedLRUIndex
-    MORIRuntimeState --> MORIHBMPolicy : class delta
-    MORIRuntimeState --> MoriCPUCachePolicy : class delta
-    MORIRuntimeState --> MORISimpleCPUOffloadPolicy : class delta
-```
+一轮使用固定时间的快照，并依次处理过期的置换受益者、CPU 债务、GPU 债务和 promotion。
+待结束的 GPU victims 只在 projected ledger 中提供预计 relief；实际 GPU ledger 没有下降前，存在硬债务时禁止 promotion。
+CPU repair 同时统计现有 CPU owner 和 pending CPU 目标，按较高 idleness 放弃保护到 WAITING。
+证据：[agentinfer/scheduling/mori/strategy.py:385-397](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L385-L397)、[agentinfer/scheduling/mori/strategy.py:748-771](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L748-L771)、[agentinfer/scheduling/mori/strategy.py:718-746](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L718-L746)。
 
-证据索引：`agentinfer/agentcache/core/scheduler.py:106-145`、`agentinfer/agentcache/mori/runtime_state.py:23-49`、
-`agentinfer/agentcache/mori/hbm_policy.py:15-31`、`agentinfer/agentcache/mori_cpu_policy.py:19-47`。
+### 8.2 Promotion 与完整置换计划
 
-### 2.2 控制面、执行面和替换面
+等待者排名依次优先：已有空间承诺的受益者、达到 `max_wait_seconds` 的老等待者、普通 CPU 返回者、WAITING 返回者、新 Program。
+普通新 Program 再按较小工作集、较低 idleness 和稳定身份排序。先扫描现有 slack，可跳过不 fit 的请求，让后面的可容纳请求运行。
+已有受益者仍在等 lazy relief 时则停止这种回填，防止答应给它的空间被反复消耗。
+证据：[agentinfer/scheduling/mori/strategy.py:223-345](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L223-L345)、[agentinfer/scheduling/mori/strategy.py:773-790](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L773-L790)。
 
-```mermaid
-flowchart LR
-    REQ[HTTP request] --> BR[AgentCache SchedulerBridge]
+对尚不能 fit 的候选，一轮最多构造一个新的完整置换计划：先在 projected union ledger 中删除候选 victims，证明整个计划足以容纳受益者，再提交。
+若移走所有合法 victims 仍无法 fit，则保留当前 placement，不做无效的部分驱逐。
+Acting victims 可立即腾出逻辑 claim；Reasoning victims 仅标记，受益者继续等待。这个单轮限制不限制硬债务修复处理多个 victims。
+证据：[agentinfer/scheduling/mori/strategy.py:223-345](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L223-L345)、[agentinfer/scheduling/mori/strategy.py:718-746](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L718-L746)。
 
-    subgraph CONTROL[Program control plane]
-      HOOKS[_VllmAdmissionHooks]
-      PS[ProgramScheduler]
-      MS[MORIStrategy]
-      FAC[MORI factors]
-      HOOKS --> PS --> MS
-      MS <--> FAC
-    end
+### 8.3 普通置换与例外
 
-    subgraph ENGINE[Native execution plane]
-      NS[native vLLM Scheduler]
-      KVM[KVCacheManager]
-      MR[ModelRunner]
-      NS --> KVM
-      NS --> MR
-    end
+| 场景 | 条件与动作 |
+| --- | --- |
+| 无硬债务、无等待者 | 保持合法驻留；不因 idleness 改变而全局重排 |
+| 普通等待者需要空间 | victim 必须 Acting、达到 GPU 最小驻留时间，且相对 idleness 差达到 margin；或全部 GPU owner 均 Acting 且该工具阶段已稳定 |
+| 等待超过公平性阈值 | 优先服务老等待者，可越过稳定性门槛并选择 Reasoning lazy victim |
+| GPU 硬债务 | Acting 优先，其次 Reasoning；同类高 idleness 优先，不受普通 sticky 门槛约束 |
+| 受益者取消或已不再等待 | 撤销为它保留的未提交软降层；不撤回已经完成的 CPU 降层 |
 
-    subgraph CACHE[Native cache replacement plane]
-      BP[HBM BlockPool]
-      HP[MORIHBMPolicy]
-      SS[SimpleCPUOffloadScheduler]
-      SBP[SimpleCPU CPU BlockPool]
-      SCP[MORISimpleCPUOffloadPolicy]
-      OM[CPUOffloadingManager compatibility]
-      CP[MoriCPUCachePolicy compatibility]
-      IDX1[HBM TypedLRUIndex]
-      IDX2[CPU TypedLRUIndex]
-      IDX3[Compatibility CPU TypedLRUIndex]
-      BP <--> HP --> IDX1
-      SS --> SBP
-      SBP <--> SCP --> IDX2
-      OM <--> CP --> IDX3
-    end
+证据：[agentinfer/scheduling/mori/strategy.py:223-345](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L223-L345)、[agentinfer/scheduling/mori/strategy.py:352-383](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L352-L383)、[agentinfer/scheduling/mori/strategy.py:798-809](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L798-L809)。
 
-    BR -->|composes| HOOKS
-    BR -- inherits / super calls --> NS
-    KVM --> BP
-    NS --> SS
-    NS -. optional compatibility connector .-> OM
-    MS -- committed class --> IDX1
-    MS -- committed class --> IDX2
-    MS -. committed class .-> IDX3
-    BP -. native safety authority .-> KVM
-    SBP -. queue/refcount authority .-> SS
-    SS -. D2H/H2D job authority .-> NS
-    OM -. job/fence/refcount authority .-> NS
-```
+默认 `min_residency_seconds=1.0` 从 GPU promotion 时计时，不是每次进入工具阶段重新得到一秒免回收期。
+当相对 idleness 明显不匹配时，已驻留足够久的 owner 仍可在短工具间隙降层。
+`max_wait_seconds=30.0` 是启动公平性例外的阈值，不是排队延迟上界：已有推理必须结束，单请求也必须能被容量容纳。
+这三个稳定性参数尚无本次重构的 GPU 消融调优结论。
+证据：[agentinfer/scheduling/mori/config.py:20-42](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/config.py#L20-L42)、[agentinfer/scheduling/mori/strategy.py:223-345](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L223-L345)、[design/module/scheduling/artifacts/mori-redesign-20261028/validation.json:114-121](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/design/module/scheduling/artifacts/mori-redesign-20261028/validation.json#L114-L121)。
 
-三个面的责任边界如下：
+## 9. 容量：上界、共享联合账本和边际回收
 
-1. Program control plane 只做 identity、retention、logical capacity、tier 和 transition。
-2. Native execution plane 继续决定 batch、token step、preemption、block allocation 和 model execution。
-3. Cache replacement plane 只改变可回收条目的**选择顺序**。推荐路径是 SimpleCPU CPU BlockPool 上的
-   `MORISimpleCPUOffloadPolicy`；`MoriCPUCachePolicy` 仅保留为旧 `OffloadingConnector` 兼容路径。两条路径的 native
-   BlockPool/manager 都继续执行合法性校验和物理操作，同一部署不会同时启用两个 CPU provider。
+### 9.1 原生可分配容量
 
-证据索引：`agentinfer/agentcache/core/scheduler.py:38-103`、`agentinfer/scheduling/runtime.py:69-100`、
-`agentinfer/agentcache/patches/vllm-0.31-mori-hbm-provider.patch:19-36`、
-`agentinfer/agentcache/mori/simple_cpu_policy.py:14-82`、`agentinfer/agentcache/mori_cpu_policy.py:19-26`。
+HBM 配额来自单 rank 的 native pool，扣除 null block：`C_gpu = (num_gpu_blocks - 1) × block_size`。
+SimpleCPU snapshot 的可分配容量同样排除 sentinel，并由 adapter 转换成 token 单位。
+当前 token 等价账本只支持一个 KV cache group；多 group 在启动时拒绝，不能把异构 group 简单相加。
+证据：[agentinfer/agentcache/core/scheduler.py:116-165](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/core/scheduler.py#L116-L165)、[agentinfer/agentcache/core/scheduler.py:472-513](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/core/scheduler.py#L472-L513)、[agentinfer/agentcache/mori/vllm_adapter.py:245-270](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/vllm_adapter.py#L245-L270)。
 
-### 2.3 与 Progress-TTL 的接入关系
+bridge 拒绝 `prompt > C_gpu`，也会在提供整数输出上界时拒绝 `prompt + max_output > C_gpu`。
+这是保守可容纳性检查：即使模型可能提前 EOS，也不会放行声明上界超过容量的请求。
+它不等于为每个请求预留完整最大输出；多个同时运行请求仍可能在后续增长时产生债务。
+证据：[agentinfer/agentcache/core/scheduler.py:167-214](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/core/scheduler.py#L167-L214)、[tests/agentcache/core/test_mori_vllm_adapter.py:498-521](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/tests/agentcache/core/test_mori_vllm_adapter.py#L498-L521)。
 
-MORI 沿用 Progress-TTL 的现有构造与 bridge 路径，没有新增独立 factory 模块。`build_controller()` 在同一个
-`agentinfer/agentcache/core/controller.py` 中显式选择 `progress_ttl` 或 `mori`，然后都返回 `ProgramScheduler`。
-`build_mori_strategy()` 只构造策略与初始 factors，职责与 Progress-TTL builder 平行。证据索引：
-`agentinfer/agentcache/core/controller.py:86-137`、`agentinfer/scheduling/mori/builder.py:15-28`。
+### 9.2 每个 owner 的 promise
 
-## 3. 启动与能力协商
-
-### 3.1 启动时序
-
-```mermaid
-sequenceDiagram
-    participant CLI as AgentInfer serve CLI
-    participant Bridge as SchedulerBridge.__init__
-    participant Hooks as _VllmAdmissionHooks
-    participant Builder as build_controller
-    participant PS as ProgramScheduler
-    participant Adapter as install_vllm_mori
-    participant CPU as SimpleCPU provider or MoriCPUCachePolicy
-    participant KVM as KVCacheManager/BlockPool
-
-    CLI->>Bridge: inject async/sync bridge class
-    Bridge->>Bridge: super().__init__ creates native scheduler
-    Bridge->>Hooks: construct with vLLM config and block size
-    Hooks->>Hooks: observe HBM/DRAM quotas
-    Hooks->>Builder: strategy=mori, mode, window_size
-    Builder->>PS: MORIStrategy + MORIFactors + backend snapshot
-    Builder-->>Hooks: ProgramScheduler
-    Hooks->>Adapter: install_vllm_mori(owner, strategy)
-    Adapter->>CPU: register SimpleCPU v1 or verify policy marker
-    Adapter->>Adapter: bind strategy as class provider
-    Adapter->>KVM: register_mori_block_selection_provider(v1)
-    KVM->>KVM: bootstrap native free-queue LRU sequence
-    KVM-->>Adapter: hook_api_version=1
-```
-
-证据索引：`agentinfer/agentcache/core/scheduler.py:106-151`、
-`agentinfer/agentcache/core/controller.py:101-137`、`agentinfer/agentcache/mori/vllm_adapter.py:105-214`、
-`agentinfer/agentcache/patches/vllm-0.31-mori-hbm-provider.patch:176-203`、
-`agentinfer/agentcache/patches/vllm-0.31-mori-simple-cpu-provider.patch:88-224`。
-
-### 3.2 full 与 placement-only
-
-`full` 模式启动时必须同时满足：单 embedded backend rank、rank-local DRAM quota 与 block/chunk size、HBM provider
-register/unregister、hook API version 1，以及一个完整 offload-tier capability。推荐的 SimpleCPU 路径要求 snapshot、
-register/unregister、CPU backend 和 eager mode；兼容的 OffloadingConnector 路径要求外部 CPU policy marker。任何条件
-不满足都会 fail closed；不会静默退化到 native LRU。adapter 通过 `connector.scheduler_manager` 定位
-`SimpleCPUOffloadScheduler`，通过版本化 register/unregister 完成实例级接线，不读取进程全局 connector。`placement_only`
-是显式消融：只绑定 Program placement，不安装 HBM/CPU policy，也不能宣称完成三层 cache management。证据索引：
-`agentinfer/agentcache/core/controller.py:115-137`、`agentinfer/agentcache/mori/vllm_adapter.py:105-214`。
-
-## 4. 服务端 identity 与生命周期
-
-### 4.1 正式实现不读取 plan
-
-Program identity 只来自请求携带的 `vllm_xargs.agentic_context`、支持的 `agent_hint` 或 framework headers。
-解析器在服务端生成 `AgentIdentity`；若 full MORI 解析不到 identity，bridge 直接拒绝请求。subagent 的 `agent_id`
-会形成独立 Program ID，不能与 lead 共用 Program。证据索引：`agentinfer/scheduling/identity.py:97-174`、
-`agentinfer/agentcache/core/scheduler.py:153-177`。
-
-```mermaid
-sequenceDiagram
-    participant Client
-    participant Bridge
-    participant Parser as parse_agent_identity
-    participant Registry as ProgramRegistry
-    participant Runtime as ProgramScheduler
-    participant State as MORIRuntimeState
-
-    Client->>Bridge: Request + xargs/headers
-    Bridge->>Parser: parse body extension and headers
-    alt identity missing
-        Parser-->>Bridge: None
-        Bridge-->>Client: reject (MORI requires identity)
-    else identity valid
-        Parser-->>Bridge: AgentIdentity(program_id,...)
-        Bridge->>Runtime: on_request_arrival
-        Runtime->>Registry: materialize current generation
-        Registry-->>Runtime: ProgramRef(program_id, generation)
-        Runtime-->>Bridge: admitted now or retained
-        Bridge->>State: bind native request_id -> ProgramRef
-    end
-```
-
-`ProgramRef(program_id, generation)` 防止同一个稳定 ID 被释放后重新出现时，旧 block/chunk owner 或迟到事件误作用于
-新 incarnation。Registry 每次 rematerialize 递增 generation，release 同时清理 task/parent 索引。证据索引：
-`agentinfer/scheduling/domain.py:49-66`、`agentinfer/scheduling/program_registry.py:55-102`、
-`agentinfer/scheduling/program_registry.py:166-185`。
-
-### 4.2 并发语义
-
-首版正式 MORI 对同一个 `ProgramRef` 最多允许一个 in-flight inference request；重叠请求在 arrival 时拒绝。并行
-subagent 必须使用独立 Program ID，因此各自有独立 factors、reservation 与 cache class。证据索引：
-`agentinfer/scheduling/mori/strategy.py:48-54`、`agentinfer/scheduling/runtime.py:159-178`、
-`tests/scheduling/test_mori_runtime.py:68-97`。
-
-## 5. 核心数据模型
-
-```mermaid
-classDiagram
-    class ProgramRef {
-      +str program_id
-      +int generation
-    }
-    class RuntimeProgram {
-      +ProgramState state
-      +ProgramStatus status
-      +ProgramTokenObservation tokens
-      +int step_count
-      +bool marked_for_pause
-    }
-    class ProgramTokenObservation {
-      +int estimated_context_tokens
-      +int shared_prefix_tokens
-      +int actual_resident_tokens?
-      +TokenObservationSource source
-    }
-    class RequestBinding {
-      +ProgramRef program
-      +int prompt_tokens
-      +int output_tokens
-      +float scheduler_queue_seconds
-      +cache hit observations
-    }
-    class MORIProgramFactors {
-      +MORITier tier
-      +tuple cycles
-      +float pending_reasoning_seconds
-      +float acting_started_at
-      +float reasoning_started_at
-      +MORITier pending_tier
-      +float last_idleness
-    }
-    class SchedulingSnapshot {
-      +int total_kv_tokens
-      +int total_dram_kv_tokens
-      +int native_used_kv_tokens
-      +int used_dram_kv_tokens
-      +int pending_h2d_kv_tokens
-      +int pending_d2h_kv_tokens
-      +int hbm_block_size_tokens
-      +int dram_chunk_size_tokens
-    }
-
-    ProgramRef "1" <-- "1" RuntimeProgram
-    RuntimeProgram *-- ProgramTokenObservation
-    ProgramRef "1" <-- "0..*" RequestBinding
-    ProgramRef "1" <-- "1" MORIProgramFactors
-    SchedulingSnapshot o-- RuntimeProgram : immutable ProgramView
-```
-
-证据索引：`agentinfer/scheduling/runtime.py:50-67`、`agentinfer/scheduling/domain.py:69-148`、
-`agentinfer/scheduling/mori/factors.py:20-56`、`agentinfer/scheduling/snapshot.py:22-50`。
-
-### 5.1 `ProgramRegistry`
-
-Registry 是 live Program 记录和 generation/task/parent 索引的唯一所有者。它不拥有等待队列、capacity 或 strategy
-sidecar；所有 mutation 由嵌入式 scheduler 的同一 mutation boundary 串行化。证据索引：
-`agentinfer/scheduling/program_registry.py:3-8`、`agentinfer/scheduling/program_registry.py:32-44`。
-
-### 5.2 `RequestPool`
-
-RequestPool 保存尚未交给 native scheduler 的真实 `Request`，按插入顺序维护 `WAITING/ADMITTED`，并通过
-`recent_admit` 一次性把已准入请求交还 bridge。它不是第二套执行队列：请求一旦 consume，就进入 native waiting。
-证据索引：`agentinfer/scheduling/request_pool.py:23-54`、`agentinfer/scheduling/request_pool.py:83-112`。
-
-### 5.3 `MORIProgramFactors`
-
-每个 Program 的 sidecar 只保存已提交历史和当前逻辑层。`cycles` 是最近若干 `(reasoning_seconds,
-acting_seconds)`；当前未闭合周期由两个 start timestamp 与 `pending_reasoning_seconds` 表示；`pending_tier` 仅用于
-Reasoning lazy demotion，不会提前释放 GPU logical reservation。证据索引：
-`agentinfer/scheduling/mori/factors.py:31-56`、`agentinfer/scheduling/mori/strategy.py:385-394`。
-
-## 6. 请求主流程与代码走读
-
-### 6.1 Arrival、retention 与 admission
-
-```mermaid
-flowchart TD
-    A[Bridge.add_request] --> B[server parse AgentIdentity]
-    B --> C[ProgramScheduler.on_request_arrival]
-    C --> D[Registry.materialize ProgramRef]
-    D --> E[更新 prompt/context 与 REASONING 状态]
-    E --> F[RequestPool.add real Request]
-    F --> G[MORIStrategy.handle_admission]
-    G --> H{GPU logical remaining >= reservation?}
-    H -->|yes| I[ADMIT or RESUME transition]
-    I --> J[consume immediate request]
-    J --> K[super.add_request -> native waiting]
-    H -->|no| L[QUEUE transition]
-    L --> M[Request remains in RequestPool]
-```
-
-执行顺序非常重要：prompt token 先写入 Program view，再调用 `handle_admission()`；因此 admission 使用当前请求已知的
-上下文，而不是上一次完成值。新 Program 首次 decision 时会从 waiting view 暂时排除，避免把“候选本身”同时当成
-已有排队者。若立即准入，RequestPool 的 entry 在返回 bridge 前被消费；否则真实 request 对象继续保留在
-RequestPool。证据索引：`agentinfer/scheduling/runtime.py:159-252`、`agentinfer/scheduling/runtime.py:614-643`。
-
-### 6.2 周期调度
-
-```mermaid
-sequenceDiagram
-    participant Bridge
-    participant PS as ProgramScheduler
-    participant Strategy as MORIStrategy
-    participant TC as TransitionController
-    participant Native as native Scheduler
-
-    Bridge->>PS: before_schedule / fresh backend_pool_info
-    PS->>PS: needs_schedule_cycle(now)
-    PS->>Strategy: on_schedule_cycle_start(snapshot)
-    PS->>Strategy: repair_capacity(snapshot)
-    Strategy->>TC: PAUSE or MARK_FOR_PAUSE if needed
-    TC-->>PS: applied transition ledger
-    PS->>PS: advance immutable snapshot
-    PS->>Strategy: schedule_resume(updated snapshot)
-    Strategy->>TC: ADMIT / RESUME candidates that fit
-    PS-->>Bridge: consume_admitted_requests()
-    Bridge->>Native: super.add_request(each admitted)
-    Bridge->>Native: super.schedule()
-```
-
-正式 MORI 固定 `REPAIR_THEN_RESUME`：先消除已有 HBM/DRAM logical debt，再从更新后的 snapshot promotion，防止
-把待释放但尚未提交的容量重复出售。`ProgramScheduler` 通过 applied transition ledger 推导同一 cycle 的新 snapshot，
-而不是让 strategy 直接修改 Registry。证据索引：`agentinfer/scheduling/mori/strategy.py:44-46`、
-`agentinfer/scheduling/runtime.py:254-278`、`agentinfer/scheduling/runtime.py:584-612`。
-
-### 6.3 Stream output、completion 与 lazy pause
-
-native 每次 output 更新把累计 output tokens 回传 runtime；Program 的 context estimate 变为至少
-`prompt_tokens + output_tokens`。最终完成使用 backend total tokens 覆盖 estimate，并发出包含 latency、queue wait、
-cache hit 与当前 Program counts 的 `REQUEST_FINISHED` event。若 Program 已 `marked_for_pause`，完成路径先执行真正
-`PAUSE`，`on_program_paused()` 再把 `pending_tier` 提交成 tier。证据索引：
-`agentinfer/scheduling/runtime.py:295-315`、`agentinfer/scheduling/runtime.py:388-464`、
-`agentinfer/scheduling/mori/strategy.py:337-346`。
-
-```mermaid
-stateDiagram-v2
-    [*] --> GPU_REASONING
-    GPU_REASONING --> GPU_PENDING_CPU: capacity repair / MARK_FOR_PAUSE
-    GPU_PENDING_CPU --> GPU_PENDING_CPU: decode continues; GPU reservation retained
-    GPU_PENDING_CPU --> CPU_ACTING: request finishes / PAUSE committed
-    GPU_REASONING --> GPU_PENDING_WAITING: no DRAM destination
-    GPU_PENDING_WAITING --> WAITING_ACTING: request finishes / PAUSE committed
-```
-
-## 7. Idleness：只使用已提交历史和当前已流逝时间
-
-设窗口大小为 `k`，每个闭合周期为 `(R_i, A_i)`。若当前处于 Acting，加入已完成 reasoning 与截至 `now` 的 acting；
-若当前处于 Reasoning，只加入截至 `now` 的 reasoning。当前 partial cycle 占用一个窗口槽：
+设当前上下文 T、HBM block 大小 B、CPU chunk 大小 H、decode buffer d=100：
 
 ```text
-I_k(now) = sum(A_i + A_partial) / sum(R_i + R_partial + A_i + A_partial)
+ceil_q(x) = ceil(x / q) × q
+GPU promise = max(ceil_B(T), min(ceil_B(T + d), C_gpu))
+CPU promise = ceil_H(T)
 ```
 
-分母为零时 idleness 为 0。默认 `k=5`；公式不读 plan、未来 successor 或未来 return time。周期在
-`ACTING -> REASONING` 时闭合，request completion 只提交本轮 reasoning 并开始 Acting 计时。证据索引：
-`agentinfer/scheduling/mori/config.py:18-32`、`agentinfer/scheduling/mori/strategy.py:263-335`、
-`agentinfer/scheduling/mori/strategy.py:543-559`。
+GPU target 的 clamp 防止一个本来可容纳的 prompt 仅因为额外 headroom 永远无法准入；原始 context 不会被 clamp 掩盖。
+headroom 属于私有增长余量，不能因为共享 prefix 命中就把它也抵扣。
+证据：[agentinfer/scheduling/mori/strategy.py:820-828](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L820-L828)、[agentinfer/scheduling/mori/strategy.py:831-833](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L831-L833)、[tests/scheduling/test_mori_strategy.py:518-529](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/tests/scheduling/test_mori_strategy.py#L518-L529)。
 
-```mermaid
-sequenceDiagram
-    participant P as Program
-    participant R as ProgramScheduler events
-    participant F as MORIProgramFactors
+### 9.3 哪些共享证据可以抵扣
 
-    P->>R: request starts
-    R->>F: status=REASONING; close prior acting cycle
-    P->>R: stream outputs
-    Note over R,F: update token estimate; do not close timing cycle
-    P->>R: request finishes
-    R->>F: pending_reasoning_seconds = latency - scheduler_wait
-    R->>F: acting_started_at = completion time
-    P->>R: next request starts
-    R->>F: append(reasoning, elapsed acting), keep last k
-```
+`FootprintBook` 由 native owner callback 维护 `(tier, ProgramRef) → block IDs` 与 `(tier, block ID) → owners` 两个索引。
+GPU 和 CPU 的 ID 空间分开；null ID 不记账；同一 owner 的重复 ID 不重复计费。
+prompt 替换、owner release、原生 block remove/reuse、cache reset 都会撤销相关证明。
+若某 owner 的已知块数超过当前 context 能容纳的块数，策略丢弃该 owner 的整份证明，不猜哪个子集仍有效。
+证据：[agentinfer/agentcache/mori/footprints.py:10-54](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/footprints.py#L10-L54)、[agentinfer/agentcache/mori/hbm_policy.py:38-53](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/hbm_policy.py#L38-L53)、[agentinfer/agentcache/mori/simple_cpu_policy.py:46-61](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/simple_cpu_policy.py#L46-L61)、[agentinfer/scheduling/mori/strategy.py:657-666](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L657-L666)。
 
-## 8. 容量账本、promotion 与 demotion
+`shared_prefix_tokens`、一次 lookup 的 hit tokens、refcount 大于一都不能单独证明多个 owner 的联合物理工作集。
+缺失或不完整的当前 prompt 证明时完整收取未证明部分。当前没有为 waiting 请求建立独立的全局 hash 预准入目录；
+legacy CPU policy 也没有 SimpleCPU 的物理块证明能力，因此共享抵扣可能偏少。
+证据：[agentinfer/scheduling/mori/capacity.py:11-27](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/capacity.py#L11-L27)、[agentinfer/scheduling/mori/strategy.py:657-666](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L657-L666)、[agentinfer/agentcache/mori/runtime_state.py:61-63](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/runtime_state.py#L61-L63)、[agentinfer/agentcache/mori/vllm_adapter.py:105-200](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/vllm_adapter.py#L105-L200)。
 
-### 8.1 Logical reservation 公式
+### 9.4 Union ledger 与边际回收
 
-正式实现保留固定 decode buffer 设计：
+对同一层，量子为 q，每个 claim 有 promise 与已证明块集合 K：
 
 ```text
-gpu_target(program) = round_up(estimated_context_tokens + 100, hbm_block_size_tokens)
-dram_target(program) = round_up(estimated_context_tokens, dram_chunk_size_tokens)
-
-gpu_reserved = sum(gpu_target(p) for tier(p) == GPU)
-cpu_reserved = sum(dram_target(p) for tier(p) == CPU or pending_tier(p) == CPU)
+used = Σ(promise_i - q × |K_i|) + q × |union(K_i)|
+reclaim(i) = promise_i - q × |K_i 中仍被其他 claim 持有的块|
 ```
 
-`decode_buffer_tokens=100` 是不可从部署配置覆盖的实现常量，用于给下一段 decode 增长留出固定余量。引擎能够提供
-当前 block/chunk、used quota 和传输事实，但不能在 admission 前知道未来真实输出长度；因此 reservation 使用当前
-服务端维护的 context token 数加固定 buffer，并按 native allocation quantum 向上取整。证据索引：
-`agentinfer/scheduling/mori/config.py:18-32`、`agentinfer/agentcache/core/controller.py:82-117`、
-`agentinfer/scheduling/mori/strategy.py:499-541`。
+例如不含 decode headroom 的 A=40 块、B=30 块、共享=20 块，联合工作集为 50 块；移除 A 的边际 relief 是 20 块。
+直接求和得到 70 块会过度收费，取最大值得到 40 块会低估，回收时减去 A 的全部 40 块会虚构可用预算。
+`CapacityLedger` 使用 block 引用计数增减联合占用；GPU/CPU 分别建账，pending CPU 目标只进入 CPU ledger。
+证据：[agentinfer/scheduling/mori/capacity.py:30-80](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/capacity.py#L30-L80)、[tests/scheduling/test_mori_capacity.py:23-30](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/tests/scheduling/test_mori_capacity.py#L23-L30)、[tests/scheduling/test_mori_capacity.py:33-50](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/tests/scheduling/test_mori_capacity.py#L33-L50)。
 
-这里必须区分两套数值：
+### 9.5 逻辑预算和物理驻留的关系
 
-- logical reservation 决定新的 Program 是否允许进入 GPU/CPU tier；
-- `native_used_kv_tokens`、`used_dram_kv_tokens`、pending H2D/D2H 是 diagnostics 与真实 backend observation。
-
-当前 placement 公式不直接用 physical used 数做 admission，并会对每个 Program 的完整 logical context 分别做保守预留；
-因此 shared prefix 可能在 logical ledger 中重复预留。物理 block/chunk 本身仍只是一条 entry，其共享保护由 replacement
-index 的 owner set 去重处理。证据索引：`agentinfer/scheduling/snapshot.py:22-50`、
-`agentinfer/scheduling/mori/strategy.py:230-259`、`agentinfer/agentcache/mori/typed_lru.py:79-109`。
-
-### 8.2 admission 与 promotion
-
-Arrival admission 不主动挤出一个当前合法的 GPU Program：已有 GPU Program 先 repair aggregate growth；新/返回 Program
-只有在 `remaining >= gpu_target` 时才 ADMIT/RESUME，否则留在 RequestPool。周期 promotion 的候选顺序是：
-
-1. CPU tier 的 returning Program；
-2. Waiting tier 且 `step_count > 0` 的 returning Program；
-3. 新 Program，按较小 `gpu_target` 优先；
-4. 同一优先级按 idleness 从低到高，再按 `ProgramRef` 稳定 tie-break。
-
-这套排序与隔离原型的 key 相同，但正式 admission 不执行隔离原型中的 candidate-triggered relative swap；正式版只在
-真实 aggregate capacity debt 出现时做 demotion。证据索引：`agentinfer/scheduling/mori/strategy.py:90-183`、
-`agentinfer/scheduling/mori/strategy.py:468-484`、
-`/data/zx/agent-kvc/research/studies/kvc_theory/mori-reproduction-20261022/candidate/joint/mori.py:509-527`。
-
-### 8.3 HBM demotion
-
-当 `gpu_reserved > HBM quota` 时，先扣除已经承诺的 lazy relief，再从尚未标记的 GPU Programs 中选择 victim：
-
-1. Acting 先于 Reasoning；
-2. 同 status 内 idleness 高者先；
-3. Acting 可立即 PAUSE；Reasoning 只能 MARK_FOR_PAUSE；
-4. 目标 DRAM logical reservation 放得下则 pending CPU，否则 pending Waiting。
-
-Reasoning 被 mark 后仍计入 GPU reservation；只有 pause event 才提交 tier。这避免 promotion 使用并不存在的即时释放。
-证据索引：`agentinfer/scheduling/mori/strategy.py:376-423`、`tests/scheduling/test_mori_strategy.py:151-167`。
-
-```mermaid
-flowchart TD
-    A[recompute gpu_reserved] --> B{reserved <= HBM quota?}
-    B -->|yes| Z[no demotion]
-    B -->|no| C[subtract already promised lazy relief]
-    C --> D{debt remains?}
-    D -->|no| Y[wait for marked requests to finish]
-    D -->|yes| E[sort victims: Acting first, then high idleness]
-    E --> F{victim status}
-    F -->|Acting| G[choose CPU or Waiting; PAUSE now]
-    F -->|Reasoning| H[choose CPU or Waiting; MARK_FOR_PAUSE]
-    G --> I[reduce debt]
-    H --> I
-    I --> D
-```
-
-### 8.4 DRAM repair
-
-CPU reservation 同时包含已在 CPU tier 和 `pending_tier=CPU` 的 Program，防止多个 lazy demotion 预订同一份 DRAM。
-超额时按 idleness 从高到低把 CPU/pending-CPU victim 改为 Waiting，直到不超 quota。正式实现不主动发起 D2H/H2D；
-tier 只改变随后 replacement 的保护等级，实际 offload/load 仍由 native connector 按请求生命周期触发。证据索引：
-`agentinfer/scheduling/mori/strategy.py:425-466`、`agentinfer/scheduling/mori/strategy.py:509-515`、
-`agentinfer/scheduling/mori/strategy.py:26-33`。
-
-## 9. Program tier 如何传递到两层 KV replacement
-
-### 9.1 `MORIRuntimeState` 是窄桥，不是另一份 scheduler
-
-`MORIRuntimeState` 保存三类 process-local 关系：当前 class provider、native request ID 到 `ProgramRef` 的绑定、以及已注册
-owner index 列表。当 strategy 提交 class change，它只对反向索引到该 Program 的 entries 触发 reclass；Program
-release 则删除该 generation 的 owner 并清理残留 request binding。所有操作发生在序列化 engine thread 路径。
-证据索引：`agentinfer/agentcache/mori/runtime_state.py:17-39`、
-`agentinfer/agentcache/mori/runtime_state.py:51-86`。
-
-```mermaid
-classDiagram
-    class MORIRuntimeState {
-      -provider: ProgramCacheClassProvider
-      -requests: dict~request_id, ProgramRef~
-      -indexes: list~OwnerIndex~
-      +bind_request()
-      +cache_class_for_program()
-      +on_cache_class_changed()
-      +on_program_released()
-    }
-    class MORIStrategy {
-      -classes: dict~ProgramRef, CacheClass~
-      -cache_class_epoch
-      +subscribe_cache_class_observer()
-    }
-    class HBMIndex
-    class CPUIndex
-
-    MORIStrategy --> MORIRuntimeState : observer notification
-    MORIRuntimeState --> HBMIndex : reclassify/release Program
-    MORIRuntimeState --> CPUIndex : reclassify/release Program
-```
-
-### 9.2 shared entry 的“最受保护 owner”
-
-一个 block/chunk 可有多个 Program owner。每个 typed index 对所有 owners 求自己 protection rank 下的最大 class：
-
-| 层 | protection rank（低 -> 高） | 淘汰顺序（先 -> 后） |
+| 观测或承诺 | 可以推断 | 不能推断 |
 | --- | --- | --- |
-| HBM | `INACTIVE < IDLE < BUSY` | `INACTIVE -> IDLE -> BUSY` |
-| CPU | `INACTIVE < BUSY < IDLE` | `INACTIVE -> BUSY -> IDLE` |
+| `gpu_reserved_tokens` | 逻辑 GPU promises 的共享联合计费 | allocator 立即可用的 free blocks |
+| `cpu_reserved_tokens` | CPU owner 与 pending 目标的逻辑计费 | 每个 owner 已完整 READY |
+| `native_hbm_used_tokens` | 当前 native 使用观测 | 尚未分配的未来 decode 空间 |
+| `native_dram_used_tokens` | 当前 CPU tier 使用观测 | CPU 命中收益或可回收量 |
+| `pending_h2d/d2h_tokens` | 当前在途传输观测 | 传输已完成或不再持有源 block |
+| owner footprint | 可证明的共享容量关系 | 所有 block 现在均可驱逐或已经持久化 |
 
-因此 shared HBM block 只要有 BUSY owner 就按 BUSY 保护；shared CPU chunk 只要有 IDLE owner 就按 IDLE 保护。
-两层使用相同的 owner set 语义，但 protection rank 有意不同。证据索引：
-`agentinfer/agentcache/mori/hbm_policy.py:20-30`、`agentinfer/agentcache/mori_cpu_policy.py:31-46`、
-`agentinfer/agentcache/mori/typed_lru.py:297-299`。
+证据：[agentinfer/scheduling/mori/strategy.py:429-504](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L429-L504)、[agentinfer/agentcache/core/scheduler.py:472-513](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/core/scheduler.py#L472-L513)、[agentinfer/agentcache/mori/vllm_adapter.py:69-102](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/vllm_adapter.py#L69-L102)。
 
-```mermaid
-flowchart LR
-    P1[Program A: BUSY] --> E[shared entry]
-    P2[Program B: IDLE] --> E
-    P3[Program C: INACTIVE] --> E
-    E --> H[HBM class = BUSY]
-    E --> C[CPU class = IDLE]
-```
+因此本实现提供的是保守逻辑准入与 cache protection。它没有建立“全量 CPU READY 才允许 demotion”的两阶段物理迁移协议；
+缓存缺失时 native 仍可重算。这个差异也是后续性能分析必须单独测量的因素。
+证据：[agentinfer/scheduling/mori/strategy.py:681-716](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L681-L716)、[agentinfer/agentcache/mori/simple_cpu_policy.py:14-85](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/simple_cpu_policy.py#L14-L85)、[design/module/scheduling/artifacts/mori-redesign-20261028/validation.json:114-121](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/design/module/scheduling/artifacts/mori-redesign-20261028/validation.json#L114-L121)。
 
-## 10. `TypedLRUIndex` 数据结构实现
+## 10. Typed-LRU：两层共享索引机制
 
-### 10.1 内部对象图
+### 10.1 类顺序和共享 owner
 
-```mermaid
-classDiagram
-    class Entry {
-      +key
-      +frozenset owners
-      +CacheClass cache_class
-      +int native_lru_seq
-      +int version
-      +bool ready
-    }
-    class TypedLRUIndex {
-      -dict entries
-      -dict program_entries
-      -dict class_entries
-      -Counter ready_counts
-      -dict heaps
-      -int ticket
-      +upsert()
-      +touch()
-      +mark_ready()
-      +reclassify_program()
-      +release_program()
-      +reserve_exact()
-    }
-    class HeapRecord {
-      +native_lru_seq
-      +ticket
-      +entry_version
-      +key
-    }
-
-    TypedLRUIndex *-- Entry : key -> live state
-    TypedLRUIndex *-- HeapRecord : one min-heap per class
-    TypedLRUIndex --> Entry : ProgramRef -> keys reverse index
-    TypedLRUIndex --> Entry : CacheClass -> keys
-```
-
-实际字段如下：
-
-- `_entries[key]` 是某个 entry 的唯一 live state；
-- `_program_entries[ProgramRef]` 使 tier change 只访问该 Program 的 entries；
-- `_class_entries[CacheClass]` 支持 class-local compaction；
-- `_heaps[CacheClass]` 保存 `(native_lru_seq, ticket, version, key)`，最小 sequence 就是类内 native LRU victim；
-- `_ready_counts` 控制 compaction 阈值；
-- `version` 让 touch/reclass/ready change 留下的旧 heap record 可惰性丢弃。
-
-证据索引：`agentinfer/agentcache/mori/typed_lru.py:24-70`、
-`agentinfer/agentcache/mori/typed_lru.py:301-338`。
-
-### 10.2 更新路径
-
-`upsert()` 归一化 owner set，重算 strongest class，更新 reverse/class indexes；ready entry 压入对应 class heap。
-`touch()` 只推进 native sequence 和 version，不改变 class；`mark_ready()` 映射 native evictability；`remove()` 清 live state
-和所有 reverse indexes。证据索引：`agentinfer/agentcache/mori/typed_lru.py:79-169`。
-
-Program class change 采用 **eager reverse-index migration**：遍历 `_program_entries[program]`，只迁移 strongest class
-真的变化的 entry，并保留原 `native_lru_seq`。它不是 `O(1)`；若 Program 拥有 `B_p` 个 entries，最坏为
-`O(B_p log N)`，换取 proposal hot path 不做全表 owner join。证据索引：
-`agentinfer/agentcache/mori/typed_lru.py:34-41`、`agentinfer/agentcache/mori/typed_lru.py:171-197`。
-
-### 10.3 victim reservation
-
-```mermaid
-flowchart TD
-    A[reserve_exact n, protected] --> B[按 eviction_order 访问 class heap]
-    B --> C[heappop oldest record]
-    C --> D{record version/class/seq/ready current?}
-    D -->|no| E[stale repair counter]
-    E --> F{超过 bound?}
-    F -->|yes| G[raise; fail closed]
-    F -->|no| C
-    D -->|yes| H{protected or duplicate?}
-    H -->|yes| I[defer and continue]
-    H -->|no| J[reserve key]
-    J --> K{selected == n?}
-    K -->|no| B
-    K -->|yes| L[yield exact ordered tuple]
-    L --> M{caller removed live entry?}
-    M -->|yes| N[do not restore]
-    M -->|no / rejected| O[restore still-current heap record]
-```
-
-`reserve_exact()` 只在凑齐 exact count 时返回 tuple；不足返回 `None`。protected head 暂存后回压；已选 entry 若在
-reservation 内被 caller `remove()`，退出时不会恢复；验证失败但 entry 仍 live，则自动恢复。stale repair 超过 4096
-直接抛错，不退化为无界扫描或 native fallback。证据索引：
-`agentinfer/agentcache/mori/typed_lru.py:218-281`、`agentinfer/agentcache/mori/typed_lru.py:44-61`。
-
-### 10.4 复杂度与内存
-
-| 操作 | 成本 | 说明 |
+| 物理层 | 优先驱逐顺序 | 同一 entry 共享 owner 时最强保护 |
 | --- | --- | --- |
-| `upsert` | `O(owners + log N)` | owner attach/detach 加一次 heap push |
-| `touch` | `O(log N)` | 新 version record；旧 record 惰性失效 |
-| `mark_ready(False)` | `O(1)` | version 使旧 record 失效 |
-| `mark_ready(True)` | `O(log N)` | 新 record 入堆 |
-| Program reclass | `O(B_p * (owners + log N))` | eager reverse-index migration |
-| `reserve_exact(n)` | `O((n + protected_heads + stale_repairs) log N)` | stale repairs 有硬上界 |
-| class-local compact | `O(N_class)` amortized | heap 至少 64 且达到 ready live records 的 2 倍时重建 |
+| HBM | INACTIVE → IDLE → BUSY | BUSY > IDLE > INACTIVE |
+| CPU | INACTIVE → BUSY → IDLE | IDLE > BUSY > INACTIVE |
 
-Live state 为 `O(N + sum(owner edges))`；heap 允许短期 stale records，但 class-local compaction 将其控制在与 ready
-entries 同阶。证据索引：`agentinfer/agentcache/mori/typed_lru.py:309-323`、
-`agentinfer/agentcache/mori/typed_lru.py:340-351`。
+CPU 优先保留只依赖 CPU 层的 IDLE owner；GPU 上已有 BUSY 工作集的 CPU 备份相对低优先级。
+同一层按最强 owner 保护共享 entry，然后在同 class 内沿用 native recency。
+证据：[agentinfer/agentcache/mori/hbm_policy.py:20-31](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/hbm_policy.py#L20-L31)、[agentinfer/agentcache/mori/simple_cpu_policy.py:24-35](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/simple_cpu_policy.py#L24-L35)、[agentinfer/agentcache/mori/typed_lru.py:302-304](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/typed_lru.py#L302-L304)。
 
-## 11. HBM replacement 走读
+### 10.2 索引结构与更新
 
-### 11.1 正式 hook 的边界
+每个 entry 保存 key、owner 集合、cache class、native LRU sequence、version 和 ready 标记。
+索引同时维护 key→entry、ProgramRef→keys、class→keys、class→heap 及 ready 计数。
+owner 变化只更新相应 entry；某 Program tier 改变时仅遍历它反向索引的 entries，重新计算最强 class。
+release 只移除本代 owner，其他共享 owner 继续保护该 entry。
+证据：[agentinfer/agentcache/mori/typed_lru.py:25-71](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/typed_lru.py#L25-L71)、[agentinfer/agentcache/mori/typed_lru.py:113-123](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/typed_lru.py#L113-L123)、[agentinfer/agentcache/mori/typed_lru.py:172-198](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/typed_lru.py#L172-L198)、[agentinfer/agentcache/mori/typed_lru.py:200-217](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/typed_lru.py#L200-L217)。
 
-正式 HBM 不替换 `queue.popleft_n`。vLLM patch 增加版本化 `MoriBlockSelectionProvider`：BlockPool 发送 owner、ready、
-evictability、remove/reset 和 native sequence delta；需要 block 时向 provider 请求 exact IDs。provider 只给建议，
-BlockPool 先验证 count、唯一性、ID 范围、非 null、`ref_cnt==0` 与 free-queue membership，完整 proposal 合法后才
-remove；hash eviction、reuse watcher 和 allocation 继续走 native 代码。证据索引：
-`agentinfer/agentcache/patches/vllm-0.31-mori-hbm-provider.patch:19-36`、
-`agentinfer/agentcache/patches/vllm-0.31-mori-hbm-provider.patch:58-100`。
+heap ticket 带 sequence 和 version，旧记录在弹出时校验并跳过；频繁 touch/class 变化引入的 stale records 通过 class-local compaction 清理。
+heap 长度达到 `max(64, 2 × ready_count)` 会重建；一次 proposal 的 stale repair 超过预算也会重建，并排除已暂存的有效记录以避免重复恢复。
+证据：[agentinfer/agentcache/mori/typed_lru.py:225-286](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/typed_lru.py#L225-L286)、[agentinfer/agentcache/mori/typed_lru.py:314-320](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/typed_lru.py#L314-L320)、[agentinfer/agentcache/mori/typed_lru.py:322-333](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/typed_lru.py#L322-L333)、[agentinfer/agentcache/mori/typed_lru.py:339-348](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/typed_lru.py#L339-L348)。
 
-```mermaid
-sequenceDiagram
-    participant KVM as KVCacheManager
-    participant BP as BlockPool
-    participant HP as MORIHBMPolicy
-    participant IDX as HBM TypedLRUIndex
+### 10.3 Proposal 与 reservation
 
-    KVM->>BP: observe request blocks(request_id)
-    BP->>HP: on_block_owner_added(block_id, request_id)
-    HP->>IDX: update owner ProgramRef
-    BP->>HP: on_block_ready(block_id, native_lru_seq)
-    HP->>IDX: upsert ready entry
-    BP->>HP: propose(count)
-    HP->>IDX: propose_exact(count)
-    IDX-->>HP: ordered block IDs
-    HP-->>BP: advice only
-    BP->>BP: validate all IDs/refcnt/queue links
-    BP->>BP: remove from native free queue
-    BP->>HP: evictability false + removed
-    BP->>KVM: continue native hash eviction/allocation
-```
+`propose_exact(n)` 返回恰好 n 个候选或 None，不改 live entries；内部借助 reservation，在作用域结束时恢复仍有效记录。
+legacy CPU 的 `reserve_exact(n)` 允许 caller 在作用域内真正 remove，已经删除的 victims 不再回压，因此省掉 proposal→restore→remove 的额外 heap 操作。
+protected entries 暂存后恢复；不足 n 不返回部分列表。所有修改在 engine thread 执行，reservation 不是跨线程锁。
+证据：[agentinfer/agentcache/mori/typed_lru.py:219-222](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/typed_lru.py#L219-L222)、[agentinfer/agentcache/mori/typed_lru.py:225-286](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/typed_lru.py#L225-L286)、[agentinfer/agentcache/mori_cpu_policy.py:19-196](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori_cpu_policy.py#L19-L196)。
 
-owner 建立不是每 decode step 全扫：某请求每次 residency 第一次观察已有 blocks，此后只观察 newly allocated blocks。
-free queue sequence 在 provider 注册时 bootstrap，之后 prepend/append delta 使用单调 front/back sequence 保持原生顺序。
-证据索引：`agentinfer/agentcache/patches/vllm-0.31-mori-hbm-provider.patch:176-217`、
-`agentinfer/agentcache/patches/vllm-0.31-mori-hbm-provider.patch:275-292`。
+Program class 更新成本是 `O(B_p log N)`，不是 O(1)；proposal 成本取决于 victims、protected heads、stale records，极端时包括 class-local rebuild。
+增量索引消除了每次 CPU eviction 扫描所有 keys 的常规路径，但没有让所有 cache 操作都变成常数时间。
+证据：[agentinfer/agentcache/mori/typed_lru.py:34-43](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/typed_lru.py#L34-L43)、[agentinfer/agentcache/mori/typed_lru.py:172-198](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/typed_lru.py#L172-L198)、[agentinfer/agentcache/mori/typed_lru.py:225-286](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/typed_lru.py#L225-L286)。
 
-### 11.2 `MORIHBMPolicy`
+## 11. Native HBM 与 CPU 接线
 
-Policy 配置 `INACTIVE -> IDLE -> BUSY` 淘汰顺序。native callback 只携带 request ID；policy 通过
-`MORIRuntimeState.program_for_request()` 在服务端解析 `ProgramRef`，因此 native patch 不认识 AgentInfer Program。
-`propose()` 直接调用 shared `TypedLRUIndex.propose_exact()`。证据索引：
-`agentinfer/agentcache/mori/hbm_policy.py:15-30`、`agentinfer/agentcache/mori/hbm_policy.py:33-82`。
+### 11.1 HBM provider
 
-bridge 仍会为 cache hit metrics 包装 `get_computed_blocks()`，但这个 observational wrapper 不参与 victim selection，
-不能与隔离版替换 free queue 的 eviction monkey patch 混为一谈。证据索引：
-`agentinfer/agentcache/core/scheduler.py:340-362`。
+`MORIHBMPolicy` 接收 block ready、owner added、touch、evictability 和 remove/reset 事件，维护 typed index 与 footprint。
+provider 只给出候选。native patch 在实际摘取前校验数量、唯一性、ID 范围、非 null、refcount 和 free queue membership。
+无效 proposal 回退 native LRU 并记录诊断，不能为追求 typed 顺序绕过原生安全条件。
+证据：[agentinfer/agentcache/mori/hbm_policy.py:15-86](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/hbm_policy.py#L15-L86)、[agentinfer/agentcache/patches/vllm-0.31-mori-hbm-provider.patch:58-108](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/patches/vllm-0.31-mori-hbm-provider.patch#L58-L108)。
 
-## 12. CPU offload replacement 走读
+native LRU sequence 来自原生 free queue 的操作语义，不能把 request 到达顺序当作 block recency。
+block 被真正 remove 时先撤销旧 owner/footprint，之后同一个物理 ID 才能被复用；cache reset 清空相应层证明。
+证据：[agentinfer/agentcache/mori/hbm_policy.py:64-66](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/hbm_policy.py#L64-L66)、[agentinfer/agentcache/mori/hbm_policy.py:68-70](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/hbm_policy.py#L68-L70)、[tests/scheduling/test_mori_capacity.py:70-87](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/tests/scheduling/test_mori_capacity.py#L70-L87)。
 
-### 12.1 推荐路径：SimpleCPUOffloadConnector
+### 11.2 推荐路径：SimpleCPUOffloadConnector
 
-SimpleCPU 没有 external `CachePolicy` slot，因此正式支持使用第二个版本化 native hook，而不是替换 scheduler 或
-`BlockPool` bound method。`SimpleCPUOffloadScheduler.register_mori_offload_tier_provider(1, provider)` 把
-`MORISimpleCPUOffloadPolicy` 注册到该实例的 CPU BlockPool；未注册时不维护 sequence/index，也不改变 native
-`popleft_n()`。该 connector 的 worker 在普通 CPU tensor 上分配 KV cache；推荐路径不经过旧 `OffloadingConnector`
-的共享内存 allocator，因此不要求 `/dev/shm` 承载这部分 CPU KV cache。证据索引：
-`agentinfer/agentcache/patches/vllm-0.31-mori-simple-cpu-provider.patch:88-99`、
-`/data/zx-envs/agentinfer-vllm-0.31.0/lib/python3.12/site-packages/vllm/v1/simple_kv_offload/worker.py:220-233`。
+SimpleCPU provider 使用原生 CPU block pool，直接接收 ready、owner、pin/evictability 和 remove/reset 回调。
+D2H 尚未完成的目标和正在 load 的块不能作为可淘汰 entries；native 完成时再发布 READY。
+provider 以 typed 顺序提议 CPU victims，最终选择和传输安全仍留在 native；没有另造 CPU allocator 或 job manager。
+证据：[agentinfer/agentcache/mori/simple_cpu_policy.py:14-85](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/simple_cpu_policy.py#L14-L85)、[agentinfer/agentcache/patches/README.md:28-35](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/patches/README.md#L28-L35)。
 
-```mermaid
-sequenceDiagram
-    participant S as SimpleCPUOffloadScheduler
-    participant P as CPU BlockPool
-    participant M as MORISimpleCPUOffloadPolicy
-    participant I as CPU TypedLRUIndex
+当前 full 接线要求 eager offload，`lazy_offload=false`。这保证使用现有备份流程，但可能复制 GPU 热 owner 的备份、增加 CPU 压力与回迁流量。
+优化 typed replacement 与减少 D2H 不是同一件事；“改成 lazy”需要另行设计 readiness、源持有和迁移确认，不能仅改开关。
+证据：[agentinfer/agentcache/mori/simple_cpu_policy.py:14-24](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/simple_cpu_policy.py#L14-L24)、[agentinfer/agentcache/patches/vllm-0.31-mori-simple-cpu-provider.patch:143-155](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/patches/vllm-0.31-mori-simple-cpu-provider.patch#L143-L155)、[examples/serve-mori.sh:1-17](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/examples/serve-mori.sh#L1-L17)。
 
-    S->>P: get_new_blocks for eager D2H
-    P->>M: selected entries removed/non-evictable
-    S->>M: owner request observed while pinned
-    M->>I: owner edge, ready=false
-    S->>S: native asynchronous D2H
-    alt store committed
-        S->>P: insert hashes, free_blocks
-        P->>M: ready(block, native sequence)
-        M->>I: upsert owners and ready
-    else store abandoned
-        S->>M: removed(block)
-        S->>P: free empty block
-        P->>M: ready ownerless block
-    end
-    P->>M: propose exact victims
-    M->>I: INACTIVE then BUSY then IDLE
-    I-->>P: ordered block IDs
-    P->>P: validate then native hash eviction/allocation
-```
+### 11.3 兼容路径：OffloadingConnector external policy
 
-load hit 和 already-cached store 会为同一 block 追加 owner；Program generation release 只删除该 owner，shared block
-继续按剩余 owner 中最受保护者分类。connector snapshot 报告可用总 block、已有有效 hash 的 resident block、pending
-store/load block 和 scheduler block size；adapter 换算为 rank-local token quota。当前注册明确拒绝 disk backend 与 lazy
-offload，防止把未实现的成本和 owner 语义伪装成 full 支持。证据索引：
-`agentinfer/agentcache/mori/simple_cpu_policy.py:14-82`、`agentinfer/agentcache/mori/vllm_adapter.py:69-102`、
-`agentinfer/agentcache/mori/vllm_adapter.py:243-268`、
-`agentinfer/agentcache/patches/vllm-0.31-mori-simple-cpu-provider.patch:100-224`。
+`MoriCPUCachePolicy` 插入旧 OffloadingManager 的 CachePolicy 接口，key/hash/chunk 的组织与 SimpleCPU block provider 不同。
+它复用同一 typed index，但通过 `reserve_exact → 原生条目校验 → remove` 提交 CPU victims。
+选择逻辑可对齐，不能据此认为两个 connector 的复制批次、readiness、CPU 命中与耗时完全一致。
+证据：[agentinfer/agentcache/mori_cpu_policy.py:19-196](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori_cpu_policy.py#L19-L196)、[agentinfer/agentcache/mori/vllm_adapter.py:105-200](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/vllm_adapter.py#L105-L200)。
 
-SimpleCPU hook 的状态维护不是在每次 snapshot 扫描整个 CPU pool：bridge 用 `_mori_resident_block_ids` 增量维护已提交
-resident block，snapshot 直接读取集合大小；pending store/load 则从 connector 自己的在途 request/transfer 容器去重。
-注册时先让通用 BlockPool hook 发出 reset/bootstrap，再扫描一次已有 hash block 初始化 resident set，避免 bootstrap
-reset 清掉初值。关键事件与 MORI index 的关系如下：
+### 11.4 RuntimeState 的进程内桥梁
 
-| native 事件 | MORI 动作 | 仍由谁最终决定 |
+`MORIRuntimeState` 绑定 cache-class provider、request→ProgramRef、owner indexes 和 FootprintBook。
+class 变化通过 observer 通知 HBM/CPU 索引；release 撤销本代 owner 与 footprint；shutdown 清理 request 和 provider。
+安装失败需回滚部分注册，避免一次失败启动污染同进程的下次初始化。
+证据：[agentinfer/agentcache/mori/runtime_state.py:24-121](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/runtime_state.py#L24-L121)、[agentinfer/agentcache/mori/vllm_adapter.py:105-200](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/vllm_adapter.py#L105-L200)、[agentinfer/agentcache/mori/vllm_adapter.py:40-66](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/vllm_adapter.py#L40-L66)。
+
+## 12. 取消、terminal、release 和 shutdown
+
+| 事件 | 当前处理 | 保护的边界 |
 | --- | --- | --- |
-| CPU load hit / already-cached store | 为已有 block 追加 request owner | SimpleCPU hash lookup |
-| eager D2H 分配 destination | 添加 owner，保持 `ready=false` | CPU BlockPool allocation |
-| D2H commit + `free_blocks()` | 加入 resident set，发布 native LRU sequence 和 ready | SimpleCPU transfer completion |
-| abandoned transfer | 先移除 owner/index/resident，再释放空 block | SimpleCPU abandonment path |
-| CPU pool 需要 block | 按 `INACTIVE -> BUSY -> IDLE` 提议 exact IDs | BlockPool 复验并实际回收 |
+| 取消尚未转发的请求 | 从 retained pool 与 binding 删除；当前步骤可结束，deferred 后继取消不影响当前 lease | 不伪造 native 完成 |
+| 取消已转发请求 | 先交给 native finish；收到确认后才解除绑定与 lease | 取消意图不能提前兑现 GPU relief |
+| 最新响应的 scoped terminal | receipt 匹配该家族中的精确 owner，且没有已接受工作时 release | 旧响应不能结束新上下文或其他分支 |
+| 可信内部 unscoped terminal | 仅在整个 family 没有已接受工作时释放 family | 不与 HTTP receipt 路径混用 |
+| CONTINUE / UNKNOWN | 不做 terminal release | 未知不等于结束；MORI 没有另加 TTL 猜测 |
+| shutdown / 初始化失败 | 注销 provider、owner indexes、request bindings 和 footprint | 下次同进程初始化不继承脏状态 |
 
-证据索引：`agentinfer/agentcache/patches/vllm-0.31-mori-simple-cpu-provider.patch:49-82`、
-`agentinfer/agentcache/patches/vllm-0.31-mori-simple-cpu-provider.patch:104-224`、
-`agentinfer/agentcache/patches/vllm-0.31-mori-simple-cpu-provider.patch:228-350`。
+证据：[agentinfer/scheduling/runtime.py:639-680](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/runtime.py#L639-L680)、[agentinfer/agentcache/core/scheduler.py:394-419](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/core/scheduler.py#L394-L419)、[agentinfer/scheduling/runtime.py:589-599](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/runtime.py#L589-L599)、[agentinfer/scheduling/runtime.py:601-637](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/runtime.py#L601-L637)、[agentinfer/agentcache/mori/vllm_adapter.py:40-66](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/vllm_adapter.py#L40-L66)。
 
-### 12.2 兼容路径：OffloadingConnector external policy
+API lifecycle 经响应语义解析和 Unix datagram 传递；发送是 best effort，不能把信号送达当作强一致保证。
+MORI wire 路径使用 scoped receipt；若 terminal 丢失，owner 可能继续保留直到后续容量降层或新的生命周期事实。
+容量降至 WAITING 只降低保护，不会自动清理所有业务身份元数据；这与物理缓存由 native 最终回收是两个层面。
+证据：[agentinfer/agentcache/core/api_adapter.py:169-222](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/core/api_adapter.py#L169-L222)、[agentinfer/agentcache/core/api_adapter.py:606-638](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/core/api_adapter.py#L606-L638)、[agentinfer/agentcache/core/scheduler.py:544-559](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/core/scheduler.py#L544-L559)、[agentinfer/scheduling/mori/strategy.py:748-771](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L748-L771)。
 
-vLLM 0.31 原生支持通过 `cache_policy_module_path` 加载外部 `CachePolicy`。`MoriCPUCachePolicy` 自己维护协议要求的
-`chunks`，同时把 owner/recency/evictability delta 投影到 TypedLRU；manager 仍拥有 protected set、refcount、transfer
-job、fence、chunk slot 与传输完成语义。证据索引：`agentinfer/agentcache/mori_cpu_policy.py:19-47`。
+## 13. 扫描复杂度与仍存在的热路径
 
-```mermaid
-sequenceDiagram
-    participant Native as Offload scheduler
-    participant Manager as CPUOffloadingManager
-    participant Policy as MoriCPUCachePolicy
-    participant IDX as CPU TypedLRUIndex
+重构后，一轮的每个固定规划阶段建一次 ledger；候选和 victims 各排序一次，使用增量 union add/remove 更新预算。
+新置换最多做一个完整计划，`RequestPool.for_program()` 按 owner 访问，避免为每个候选重新扫全部请求或全部 Programs。
+以 P 为 live owners、K 为本轮遍历的 footprint 条目，放置选择目标成本是 `O(P log P + K)`，而非逐候选再做一次全量修复。
+证据：[agentinfer/scheduling/mori/strategy.py:223-345](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L223-L345)、[agentinfer/scheduling/mori/strategy.py:668-679](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L668-L679)、[agentinfer/scheduling/request_pool.py:76-78](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/request_pool.py#L76-L78)。
 
-    Native->>Policy: on_store_miss(keys, ReqContext)
-    Policy->>Policy: pending key -> ProgramRef owners
-    Manager->>Policy: insert(key, ChunkStatus)
-    Policy->>IDX: upsert owners, rank, ref_cnt==0
-    Native->>Policy: touch / on_request_finished
-    Policy->>IDX: update native recency
-    Manager->>Policy: mark_evictable/non_evictable
-    Policy->>IDX: ready delta
-    Manager->>Policy: evict(n, protected)
-    Policy->>IDX: reserve_exact(n, protected)
-    IDX-->>Policy: exact keys
-    Policy->>Policy: recheck chunk/ref_cnt/protected
-    alt every key still legal
-        Policy->>Policy: remove selected keys
-        Policy-->>Manager: key/chunk pairs
-    else native state changed
-        Policy-->>Manager: None; reservation restores live entries
-    end
-```
+这个复杂度边界不包含所有系统工作。到达仍构造全量快照与 ledger，一批 A 次到达可累计 `O(A × (P + K))`；
+program completion、diagnostics 也可能扫描 Programs。typed owner reclassification 还需按实际受影响 blocks 更新。
+因此不能把“移除一处平方级规划”写成“整个 scheduler 所有请求均为线性或 O(1)”。
+证据：[agentinfer/scheduling/mori/strategy.py:141-209](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L141-L209)、[agentinfer/scheduling/runtime.py:784-813](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/runtime.py#L784-L813)、[agentinfer/scheduling/runtime.py:444-519](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/runtime.py#L444-L519)、[agentinfer/scheduling/mori/strategy.py:429-504](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L429-L504)、[agentinfer/agentcache/mori/typed_lru.py:172-198](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/typed_lru.py#L172-L198)。
 
-pending owner maps 解决 `on_store_miss` 先于 `insert` 的事件顺序；Program release 同时清 live 与 pending owner edges。
-`evict()` 在 reservation 后再次校验 chunk 存在、`ref_cnt==0` 和 protected，任一失败整批返回 `None`。证据索引：
-`agentinfer/agentcache/mori_cpu_policy.py:31-83`、`agentinfer/agentcache/mori_cpu_policy.py:92-129`、
-`agentinfer/agentcache/mori_cpu_policy.py:153-193`。
+CPU 探针只增加不 fit 的等待者，结果如下；它验证该规划路径的读取增长，不代表 GPU 吞吐或 TTFT：
 
-## 13. Cache hit 与调度开销报告
+| 等待者 | factor reads | 中位线程 CPU / ms | 每组样本数 |
+| --- | ---: | ---: | ---: |
+| 64 | 389 | 0.419393 | 3 |
+| 128 | 773 | 0.767241 | 3 |
+| 256 | 1541 | 1.491170 | 3 |
+| 512 | 3077 | 2.885365 | 3 |
 
-bridge 在 native prefix lookup 后记录四个 server-observed 量：prompt tokens、全部 reusable prefix、HBM prefix hit、以及
-lookup 时 `ref_cnt==0` 的 HBM hit。request completion event 把这些值送给 MORI；diagnostics 累积 request count、token
-counters、prefix/HBM hit ratio，同时输出 tier counts、logical quota/reservation、native physical use、pending H2D/D2H、
-class epoch 和 `decision_cpu_seconds`。证据索引：`agentinfer/agentcache/core/scheduler.py:281-297`、
-`agentinfer/scheduling/runtime.py:388-455`、`agentinfer/scheduling/mori/strategy.py:214-261`。
+证据：[design/module/scheduling/artifacts/mori-redesign-20261028/scaling.json:1-86](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/design/module/scheduling/artifacts/mori-redesign-20261028/scaling.json#L1-L86)；
+复现脚本 [design/module/scheduling/artifacts/mori-redesign-20261028/probe_scaling.py:1-40](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/design/module/scheduling/artifacts/mori-redesign-20261028/probe_scaling.py#L1-L40)。
 
-这些指标不能互相替代：HBM prefix hit 不是 CPU offload hit；CPU lookup/store/load、job 和 transfer 指标仍应从所选
-native connector 收集。正式报告应把两组指标并列，才能分辨策略保护效果、D2H/H2D 成本与 scheduler overhead。
-证据索引：`design/module/scheduling/mori-scheduling.md:365-372`。
+## 14. 诊断指标如何读
 
-## 14. Failure、取消、release 与 shutdown
+| 维度 | 当前诊断字段 | 注意事项 |
+| --- | --- | --- |
+| 逻辑放置 | tier program counts、reserved/quota/debt tokens | 与物理 resident 分开解释 |
+| 物理状态 | native HBM/DRAM used、pending H2D/D2H | snapshot，不等于累计传输字节 |
+| 缓存命中 | observed requests、prompt/prefix/HBM/ref-zero hit tokens、相应 ratio | 必须先核实分母和覆盖范围 |
+| 等待和稳定性 | mean idleness、`max_wait_seconds`、配置门槛 | `max_wait_seconds` 是当前观测；`configured_max_wait_seconds` 才是阈值 |
+| 规划成本 | decision CPU、program reads、candidates、victims、sticky kept、lazy relief 等 | 决策 CPU 不是端到端全部开销 |
+| native fallback | pool fallback count 与限频 warning | fallback 表示退回原生顺序，不能继续假设全程 typed |
 
-```mermaid
-flowchart TD
-    A[full MORI startup] --> B{DRAM quota/chunk known?}
-    B -->|no| X[fail closed]
-    B -->|yes| C{SimpleCPU hook or MORI CPU policy?}
-    C -->|no| X
-    C -->|yes| D{HBM register/unregister v1?}
-    D -->|no| X
-    D -->|yes| E[runtime active]
-    E --> F{shutdown}
-    F --> G[super scheduler shutdown]
-    G --> H[unregister HBM provider]
-    H --> I[clear HBM index]
-    I --> J[close CPU policy/index]
-    J --> K[unbind class observer]
-    K --> L[clear request bindings]
-```
+证据：[agentinfer/scheduling/mori/strategy.py:429-504](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L429-L504)、[agentinfer/agentcache/patches/vllm-0.31-mori-hbm-provider.patch:58-108](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/patches/vllm-0.31-mori-hbm-provider.patch#L58-L108)。
 
-retained request 取消时先从 RequestPool 删除并清 request binding；native request finish 则先完成 native cleanup，再通知
-Program runtime 并解绑 owner。terminal lifecycle 只有在该 generation 没有 in-flight request 且处于 Acting 时才 release，
-迟到信号不会释放新一轮 Reasoning。证据索引：`agentinfer/agentcache/core/scheduler.py:299-338`、
-`agentinfer/scheduling/runtime.py:466-526`。
+GPU 命中率与“GPU miss 之后 CPU 条件命中率”的分母不同，不能直接相加；
+应使用不重叠的 tier hit token counts 除以同一 prompt query 总量。也不能把 H2D/D2H 累计操作时间相加当作关键路径 wall time。
+历史统计口径的具体例子见第 17 节及
+[/data/zx/agent-kvc/research/studies/kvc_theory/mori-real-v031-20261022/baseline-evidence/REAL-RUN-REPORT-20261022.md:167–245](/data/zx/agent-kvc/research/studies/kvc_theory/mori-real-v031-20261022/baseline-evidence/REAL-RUN-REPORT-20261022.md:167)。
 
-adapter close 是幂等的；HBM provider unregister、两层 index close、observer unbind 与 request map clear 使用嵌套 cleanup，
-确保局部异常不跳过后续清理。证据索引：`agentinfer/agentcache/mori/vllm_adapter.py:27-59`、
-`agentinfer/agentcache/core/scheduler.py:382-389`。
+## 15. 配置、启动与兼容性
 
-## 15. 隔离实现与正式实现对比
+### 15.1 参数
 
-### 15.1 两套架构
+| 配置 | 默认 | 当前含义 |
+| --- | --- | --- |
+| `agentcache.strategy` | 通用默认为 progress_ttl | 显式设 `mori` 启用本文行为 |
+| `agentcache.schedule_interval_seconds` | MORI builder 为 5 秒 | 周期维护，不阻止事件更早唤醒 |
+| `mori.mode` | `full` | 安装 typed providers；`placement_only` 用于显式消融 |
+| `mori.window_size` | 5 | 最近 idleness cycles |
+| `mori.min_residency_seconds` | 1.0 秒 | 普通置换的驻留稳定门槛 |
+| `mori.idleness_margin` | 0.05 | 普通置换相对差距，范围 0–1 |
+| `mori.max_wait_seconds` | 30.0 秒 | 正数、公平性例外阈值 |
+| `decode_buffer_tokens` | 内部固定 100 | 服务配置禁止覆盖，不是可调配置项 |
 
-```mermaid
-flowchart TB
-    subgraph ISO[隔离 replay 实现]
-      IP[plan.json / JointRunState]
-      IL[launch._install_mori]
-      IC[existing controller]
-      IG[GapFarthestEviction subclass]
-      IQ[native free queue methods]
-      ICP[native LRU policy.evict]
-      IS[scan-based CPU typed wrapper]
-      IP --> IL
-      IL -->|replace strategy/factors| IC
-      IL --> IG
-      IG -->|runtime method replacement| IQ
-      IL --> IS
-      IS -->|MethodType replacement| ICP
-    end
+未知配置和已移除配置会报错；不要继续传入旧 `starvation_timeout_seconds`。
+时间参数需有限且非负，max wait 必须大于零。full 要求一个 embedded backend rank 与已知 CPU quota/chunk size；
+`placement_only` 不安装 native cache policy，也不代表 full 的 CPU 保护效果。两种模式都要求请求 identity。
+证据：[agentinfer/agentcache/core/controller.py:103-145](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/core/controller.py#L103-L145)、[agentinfer/scheduling/mori/config.py:20-42](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/config.py#L20-L42)、[agentinfer/agentcache/mori/vllm_adapter.py:105-200](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/vllm_adapter.py#L105-L200)、[agentinfer/scheduling/mori/strategy.py:99-100](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L99-L100)。
 
-    subgraph FORMAL[正式 server 实现]
-      FR[request xargs / headers]
-      FB[existing build_controller]
-      FPS[ProgramScheduler + MORIStrategy]
-      FRS[MORIRuntimeState]
-      FHP[versioned HBM provider]
-      FSCP[SimpleCPU provider v1 recommended]
-      FCP[external CPU CachePolicy compatibility]
-      FHI[HBM TypedLRUIndex]
-      FSI[SimpleCPU TypedLRUIndex]
-      FCI[Compatibility CPU TypedLRUIndex]
-      FR --> FB --> FPS --> FRS
-      FRS --> FHP --> FHI
-      FRS --> FSCP --> FSI
-      FRS -. alternate connector .-> FCP --> FCI
-    end
-```
+### 15.2 vLLM 0.31 full 启动
 
-证据索引：`/data/zx/agent-kvc/research/studies/kvc_theory/mori-reproduction-20261022/candidate/joint/launch.py:78-127`、
-`agentinfer/agentcache/core/controller.py:86-137`、`agentinfer/agentcache/mori/vllm_adapter.py:105-214`。
-
-### 15.2 逐项差异
-
-| 维度 | 隔离实现 | 正式实现 | 设计意义 |
-| --- | --- | --- | --- |
-| 目标 | 固定 trace 的隔离复现与机制验证 | AgentInfer serve 可维护实现 | 原型可侵入运行时；正式版需要稳定 contract |
-| Program identity | `state.canonical(request)` 后查 `state.programs[canonical]`；该表由 `plan.tasks` 初始化 | 只解析 request xargs/headers；缺 identity fail closed | 正式版是 server-only；隔离版虽不读未来 return，identity 仍依赖 plan |
-| future return | MORI counters 声明 `future_oracle_reads=0` | 没有 plan/DAG API | 两者的 placement 都是 causal，但输入边界不同 |
-| 构造 | launch 时替换 controller strategy/factors 与 interval | 与 Progress-TTL 共用 `build_controller` 路径 | 避免实验 harness 成为生产依赖 |
-| generation | 多处以 `str program_id` 建 tier/owner 索引 | 全链路 `ProgramRef(id,generation)` | 避免释放后 ID 复用污染 |
-| overlap | replay trace 隐含串行 Program 段 | 显式拒绝同 Program overlap；subagent 独立 ID | 并发语义可验证 |
-| GPU reservation | `estimated - shared_prefix + decode_buffer(默认256)`，无 block rounding | `round_up(estimated + 100, block_size)` | 正式版固定保守 buffer 并匹配 native quantum；两者容量数值不完全等价 |
-| DRAM quota | 启动时读取 manager 私有 `_num_chunks` | SimpleCPU public snapshot 报告 total/resident/pending block 并换算 rank-local token quota | 消除策略长期抓取 manager 私有字段的依赖 |
-| promotion | 可为候选立即 swap Acting，并对更 idle Reasoning 做 lazy mark | no-fit admission 先排队；仅 aggregate capacity debt 触发 demotion | 正式策略更保守；不能声称两者完整 placement 序列等价 |
-| HBM selection | 复用 `GapFarthestEviction` safe-tail/content graph，替换 queue/pool/KVM 多个方法 | 窄 provider v1 + block-level incremental typed-LRU | class/LRU 意图一致，owner/content 数据结构与 backend safety 路径不同 |
-| HBM native safety | 原型 `_pop()` 手动检查 hash/ref/queue link | BlockPool 批量验证 ID、refcnt、membership 后原生分配 | 正式版把安全权留给 native owner |
-| CPU selection | 替换 `LRUCachePolicy.evict`；每次扫描全部 `_evictable` | 推荐 SimpleCPU provider v1；旧 OffloadingConnector 可用 external `CachePolicy`；二者共享持久 reverse index + class heaps | 消除 eviction hot-path 全量扫描，同时保留 connector 原生传输路径 |
-| shared owner | HBM 通过 content owner deadline；CPU 通过 key owner + max priority | 两层都用 generation-safe owner set 与各自 strongest rank | 保护语义保留，表示法统一 |
-| prefetch | full-mori preset 的 P=false | strategy 明确不 prefetch | 两者都依赖 native on-demand load |
-| cleanup | close 时恢复被替换方法 | unregister provider、close policy、unbind observer | 正式生命周期可重复启动且能力可协商 |
-
-隔离 identity 与 plan 的证据索引：
-`/data/zx/agent-kvc/research/studies/kvc_theory/mori-reproduction-20261022/candidate/joint/replay.py:201-218`、
-`/data/zx/agent-kvc/research/studies/kvc_theory/mori-reproduction-20261022/candidate/joint/replay.py:306-317`、
-`/data/zx/agent-kvc/research/studies/kvc_theory/mori-reproduction-20261022/candidate/joint/mori.py:630-649`。
-
-隔离与正式容量/placement 的证据索引：
-`/data/zx/agent-kvc/research/studies/kvc_theory/mori-reproduction-20261022/candidate/joint/mori.py:384-564`、
-`agentinfer/scheduling/mori/strategy.py:90-196`、`agentinfer/scheduling/mori/strategy.py:376-541`。
-
-隔离 HBM/CPU 接线的证据索引：
-`/data/zx/agent-kvc/research/studies/kvc_theory/mori-real-v031-20261022/joint/eviction.py:938-973`、
-`/data/zx/agent-kvc/research/studies/kvc_theory/mori-real-v031-20261022/joint/eviction.py:975-1108`、
-`/data/zx/agent-kvc/research/studies/kvc_theory/mori-reproduction-20261022/candidate/joint/mori.py:618-790`。
-
-### 15.3 后端 KV 映射和 victim 选择是否“一致”
-
-答案需要分层：
-
-- **算法意图一致**：HBM 都是 `INACTIVE -> IDLE -> BUSY`，CPU 都是
-  `INACTIVE -> BUSY -> IDLE`，同类中都以 native LRU 为 tie-break，shared entry 都采用最受保护 owner。
-- **物理映射实现不一致**：隔离 HBM 建 content/hash/parent safe-tail index，并在原型中接管多个 native 方法；正式 HBM
-  直接维护 block ID owner/ready/LRU delta，由 BlockPool 负责 hash 与合法性。隔离 CPU 在 request completion 重建
-  OffloadKey owner；正式 SimpleCPU 从 load hit、store allocation/commit/abandon 与 CPU BlockPool delta 增量维护 block
-  owner、ready 和 recency，兼容 OffloadingConnector 才从 external `CachePolicy` lifecycle 接收 key 级 delta。
-- **不能由受控 benchmark 证明完整等价**：现有 identical digest 只验证 CPU typed-LRU 的给定 owner/class/recency
-  workload，不验证两套 placement、HBM content dependency 或真实传输时序完全一致。
-
-证据索引：`agentinfer/agentcache/mori/hbm_policy.py:15-76`、
-`agentinfer/agentcache/mori/simple_cpu_policy.py:14-82`、`agentinfer/agentcache/mori_cpu_policy.py:19-129`、
-`design/module/scheduling/mori-performance.md:5-13`。
-
-## 16. 为什么正式 CPU policy 更快
-
-隔离 CPU `evict(n)` 每次先计算 candidate count，然后遍历全部 `_evictable` key，对每个 key 查 type priority，并只保留
-每类前 n 个的有界 heap。它避免了全局 `O(N log N)` 排序，却仍是每次 eviction `O(N)` 扫描。第一轮完整隔离实验
-发生 16,795 次 eviction、检查 180,152,700 keys，仅 CPU typed selection 就耗 118.2343 thread CPU-s。证据索引：
-`/data/zx/agent-kvc/research/studies/kvc_theory/mori-reproduction-20261022/candidate/joint/mori.py:720-765`、
-`/data/zx/agent-kvc/research/studies/kvc_theory/mori-reproduction-20261022/runs/mori-k5-v6-bounded/r1-full-mori/validation.json:319-337`。
-
-正式版把成本移到 delta 路径：owner/touch/readiness/class change 发生时维护持久 heaps，eviction 只 pop 所需 victims。
-受控 trace-derived 实验在相同 50,193-victim 序列上得到：
-
-| 路径 | 中位 thread CPU | 相对隔离 |
-| --- | ---: | ---: |
-| 隔离 scan | 3.537876127 s | 1.0000x |
-| 正式 proposal/restore 消融 | 0.749834859 s | 4.7181x |
-| 正式 reservation | 0.622228630 s | 5.6858x |
-
-三条路径 victim digest 相同；正式 reservation 相对隔离降低 82.4124% CPU。该结果证明的是 CPU typed-LRU 实现
-开销与 victim 顺序，不是端到端 server makespan。证据索引：
-`design/module/scheduling/mori-performance.md:5-13`、`design/module/scheduling/mori-performance.md:44-50`、
-`design/module/scheduling/artifacts/mori-typed-lru-benchmark-20261026.json:31-41`、
-`design/module/scheduling/artifacts/mori-typed-lru-benchmark-20261026.json:151-188`。
-
-## 17. 目录、文件职责与调用入口
-
-```text
-agentinfer/
-├── scheduling/
-│   ├── runtime.py                    # ProgramScheduler 与 request lifecycle
-│   ├── domain.py                     # ProgramRef/state/status/token facts
-│   ├── snapshot.py / backend.py      # rank-local capacity read model
-│   ├── cache_placement.py            # class provider/observer protocol
-│   └── mori/
-│       ├── config.py                 # k/mode/fixed decode buffer
-│       ├── factors.py                # tier、pending tier、idleness history
-│       ├── builder.py                # strategy + initial factors
-│       └── strategy.py               # placement/capacity/diagnostics
-└── agentcache/
-    ├── core/
-    │   ├── controller.py             # progress_ttl/mori explicit selector
-    │   └── scheduler.py              # vLLM bridge and server observations
-    ├── mori/
-    │   ├── runtime_state.py          # request owner + class delta fan-out
-    │   ├── typed_lru.py              # shared incremental index
-    │   ├── hbm_policy.py             # HBM provider implementation
-    │   ├── simple_cpu_policy.py       # SimpleCPU offload-tier provider
-    │   └── vllm_adapter.py            # capability check/offload observation
-    ├── mori_cpu_policy.py            # OffloadingConnector external CachePolicy
-    └── patches/
-        ├── vllm-0.31-mori-hbm-provider.patch
-        └── vllm-0.31-mori-simple-cpu-provider.patch
-examples/
-└── serve-mori.sh                     # SimpleCPU full-mode 可执行启动示例
-docs/zh/how-to/use-mori.md            # 用户部署、请求和排障指南
-tests/agentcache/
-├── test_mori_simple_cpu_policy.py    # CPU typed victim provider 单测
-└── core/test_mori_vllm_adapter.py    # connector discovery/capability/snapshot 单测
-design/module/scheduling/artifacts/
-└── mori-simple-cpu-validation-20261027.json  # reviewer-readable 验证收据
-```
-
-证据索引：`design/module/scheduling/mori-scheduling.md:374-393`、`examples/serve-mori.sh:1-17`、
-`design/module/scheduling/artifacts/mori-simple-cpu-validation-20261027.json:1-48`。
-
-### 17.1 从入口到核心方法的阅读顺序
-
-1. `AgentCache*SchedulerBridge.add_request/schedule/update_from_output`：看 native interception 点。
-2. `_VllmAdmissionHooks`：看 controller 构造、identity、backend observation 与 request binding。
-3. `ProgramScheduler`：看 RequestPool、Registry、snapshot、transition/event sequencing。
-4. `MORIStrategy`：看 logical capacity、promotion/demotion 与 class notification。
-5. `MORIRuntimeState`：看 Program class 如何 fan-out 到两层 index。
-6. `TypedLRUIndex`：看 exact class/LRU ordering 和 reservation。
-7. `MORIHBMPolicy`、`MORISimpleCPUOffloadPolicy`、两个 vLLM patch 与兼容的 `MoriCPUCachePolicy`：看最终 native
-   victim contract。
-
-证据索引：`agentinfer/agentcache/core/scheduler.py:477-562`、`agentinfer/scheduling/runtime.py:69-100`、
-`agentinfer/scheduling/mori/strategy.py:26-88`、`agentinfer/agentcache/mori/typed_lru.py:34-70`。
-
-### 17.2 调用图
-
-```mermaid
-flowchart TD
-    AR[Bridge.add_request] --> HA[Hooks.add_request]
-    HA --> PRA[ProgramScheduler.on_request_arrival]
-    PRA --> ADM[MORIStrategy.handle_admission]
-    ADM --> TR[TransitionController]
-    TR --> AT[ProgramScheduler._apply_transition]
-    AT --> EV[dispatch SchedulingEvent]
-    EV --> SE[MORIStrategy event handler]
-    SE --> CF[_set_factor / cache class change]
-    CF --> RS[MORIRuntimeState observer]
-    RS --> RI[TypedLRU reclassify_program]
-
-    SC[Bridge.schedule] --> BS[Hooks.before_schedule]
-    BS --> CY[ProgramScheduler.schedule_cycle]
-    CY --> REP[MORIStrategy.repair_capacity]
-    CY --> RES[MORIStrategy.schedule_resume]
-    BS --> NA[super.add_request admitted]
-    SC --> NS[super.schedule]
-```
-
-## 18. 部署配置与验证
-
-### 18.1 vLLM 0.31 full 模式
-
-先在目标 vLLM 0.31 source tree 依次应用 HBM/BlockPool 与 SimpleCPU provider patch：
+在匹配的 vLLM source root 按顺序应用两个补丁，再使用该构建安装运行：
 
 ```bash
 git apply --check /path/to/agent-infer/agentinfer/agentcache/patches/vllm-0.31-mori-hbm-provider.patch
@@ -1138,7 +534,7 @@ git apply --check /path/to/agent-infer/agentinfer/agentcache/patches/vllm-0.31-m
 git apply /path/to/agent-infer/agentinfer/agentcache/patches/vllm-0.31-mori-simple-cpu-provider.patch
 ```
 
-AgentCache 配置：
+完整启动入口是 `examples/serve-mori.sh`。下例明确展示新增参数；CPU 字节数仅为示例，需按部署容量设置：
 
 ```json
 {
@@ -1147,13 +543,14 @@ AgentCache 配置：
     "schedule_interval_seconds": 5.0,
     "mori": {
       "mode": "full",
-      "window_size": 5
+      "window_size": 5,
+      "min_residency_seconds": 1.0,
+      "idleness_margin": 0.05,
+      "max_wait_seconds": 30.0
     }
   }
 }
 ```
-
-推荐的 CPU offload connector 配置为：
 
 ```json
 {
@@ -1167,84 +564,126 @@ AgentCache 配置：
 }
 ```
 
-完整启动范例在 `examples/serve-mori.sh`，操作说明见 `docs/zh/how-to/use-mori.md`；patch 只在 full 模式需要，
-未注册 provider 时 native allocation path 不维护 MORI sequence，也不改变 `popleft_n()`。证据索引：
-`examples/serve-mori.sh:1-17`、`agentinfer/agentcache/patches/README.md:1-42`。
+full 启动严格验证 provider 注册/注销能力与 API version，缺失时失败并回滚。未启用 provider 的原生路径不维护 MORI sequence。
+操作依据：[examples/serve-mori.sh:1-17](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/examples/serve-mori.sh#L1-L17)、[agentinfer/agentcache/patches/README.md:1-45](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/patches/README.md#L1-L45)、[agentinfer/agentcache/mori/vllm_adapter.py:105-200](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/vllm_adapter.py#L105-L200)。
 
-### 18.2 请求 identity 示例
+## 16. 论文机制与正式实现范围
 
-客户端不需要 plan，但必须让服务端能解析 Program identity。例如：
+论文将 Program 建模为串行推理与工具交替，使用滑动窗口 idleness、容量驱动 sticky placement、Reasoning 结束后的 lazy demotion，以及分层 typed eviction。
+论文还包含多副本路由和 batch 类型优先级，其实验系统基于 ThunderAgent/SGLang。
+来源：[MORI，§3.1、§4.1–4.3、§5](https://arxiv.org/html/2606.00866v1)。
 
-```json
-{
-  "vllm_xargs": {
-    "agentic_context": {
-      "program_id": "task-42:lead",
-      "task_id": "task-42",
-      "agent_id": "lead",
-      "agent_role": "lead",
-      "expected_resume": true
-    }
-  }
-}
-```
+正式实现保留上述 idleness、sticky、lazy 与 typed eviction 主干，在 vLLM 上另加 lineage、有限 lease、receipt、共享容量证明、事件唤醒和等待进展条件。
+它只做 embedded rank 放置，没有实现跨副本 BFD/affinity 路由，也没有改写 native token batch 为 BUSY 优先的全新批处理器。
+CPU tier 是保护意图，WAITING 可留下机会性缓存；这两个工程语义必须与物理完整迁移区分。
+证据：[agentinfer/agentcache/core/controller.py:103-142](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/core/controller.py#L103-L142)、[agentinfer/agentcache/core/scheduler.py:622-626](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/core/scheduler.py#L622-L626)、[agentinfer/scheduling/mori/strategy.py:681-716](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L681-L716)、[agentinfer/scheduling/lineage.py:14-72](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/lineage.py#L14-L72)。
 
-subagent 应使用不同的 `program_id`/`agent_id`，可附 `parent_program_id` 与 `blocks_parent`。解析器也支持已列出的
-framework session/agent headers。证据索引：`agentinfer/scheduling/identity.py:27-87`、
-`agentinfer/scheduling/identity.py:90-174`。
+## 17. 与 MORI 隔离实现及历史实验的对照
 
-### 18.3 当前验证命令
+### 17.1 架构和语义
+
+隔离目录用于 replay 与原型实验；正式服务实现运行于常规请求入口。二者可共享策略思想，不能因名字相同便认定请求生命周期、owner 管理和容量口径相同。
+以下隔离路径为研究本地证据，不属于本文提交到 Git 的源码。
+
+| 项目 | 隔离路径 | 当前正式路径 |
+| --- | --- | --- |
+| Program ranking | `_promotion_key/_demotion_key` 按 tier、idleness、上下文排序 | 相同基础顺序，加稳定性、公平性与受益者保护 |
+| 请求身份 | replay harness 提供请求与 Program 的归属 | API identity + lineage + generation + 每请求 receipt |
+| 重叠与未来采用 | 回放的已定义请求结构不能覆盖任意线上分叉语义 | 默认临时分支；显式链串行；真实 prompt 决定工作集 |
+| CPU victim selection | 扫描 `_evictable`，每类 bounded heap 排序 | 增量 typed-LRU 与反向 owner 索引 |
+| GPU/CPU 物理工作 | 依赖隔离 native 接线和运行配置 | versioned provider；native 校验与 fallback |
+| 联合容量 | 不能以隔离的单 Program context 排名替代分叉联合账本 | 有效 footprint 抵扣；按边际 relief 选择 victims |
+
+正式证据：[agentinfer/scheduling/mori/strategy.py:773-790](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L773-L790)、[agentinfer/scheduling/lineage.py:14-72](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/lineage.py#L14-L72)、[agentinfer/scheduling/mori/capacity.py:30-80](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/capacity.py#L30-L80)、[agentinfer/agentcache/mori/typed_lru.py:34-361](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/typed_lru.py#L34-L361)。
+隔离证据：
+[/data/zx/agent-kvc/research/studies/kvc_theory/mori-reproduction-20261022/candidate/joint/mori.py:509–527](/data/zx/agent-kvc/research/studies/kvc_theory/mori-reproduction-20261022/candidate/joint/mori.py:509)、
+[/data/zx/agent-kvc/research/studies/kvc_theory/mori-reproduction-20261022/candidate/joint/mori.py:697–765](/data/zx/agent-kvc/research/studies/kvc_theory/mori-reproduction-20261022/candidate/joint/mori.py:697)。
+
+### 17.2 历史真实 GPU 回放：只说明当时运行
+
+2026-10-22 的隔离 full run 记录 1,290 次成功请求、真实 D2H/H2D，并审计未来 oracle 读取为零。
+同一报告中的 cache 覆盖如下，均属于那次运行，不是本次重构代码的复测：
+
+| 方法 | GPU prefix hit | CPU 条件 hit | 总 prompt-token hit |
+| --- | ---: | ---: | ---: |
+| vanilla | 30.8681% | 30.7922% | 52.1553% |
+| PT | 72.4697% | 22.3003% | 78.6091% |
+| 隔离 MORI | 71.5883% | 26.7298% | 79.1827% |
+
+这组对比是描述性结果：报告说明 GPU UUID 不同，生成内容也可能使后续 prompt 分叉。它不能证明当前正式重构对 vanilla/PT 的收益。
+原报告与运行审计保留不改写：
+[/data/zx/agent-kvc/research/studies/kvc_theory/mori-real-v031-20261022/baseline-evidence/REAL-RUN-REPORT-20261022.md:142–219](/data/zx/agent-kvc/research/studies/kvc_theory/mori-real-v031-20261022/baseline-evidence/REAL-RUN-REPORT-20261022.md:142)。
+
+该报告还记录 placement 0.4991 thread CPU-s、GPU typed 35.9090 elapsed-s、CPU typed 163.4116 thread CPU-s；
+CPU policy 检查了 181,037,770 个 keys。
+这些不同口径的计时不能相加称为关键路径开销，却为当时优化 CPU 扫描提供了依据。
+证据：[/data/zx/agent-kvc/research/studies/kvc_theory/mori-real-v031-20261022/baseline-evidence/REAL-RUN-REPORT-20261022.md:221–245](/data/zx/agent-kvc/research/studies/kvc_theory/mori-real-v031-20261022/baseline-evidence/REAL-RUN-REPORT-20261022.md:221)。
+
+### 17.3 历史受控 typed-LRU benchmark
+
+受控输入使用相同 50,193 个 victims，5 轮 digest 一致：隔离扫描中位线程 CPU 为 3.537876127 秒，formal proposal 为 0.749834859 秒，
+formal reservation 为 0.622228630 秒。
+相对隔离扫描降低 82.4124%，约 5.6858 倍；这是旧 connector CPU policy 的维护与 selection 成本，不是 SimpleCPU end-to-end 性能。
+输入、脚本、计数、原始 JSON 与复现命令见 [design/module/scheduling/mori-performance.md:1-73](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/design/module/scheduling/mori-performance.md#L1-L73)。
+
+## 18. 当前源码验证与复现
+
+下面是本次重构收据中的命令。运行根目录为 MORI worktree；`MORI_VLLM_SOURCE` 指向当时保存的原生源码副本。
+另一环境复现时需准备匹配源码和依赖，不能假定这个临时路径永远存在。
 
 ```bash
-pytest -q \
-  tests/agentcache/test_mori_simple_cpu_policy.py \
-  tests/agentcache/core/test_mori_vllm_adapter.py \
-  tests/agentcache/test_mori_typed_lru.py \
-  tests/agentcache/test_mori_cpu_policy.py \
-  tests/agentcache/core/test_mori_controller.py
-
-pytest -q tests/scheduling tests/agentcache \
-  --ignore=tests/agentcache/core/test_vllm_api_adapter.py \
-  --ignore=tests/agentcache/entrypoints/test_serve_flag_e2e.py
-
-bash -n examples/serve-mori.sh
+MORI_VLLM_SOURCE=/tmp/mori-review-fixes-20261027/upstream PYTHONPATH=. \
+  python -m pytest -q tests/scheduling tests/agentcache -m 'not gpu_test'
+MORI_VLLM_SOURCE=/tmp/mori-review-fixes-20261027/upstream PYTHONPATH=. \
+  /data/zx-envs/agentinfer-vllm-0.31.0/bin/python -m pytest -q tests/scheduling tests/agentcache -m 'not gpu_test'
+PYTHONPATH=. python -m pytest -q tests/agentbench/request_proxy -m 'not gpu_test'
+pre-commit run --all-files
+PYTHONPATH=. python design/module/scheduling/artifacts/mori-redesign-20261028/probe_scaling.py
 ```
 
-收据结果分别为 24 passed 和 308 passed；此外两个 vLLM patch 已在临时的 0.31 源码副本上按部署顺序完成
-`git apply --check`、应用、`py_compile` 和 native hook smoke，wheel 也确认包含 README 与两个 patch。真实 GPU serve
-未运行的原因在同一收据中显式记录。证据索引：
-`design/module/scheduling/artifacts/mori-simple-cpu-validation-20261027.json:6-45`。
+| 检查 | 已记录结果 |
+| --- | --- |
+| 系统 Python scheduling + agentcache | 415 passed，5 GPU tests deselected，16 warnings |
+| vLLM 0.31 目标环境同组检查 | 415 passed，5 deselected，14 warnings |
+| request proxy | 41 passed |
+| 全仓与新增文件静态检查 | 适用 hooks 通过 |
+| 不 fit 等待者 CPU 探针 | 64/128/256/512 样本与原始计数已归档 |
 
-## 19. 已知限制与后续扩展点
+精确命令、环境、native source hash 与每项 raw log 路径见 [design/module/scheduling/artifacts/mori-redesign-20261028/validation.json:1-80](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/design/module/scheduling/artifacts/mori-redesign-20261028/validation.json#L1-L80)。
+lineage/drain/receipt 场景见 [tests/scheduling/test_mori_lineages.py:32-256](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/tests/scheduling/test_mori_lineages.py#L32-L256)；
+容量联合计费和复杂度测试见 [tests/scheduling/test_mori_capacity.py:23-134](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/tests/scheduling/test_mori_capacity.py#L23-L134)；
+native 取消确认及上界见 [tests/agentcache/core/test_mori_vllm_adapter.py:467-521](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/tests/agentcache/core/test_mori_vllm_adapter.py#L467-L521)。
 
-1. 当前只支持单 embedded backend rank、单 full-attention KV group 和 full-KV CPU offload；SimpleCPU full 路径限定
-   CPU backend 与 eager mode。
-2. 同一 Program 不支持 overlapping requests；如需支持，必须引入 per-request reservation ledger，而不是把三个单值 timing
-   字段直接共享。
-3. `decode_buffer_tokens=100` 是固定启发式 reservation，不是论文开源 estimator，也不保证覆盖任意未来输出。
-4. tier 是保护意图，不是主动搬迁状态；当前没有 MORI-specific prefetch 或独立 transfer state machine。
-5. Program reclass 是 `O(B_p log N)`；若极端 workload 的 tier churn 成为热点，可评估 lazy epoch 或 per-Program head
-   index，但必须继续正确处理 shared owners 和 stale-repair 上界。
-6. 当前 controlled benchmark 只证明 CPU typed-LRU 的顺序与开销；真实 GPU replay 还需报告端到端时延、HBM/cache hit、
-   native CPU hit、H2D/D2H、scheduler CPU 和终态不变量。
+收据的 `full_gpu_or_e2e_benchmark_run=false` 只描述该次实现验证；当时暂停实验的原因保留在原始回执中。
+本文更新不启动新 GPU 实验，也不据此断言研究目录没有其他后续运行。任何新 GPU 报告都必须核对 code revision、patch、配置和输入后才能关联到本实现。
+证据：[design/module/scheduling/artifacts/mori-redesign-20261028/validation.json:82-88](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/design/module/scheduling/artifacts/mori-redesign-20261028/validation.json#L82-L88)、[design/module/scheduling/artifacts/mori-redesign-20261028/validation.json:107-121](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/design/module/scheduling/artifacts/mori-redesign-20261028/validation.json#L107-L121)。
 
-证据索引：`design/module/scheduling/mori-scheduling.md:39-45`、
-`agentinfer/scheduling/mori/strategy.py:26-33`、`agentinfer/agentcache/mori/typed_lru.py:34-41`、
-`design/module/scheduling/mori-performance.md:74-78`。
+## 19. 已知限制与后续性能分析入口
 
-## 20. 实现不变量清单
+| 机制或缺口 | 可能的性能影响 | 需要验证的量 |
+| --- | --- | --- |
+| 缺少 waiting prompt 的完整共享证明 | 保守收费、有效并发偏低 | 未证明 context 比例、逻辑预算与物理占用差 |
+| CPU tier 不保证 READY，eager 备份全程存在 | 回迁 miss、重算或无效复制 | 实际 D2H/H2D bytes、ready coverage、recompute |
+| sticky 门槛与 aged 例外 | 降低抖动，也可能推迟准入或造成往返 | 每 owner 驻留时间、回迁间隔、排队分位数 |
+| 同 lineage 串行、临时分支即完成释放 | 改变重叠时序、丢失临时分支跨工具保护 | 并发/串行请求量、lineage 采用率、续接命中 |
+| 100-token headroom | 多请求共同增长时仍有债务与 preemption | debt 持续时间、native preempt、增长速率 |
+| 到达/完成/diagnostics 全量快照 | 大量短请求下 scheduler CPU 仍可能较高 | 分路径 thread CPU、P/K/request rate |
+| typed reclassification 与 stale rebuild | 大工作集频繁换层带来维护成本 | entries reclassified、heap compactions、fallback |
+| 单 rank、原生 batch 顺序 | 未覆盖论文所有系统层优化 | 单独控制路由与 batch 的实验 |
+| best-effort terminal，无 MORI TTL | 闲置 owner 元数据和保护可能延长 | terminal 丢失、live owners、WAITING 元数据量 |
 
-- Program identity 必须由 server request 解析；不得从 replay plan 或预知 DAG 补齐。
-- 同一 stable Program ID 的 owner 关系必须携带 generation。
-- 未完成 lazy demotion 不得释放 GPU logical reservation。
-- pending CPU destination 必须计入 DRAM reservation。
-- shared entry 必须按该层最受保护 owner 分类。
-- class change 不得改变 native LRU sequence。
-- HBM/CPU 都只能提交 exact-count victim set；合法性变化必须整批 fail closed。
-- victim proposal hot path 不得回退为全局 owner join 或全量 key scan。
-- native vLLM 必须继续拥有 refcount、queue membership、protected set、job/fence 与实际 allocation/transfer。
-- shutdown 必须解除 provider、observer、indexes 与 request binding，不能把 process-global state 泄漏给同进程下一实例。
+这些是由机制推导的待验证方向，不能直接写成已测得的瓶颈或收益。
+依据：[agentinfer/scheduling/mori/strategy.py:657-666](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L657-L666)、[agentinfer/scheduling/mori/strategy.py:223-345](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L223-L345)、[agentinfer/scheduling/mori/strategy.py:141-209](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/mori/strategy.py#L141-L209)、[agentinfer/agentcache/mori/typed_lru.py:172-198](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/typed_lru.py#L172-L198)、[agentinfer/agentcache/core/api_adapter.py:169-222](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/core/api_adapter.py#L169-L222)、[design/module/scheduling/artifacts/mori-redesign-20261028/validation.json:114-121](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/design/module/scheduling/artifacts/mori-redesign-20261028/validation.json#L114-L121)。
 
-证据索引：`agentinfer/scheduling/mori/strategy.py:376-423`、
-`agentinfer/agentcache/mori/typed_lru.py:171-197`、`agentinfer/agentcache/mori/typed_lru.py:218-281`、
-`agentinfer/agentcache/mori/vllm_adapter.py:37-59`。
+## 20. 维护者不变量清单
+
+- 一个 MORI lineage 同时至多一个授权 lease；deferred 请求不覆盖当前 prompt 或延长 drain。
+- GPU 降层在当前 lease 完成或 native 取消确认后提交；pending relief 不能花两次。
+- 旧 generation、旧 receipt、其他 lineage 的完成不能修改当前 owner 的生命周期。
+- 每次新 prompt 都重新估算并使旧 footprint 失效；共享抵扣只依赖有效唯一块证据。
+- victim 回收按边际联合占用计算；CPU pending destination 也必须计费。
+- 无压力且无等待者时保持合法 placement；普通置换先证明完整计划可以让候选进展。
+- native refcount、readiness、fence 与可驱逐性始终是最终物理安全条件。
+- 性能报告同时记录源码版本、输入、容量、命中分母、传输和调度成本，不能用局部 CPU 探针替代 E2E。
+
+对应验收与实现索引：[tests/scheduling/test_mori_lineages.py:78-219](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/tests/scheduling/test_mori_lineages.py#L78-L219)、[tests/scheduling/test_mori_capacity.py:23-134](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/tests/scheduling/test_mori_capacity.py#L23-L134)、[tests/agentcache/core/test_mori_vllm_adapter.py:467-521](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/tests/agentcache/core/test_mori_vllm_adapter.py#L467-L521)、[agentinfer/agentcache/patches/vllm-0.31-mori-hbm-provider.patch:58-108](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/patches/vllm-0.31-mori-hbm-provider.patch#L58-L108)、[design/module/scheduling/artifacts/mori-redesign-20261028/validation.json:82-121](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/design/module/scheduling/artifacts/mori-redesign-20261028/validation.json#L82-L121)。
