@@ -1,0 +1,807 @@
+diff --git a/agentinfer/agentcache/core/controller.py b/agentinfer/agentcache/core/controller.py
+index 516a0b7..09f20c5 100644
+--- a/agentinfer/agentcache/core/controller.py
++++ b/agentinfer/agentcache/core/controller.py
+@@ -79,7 +79,7 @@ _REMOVED_PROGRESS_TTL_SETTINGS = frozenset(
+     }
+ )
+ 
+-_CONFIGURABLE_MORI_SETTINGS = frozenset({"mode", "window_size", "starvation_timeout_seconds"})
++_CONFIGURABLE_MORI_SETTINGS = frozenset({"mode", "window_size"})
+ _FIXED_MORI_SETTINGS = frozenset({"decode_buffer_tokens"})
+ 
+ 
+@@ -115,7 +115,6 @@ def build_mori_controller(
+     config = MORIConfig(
+         mode=_mori_mode_setting(raw, "mode", MORIMode.FULL),
+         window_size=_int_setting(raw, "window_size", 5, scope="mori"),
+-        starvation_timeout_seconds=_float_setting(raw, "starvation_timeout_seconds", 60.0, scope="mori"),
+     )
+     if config.mode is MORIMode.FULL:
+         if len(backend_pool_info.backends) != 1 or len(backend_pool_info.backends[0].dp_ranks) != 1:
+diff --git a/agentinfer/agentcache/core/scheduler.py b/agentinfer/agentcache/core/scheduler.py
+index df0c2d3..ecff06f 100644
+--- a/agentinfer/agentcache/core/scheduler.py
++++ b/agentinfer/agentcache/core/scheduler.py
+@@ -172,6 +172,12 @@ class _VllmAdmissionHooks:
+                 return
+             native_add(request)
+             return
++        if (
++            isinstance(getattr(self.controller, "strategy", None), MORIStrategy)
++            and request.num_prompt_tokens > self.local_hbm_kv_tokens
++        ):
++            self._reject_request(request, "mori_prompt_exceeds_hbm_capacity")
++            return
+         retained_at_monotonic_s = time.monotonic()
+         try:
+             dispatch_now = self.controller.on_request_arrival(
+diff --git a/agentinfer/scheduling/mori/config.py b/agentinfer/scheduling/mori/config.py
+index e4f25e2..7aef1a2 100644
+--- a/agentinfer/scheduling/mori/config.py
++++ b/agentinfer/scheduling/mori/config.py
+@@ -4,7 +4,6 @@
+ 
+ from __future__ import annotations
+ 
+-import math
+ from dataclasses import dataclass
+ from enum import Enum
+ 
+@@ -23,7 +22,6 @@ class MORIConfig:
+     window_size: int = 5
+     mode: MORIMode = MORIMode.FULL
+     decode_buffer_tokens: int = 100
+-    starvation_timeout_seconds: float = 60.0
+ 
+     def __post_init__(self) -> None:
+         if self.window_size <= 0:
+@@ -32,5 +30,3 @@ class MORIConfig:
+             raise ValueError("MORI mode must be a MORIMode")
+         if self.decode_buffer_tokens < 0:
+             raise ValueError("MORI decode_buffer_tokens must be non-negative")
+-        if not math.isfinite(self.starvation_timeout_seconds) or self.starvation_timeout_seconds <= 0:
+-            raise ValueError("MORI starvation_timeout_seconds must be finite and positive")
+diff --git a/agentinfer/scheduling/mori/factors.py b/agentinfer/scheduling/mori/factors.py
+index d2be452..422f538 100644
+--- a/agentinfer/scheduling/mori/factors.py
++++ b/agentinfer/scheduling/mori/factors.py
+@@ -22,10 +22,15 @@ class MORIGlobalFactors:
+     """Policy-wide committed counters used by diagnostics."""
+ 
+     schedule_cycles: int = 0
++    schedule_requested_at: float | None = None
+ 
+     def __post_init__(self) -> None:
+         if self.schedule_cycles < 0:
+             raise ValueError("MORI schedule_cycles must be non-negative")
++        if self.schedule_requested_at is not None and (
++            not math.isfinite(self.schedule_requested_at) or self.schedule_requested_at < 0
++        ):
++            raise ValueError("MORI schedule request time must be finite and non-negative")
+ 
+ 
+ @dataclass(frozen=True)
+diff --git a/agentinfer/scheduling/mori/strategy.py b/agentinfer/scheduling/mori/strategy.py
+index ce226ee..c278936 100644
+--- a/agentinfer/scheduling/mori/strategy.py
++++ b/agentinfer/scheduling/mori/strategy.py
+@@ -115,27 +115,21 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
+                     required_tokens=required,
+                 )
+ 
+-            available = self._remaining_gpu_tokens(snapshot, strategy_factors)
+-            waiting_refs = set(snapshot.waiting_programs)
+-            has_waiters = any(
+-                program.ref != candidate and program.ref in waiting_refs and program.status is ProgramStatus.REASONING
+-                for program in snapshot.programs
+-            )
+-            if available >= required and not has_waiters:
+-                result = (
+-                    transitions.resume(candidate, reason="mori_promote_gpu", backend_id=snapshot.backend_id)
+-                    if view.step_count > 0
+-                    else transitions.admit(candidate, reason="mori_new_gpu", backend_id=snapshot.backend_id)
++            # Arrivals and retained work use the same ranked selection. Arm one
++            # host cycle before transitions so other admitted requests are also
++            # transferred to native waiting on the next poll.
++            self._request_schedule(strategy_factors, snapshot.observed_at_monotonic_s)
++            self._select_pending(snapshot, strategy_factors, transitions)
++            if self._factor(strategy_factors, candidate).tier is MORITier.GPU:
++                self.counters[f"admission_{sidecar.tier.value}_to_gpu"] += 1
++                return AdmissionOutcome(
++                    AdmissionDisposition.ADMITTED,
++                    "mori_ranked_admission",
++                    required_tokens=required,
++                    transitioned_programs=(candidate,),
+                 )
+-                if result.applied:
+-                    self.counters[f"admission_{sidecar.tier.value}_to_gpu"] += 1
+-                    return AdmissionOutcome(
+-                        AdmissionDisposition.ADMITTED,
+-                        result.reason,
+-                        required_tokens=required,
+-                        transitioned_programs=(candidate,),
+-                    )
+ 
++            available = self._remaining_gpu_tokens(snapshot, strategy_factors)
+             result = transitions.queue(candidate, reason="mori_capacity_queue")
+             self._require_applied(result)
+             self.counters["admission_queued"] += 1
+@@ -157,57 +151,75 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
+     ) -> None:
+         started = time.thread_time()
+         try:
+-            available = self._remaining_gpu_tokens(snapshot, strategy_factors)
+-            if available < 0:
+-                self.counters["promotion_blocked_capacity_debt"] += 1
+-                return
+-            now = snapshot.observed_at_monotonic_s
+-            candidates = [
+-                program
+-                for program in snapshot.programs
+-                if program.state is ProgramState.PAUSED
+-                and program.status is ProgramStatus.REASONING
+-                and not program.marked_for_pause
+-            ]
+-            candidates.sort(key=lambda program: self._promotion_key(program, strategy_factors, snapshot, now))
+-            oldest = next(
+-                (
+-                    program
+-                    for program in candidates
+-                    if self._wait_seconds(program, now) >= self.config.starvation_timeout_seconds
+-                    and self._gpu_target(program, snapshot) <= self._gpu_quota(snapshot)
+-                ),
+-                None,
+-            )
+-            if oldest is not None and self._gpu_target(oldest, snapshot) > available:
+-                # Reserve the next turn for the oldest feasible overdue waiter.
+-                # Reasoning victims finish before their reservation is released;
+-                # do not fill that promised capacity with smaller newcomers.
++            self._select_pending(snapshot, strategy_factors, transitions)
++        finally:
++            self.decision_cpu_seconds += time.thread_time() - started
++
++    def _select_pending(
++        self,
++        snapshot: SchedulingSnapshot,
++        strategy_factors: MORIFactors,
++        transitions: TransitionController,
++    ) -> None:
++        """Share selection between Hooks without double-counting decision CPU time."""
++        available = self._remaining_gpu_tokens(snapshot, strategy_factors)
++        if available < 0:
++            self.counters["promotion_blocked_capacity_debt"] += 1
++            return
++        now = snapshot.observed_at_monotonic_s
++        candidates = [
++            program
++            for program in snapshot.programs
++            if program.state is ProgramState.PAUSED
++            and program.status is ProgramStatus.REASONING
++            and not program.marked_for_pause
++        ]
++        candidates.sort(key=lambda program: self._promotion_key(program, strategy_factors, snapshot, now))
++        next_waiting: ProgramView | None = None
++        for candidate in candidates:
++            required = self._gpu_target(candidate, snapshot)
++            if required > self._gpu_quota(snapshot):
++                self.counters["promotion_exceeds_total_quota"] += 1
++                continue
++            if required > available:
++                # Reclaim only immediately available Acting reservations
++                # while selecting runnable work. A pending lazy demotion
++                # must not prevent a later candidate from using free space.
+                 self._repair_gpu_capacity(
+                     snapshot,
+                     strategy_factors,
+                     transitions,
+-                    waiting_reservation=self._gpu_target(oldest, snapshot),
++                    waiting_reservation=required,
++                    acting_only=True,
+                 )
+-                self.counters["starvation_capacity_reclaims"] += 1
+-                return
+-            for candidate in candidates:
+-                required = self._gpu_target(candidate, snapshot)
+-                if required > available:
+-                    self.counters["promotion_no_fit"] += 1
+-                    continue
+-                result = (
+-                    transitions.resume(candidate.ref, reason="mori_cycle_promote", backend_id=snapshot.backend_id)
+-                    if candidate.step_count > 0
+-                    else transitions.admit(candidate.ref, reason="mori_cycle_admit", backend_id=snapshot.backend_id)
+-                )
+-                if not result.applied:
+-                    self.counters["promotion_rejected"] += 1
+-                    continue
+-                available -= required
+-                self.counters["promotion_applied"] += 1
+-        finally:
+-            self.decision_cpu_seconds += time.thread_time() - started
++                self.counters["waiting_capacity_reclaims"] += 1
++                available = self._remaining_gpu_tokens(snapshot, strategy_factors)
++            if required > available:
++                if next_waiting is None:
++                    next_waiting = candidate
++                self.counters["promotion_no_fit"] += 1
++                continue
++            result = (
++                transitions.resume(candidate.ref, reason="mori_cycle_promote", backend_id=snapshot.backend_id)
++                if candidate.step_count > 0
++                else transitions.admit(candidate.ref, reason="mori_cycle_admit", backend_id=snapshot.backend_id)
++            )
++            if not result.applied:
++                self.counters["promotion_rejected"] += 1
++                continue
++            available -= required
++            self.counters["promotion_applied"] += 1
++        if next_waiting is not None:
++            # After admitting everything that fits, arrange lazy relief for
++            # the first remaining feasible candidate. Completion will wake
++            # selection; there is no timeout or reserved empty-slot rule.
++            self._repair_gpu_capacity(
++                snapshot,
++                strategy_factors,
++                transitions,
++                waiting_reservation=self._gpu_target(next_waiting, snapshot),
++            )
++            self.counters["promotion_waiting_lazy_relief"] += 1
+ 
+     def repair_capacity(
+         self,
+@@ -235,9 +247,23 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
+     def on_schedule_cycle_start(self, snapshot: SchedulingSnapshot, strategy_factors: MORIFactors) -> None:
+         del snapshot
+         current = strategy_factors.global_factors
+-        strategy_factors.set_global_factors(replace(current, schedule_cycles=current.schedule_cycles + 1))
++        strategy_factors.set_global_factors(
++            replace(current, schedule_cycles=current.schedule_cycles + 1, schedule_requested_at=None)
++        )
+         self.counters["schedule_cycles"] += 1
+ 
++    def next_check_at(self, strategy_factors: MORIFactors) -> float | None:
++        """Wake on demand or capacity changes without waiting for a periodic tick."""
++        return strategy_factors.global_factors.schedule_requested_at
++
++    @staticmethod
++    def _request_schedule(strategy_factors: MORIFactors, now: float) -> None:
++        current = strategy_factors.global_factors
++        previous = current.schedule_requested_at
++        strategy_factors.set_global_factors(
++            replace(current, schedule_requested_at=now if previous is None else min(previous, now))
++        )
++
+     def diagnostics(
+         self,
+         snapshot: SchedulingSnapshot,
+@@ -301,6 +327,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
+     def on_request_pending(self, strategy_factors: MORIFactors, event: SchedulingEvent) -> None:
+         if event.program is not None:
+             self._factor(strategy_factors, event.program)
++            self._request_schedule(strategy_factors, event.occurred_at_monotonic_s)
+ 
+     def on_program_status_changed(self, strategy_factors: MORIFactors, event: SchedulingEvent) -> None:
+         if event.program is None or event.current_status is not ProgramStatus.REASONING:
+@@ -335,6 +362,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
+     def on_request_finished(self, strategy_factors: MORIFactors, event: SchedulingEvent) -> None:
+         if event.program is None:
+             return
++        self._request_schedule(strategy_factors, event.occurred_at_monotonic_s)
+         sidecar = self._factor(strategy_factors, event.program)
+         latency = self._event_non_negative_float(event.field("request_latency_seconds"))
+         scheduler_wait = self._event_non_negative_float(event.field("scheduler_queue_seconds"))
+@@ -380,6 +408,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
+     def on_program_paused(self, strategy_factors: MORIFactors, event: SchedulingEvent) -> None:
+         if event.program is None:
+             return
++        self._request_schedule(strategy_factors, event.occurred_at_monotonic_s)
+         sidecar = self._factor(strategy_factors, event.program)
+         target = sidecar.pending_tier or MORITier.WAITING
+         self._set_factor(
+@@ -391,6 +420,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
+     def on_program_released(self, strategy_factors: MORIFactors, event: SchedulingEvent) -> None:
+         if event.program is None:
+             return
++        self._request_schedule(strategy_factors, event.occurred_at_monotonic_s)
+         strategy_factors.remove_program_factors(event.program)
+         self._classes.pop(event.program, None)
+         self._cache_class_epoch += 1
+@@ -423,8 +453,9 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
+         transitions: TransitionController,
+         *,
+         waiting_reservation: int = 0,
++        acting_only: bool = False,
+     ) -> None:
+-        """Reclaim quota debt or a feasible overdue waiter's next turn, without early relief."""
++        """Reclaim quota debt or a feasible waiter's next turn, without early relief."""
+         deficit = max(0, self._gpu_reserved_tokens(snapshot, factors) + waiting_reservation - self._gpu_quota(snapshot))
+         if deficit == 0:
+             return
+@@ -434,7 +465,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
+             if (sidecar := self._factor(factors, program.ref)).tier is MORITier.GPU
+             and sidecar.pending_tier in (MORITier.CPU, MORITier.WAITING)
+         )
+-        needed = max(0, deficit - promised)
++        needed = deficit if acting_only else max(0, deficit - promised)
+         if needed == 0:
+             self.counters["gpu_debt_waiting_lazy_relief"] += 1
+             return
+@@ -447,6 +478,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
+             and self._factor(factors, program.ref).tier is MORITier.GPU
+             and self._factor(factors, program.ref).pending_tier is None
+             and not program.marked_for_pause
++            and (not acting_only or program.status is ProgramStatus.ACTING)
+         ]
+         victims.sort(key=lambda program: self._demotion_key(program, factors, now))
+         for victim in victims:
+@@ -517,16 +549,12 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
+         factors: MORIFactors,
+         snapshot: SchedulingSnapshot,
+         now: float,
+-    ) -> tuple[int, float, int, int, float, str, int]:
+-        """Use oldest-first priority after the wait bound, then the normal MORI order."""
++    ) -> tuple[int, int, float, str, int]:
++        """Order by MORI tier, new context size, idleness and stable identity."""
+         tier = self._factor(factors, program.ref).tier
+         priority = 0 if tier is MORITier.CPU else 1 if program.step_count > 0 else 2
+         new_context = self._gpu_target(program, snapshot) if priority == 2 else 0
+-        waited = self._wait_seconds(program, now)
+-        overdue = waited >= self.config.starvation_timeout_seconds
+         return (
+-            0 if overdue else 1,
+-            -waited if overdue else 0.0,
+             priority,
+             new_context,
+             self._idleness(self._factor(factors, program.ref), now),
+@@ -574,7 +602,12 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
+     def _gpu_target(self, program: ProgramView, snapshot: SchedulingSnapshot) -> int:
+         block_size = snapshot.hbm_block_size_tokens or program.tokens.block_size_tokens or 1
+         context = max(0, program.tokens.estimated_context_tokens)
+-        return self._round_up(context + self.config.decode_buffer_tokens, block_size)
++        rounded_context = self._round_up(context, block_size)
++        target = self._round_up(context + self.config.decode_buffer_tokens, block_size)
++        # The speculative decode buffer alone must not make a physically
++        # feasible prompt wait forever. Native max-model-length checks and
++        # allocation remain authoritative for actual growth.
++        return max(rounded_context, min(target, self._gpu_quota(snapshot)))
+ 
+     @staticmethod
+     def _dram_target(program: ProgramView, snapshot: SchedulingSnapshot) -> int:
+diff --git a/design/module/scheduling/mori-scheduling.md b/design/module/scheduling/mori-scheduling.md
+index 5c9b165..27ee5ac 100644
+--- a/design/module/scheduling/mori-scheduling.md
++++ b/design/module/scheduling/mori-scheduling.md
+@@ -228,6 +228,17 @@ offload manager 的 `num_chunks * tokens_per_chunk` 归一化得到，并经 `Dp
+ 
+ ## Admission、promotion 与 demotion
+ 
++2026-10-28 调度修订（替代本节下方保留的首版和 2026-10-27 等待规则）：新到与 retained 候选统一按
++MORI tier、new-context 大小、idleness 和稳定 identity 选择，不再使用 `starvation_timeout_seconds` 或
++等待时长提权。无空闲容量时先尝试 Acting demotion；仍无法 fit 则继续扫描后续候选，不为队首保留空槽。
++完成本轮 fit 扫描后，才为首个仍未满足的可行候选安排 Reasoning lazy demotion；真正完成后的 pause 才释放
++reservation。arrival、completion、pause 和 release 通过既有 `next_check_at` 接口唤醒调度，不额外等待
++五秒 periodic tick；无新事件时保留原周期维护。
++
++本次继续使用完整 context 计费，不扣除可能包含 residual self KV 的 shared-prefix 观测。固定 decode
++buffer 在 prompt 本身可 fit 时截到总 HBM quota；prompt 本身超过 rank 的整个 HBM KV 容量时，由 vLLM
++bridge 在创建 Program binding 前返回 terminal error。native allocator 的实际分配安全边界不变。
++
+ 2026-10-27 服务安全修订：下述首版 sticky 顺序保留用于未超时请求。当前实现对等待超过
+ `mori.starvation_timeout_seconds`（默认 60 秒）的请求使用跨组 oldest-first 顺序，并在必要时为最早可行请求
+ 回收 GPU reservation；Reasoning 仍只在完成后释放容量。新请求不能从 admission 快径绕过正在等待的请求。
+diff --git a/docs/en/how-to/use-mori.md b/docs/en/how-to/use-mori.md
+index 73221d8..ca88293 100644
+--- a/docs/en/how-to/use-mori.md
++++ b/docs/en/how-to/use-mori.md
+@@ -102,12 +102,16 @@ The SimpleCPU adapter closes the following loop at startup and runtime:
+ MORI does not actively prefetch. CPU tier is a protection priority; a later inference still triggers SimpleCPU's native
+ on-demand H2D load.
+ 
+-Queued requests older than `mori.starvation_timeout_seconds` (default `60.0`, finite and positive) take precedence
+-across all promotion groups, oldest first. If the oldest feasible request cannot fit, MORI reserves its next turn by
+-demoting idle GPU residents or marking reasoning residents for demotion after completion. New arrivals join the
+-pending queue. This serving fairness extension can change sticky placement after the timeout; it is not a bound on
+-response time. It still requires a request to fit the full GPU quota and in-flight reasoning requests to complete.
+-Diagnostics include `max_wait_seconds`; normal MORI priority and idleness ordering apply before the timeout.
++Arrivals and queued requests use the same MORI ordering: CPU returns, other returns, then new Programs ordered by
++context size, with relative idleness and stable identity as tie-breakers. There is no age-based priority override or
++minimum wait; the former `mori.starvation_timeout_seconds` setting is no longer supported. Selection continues past
++a candidate that cannot currently fit, so a later fitting request can run while a reasoning victim finishes. Request
++completion and committed capacity release wake selection without waiting for the periodic maintenance interval.
++Acting victims can pause immediately; reasoning victims release their reservations only after completion.
++
++A prompt larger than the rank's entire HBM KV capacity is rejected before it enters the Program queue. The fixed
++decode buffer is capped by that total capacity when the prompt itself fits; actual allocation and model-length limits
++remain enforced by vLLM. `max_wait_seconds` is diagnostic only.
+ 
+ ## Startup checks and troubleshooting
+ 
+diff --git a/docs/zh/how-to/use-mori.md b/docs/zh/how-to/use-mori.md
+index 261bc5c..e3fcd39 100644
+--- a/docs/zh/how-to/use-mori.md
++++ b/docs/zh/how-to/use-mori.md
+@@ -100,11 +100,14 @@ SimpleCPU adapter 在启动和运行期间完成以下闭环：
+ MORI 当前不主动 prefetch。CPU tier 表示保护优先级；需要再次推理时仍由 SimpleCPU 的 native on-demand load
+ 触发 H2D。
+ 
+-等待超过 `mori.starvation_timeout_seconds`（默认 `60.0`，要求有限正数）的请求跨 promotion 组按等待时间从长到短
+-优先处理。若最早的可行请求无法立即 fit，MORI 会暂停 Acting GPU resident，或标记 Reasoning resident 在完成后
+-降级，为该请求保留下一轮容量。新到达请求进入已有等待队列。这是服务公平性扩展，会在超时后改变 sticky placement，
+-不代表响应时间上界；仍要求请求完整 fit GPU quota，且正在推理的请求最终完成。diagnostics 增加 `max_wait_seconds`，
+-超时前仍沿用正常的 MORI priority 和 idleness 顺序。
++新到和排队请求采用相同的 MORI 顺序：CPU returning、其他 returning、按上下文大小排序的新 Program，
++同组再按相对空闲度和稳定 identity 排序。不再设置最低等待时间或超时提权，旧的
++`mori.starvation_timeout_seconds` 配置已移除。当前候选无法 fit 时继续扫描，后续可 fit 的候选可以先执行。
++请求完成和容量释放会立即唤醒重选，不等待周期维护 tick。Acting victim 可以立即 pause；Reasoning victim
++仍须在当前请求完成后释放 reservation。
++
++prompt 本身超过 rank 的整个 HBM KV 容量时，在进入 Program 队列前返回错误。若只有固定 decode buffer
++导致超额，则把预留截到总容量；实际分配和模型长度限制仍由 vLLM 执行。`max_wait_seconds` 仅用于诊断。
+ 
+ ## 启动检查和排障
+ 
+diff --git a/tests/agentcache/core/test_mori_controller.py b/tests/agentcache/core/test_mori_controller.py
+index 43cd770..04c9e3f 100644
+--- a/tests/agentcache/core/test_mori_controller.py
++++ b/tests/agentcache/core/test_mori_controller.py
+@@ -64,12 +64,6 @@ def test_decode_buffer_cannot_be_overridden() -> None:
+         build_mori_controller(backend(), {"mori": {"decode_buffer_tokens": 999}})
+ 
+ 
+-def test_controller_accepts_finite_positive_starvation_timeout() -> None:
+-    controller = build_mori_controller(backend(), {"mori": {"starvation_timeout_seconds": 12.5}})
+-    assert controller.strategy.config.starvation_timeout_seconds == 12.5
+-
+-
+-@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan"), True])
+-def test_controller_rejects_invalid_starvation_timeout(timeout) -> None:
+-    with pytest.raises(ValueError, match="starvation_timeout_seconds"):
+-        build_mori_controller(backend(), {"mori": {"starvation_timeout_seconds": timeout}})
++def test_controller_rejects_removed_starvation_timeout() -> None:
++    with pytest.raises(ValueError, match="not supported: starvation_timeout_seconds"):
++        build_mori_controller(backend(), {"mori": {"starvation_timeout_seconds": 60.0}})
+diff --git a/tests/agentcache/core/test_mori_vllm_adapter.py b/tests/agentcache/core/test_mori_vllm_adapter.py
+index 7130626..452701c 100644
+--- a/tests/agentcache/core/test_mori_vllm_adapter.py
++++ b/tests/agentcache/core/test_mori_vllm_adapter.py
+@@ -277,7 +277,7 @@ def test_full_adapter_cleans_process_state_when_native_unregister_fails() -> Non
+ 
+ 
+ @pytest.mark.parametrize("bridge_type", [AgentCacheSyncSchedulerBridge, AgentCacheAsyncSchedulerBridge])
+-@pytest.mark.parametrize("invalid", ["missing", "malformed"])
++@pytest.mark.parametrize("invalid", ["missing", "malformed", "oversized"])
+ def test_mori_rejects_only_invalid_request_and_delivers_terminal_output(bridge_type, invalid) -> None:
+     config = SimpleNamespace(
+         scheduler_config=SimpleNamespace(async_scheduling=bridge_type is AgentCacheAsyncSchedulerBridge),
+@@ -307,6 +307,10 @@ def test_mori_rejects_only_invalid_request_and_delivers_terminal_output(bridge_t
+     identity = {"agentic_context": {"program_id": "program"}}
+     good = request("good", identity)
+     bad = request("bad", None if invalid == "missing" else {"agentic_context": "{"})
++    if invalid == "oversized":
++        bad = request("bad", identity)
++        bad.num_prompt_tokens = 1601
++        bad.num_tokens = 1601
+     with (
+         patch.object(Scheduler, "__init__", initialize),
+         patch.object(AsyncScheduler, "__init__", initialize),
+@@ -426,7 +430,7 @@ def test_retained_abort_uses_host_contract_and_releases_program_binding(monkeypa
+         parallel_config=SimpleNamespace(data_parallel_index=0),
+         additional_config={"agentcache": {"strategy": "mori", "mori": {"mode": "placement_only"}}},
+     )
+-    hooks = _VllmAdmissionHooks(owner, config, SimpleNamespace(num_blocks=1), 16)
++    hooks = _VllmAdmissionHooks(owner, config, SimpleNamespace(num_blocks=13), 16)
+     request = SimpleNamespace(
+         request_id="retained",
+         client_index=7,
+@@ -436,8 +440,17 @@ def test_retained_abort_uses_host_contract_and_releases_program_binding(monkeypa
+         events=[],
+     )
+     native = []
++    resident = SimpleNamespace(
++        request_id="resident",
++        num_prompt_tokens=100,
++        sampling_params=SimpleNamespace(extra_args={"agentic_context": {"program_id": "resident"}}),
++        trace_headers={},
++        events=[],
++    )
++    # Retain because capacity is occupied, not because the prompt can never fit.
++    hooks.add_request(owner, resident, native.append)
+     hooks.add_request(owner, request, native.append)
+-    assert not native
++    assert native == [resident]
+     assert MORI_RUNTIME_STATE.program_for_request("retained") is not None
+     finished = hooks.finish_requests(owner, "retained", RequestStatus.FINISHED_ABORTED, lambda ids, status: [])
+     assert finished == ([request] if returns_requests else [("retained", 7)])
+diff --git a/tests/scheduling/test_mori_runtime.py b/tests/scheduling/test_mori_runtime.py
+index fdc5bc7..150e89b 100644
+--- a/tests/scheduling/test_mori_runtime.py
++++ b/tests/scheduling/test_mori_runtime.py
+@@ -92,31 +92,55 @@ def test_same_program_requests_overlap_and_act_only_after_the_last_completion()
+     assert runtime.registry.require(lead_ref).status is ProgramStatus.ACTING
+ 
+ 
+-@pytest.mark.parametrize("resident_finished", [True, False])
+-def test_overdue_waiter_eventually_reclaims_a_sticky_gpu_reservation(resident_finished) -> None:
++def test_lazy_demotion_completion_wakes_waiter_before_the_next_periodic_tick() -> None:
+     runtime = scheduler()
+     capacity = backend(208)
+     with patch("agentinfer.scheduling.runtime.time.monotonic", return_value=0.0) as clock:
+         assert runtime.on_request_arrival("resident", AgentIdentity("resident"), 100, capacity, "resident")
+-        if resident_finished:
+-            runtime.on_request_completion("resident", 100)
++        runtime.schedule_cycle(capacity)
+         clock.return_value = 1.0
+         assert not runtime.on_request_arrival("old", AgentIdentity("old"), 100, capacity, "old")
+         old = runtime.program_ref_for_request("old")
+-        for tick in range(2, 62, 5):
+-            clock.return_value = float(tick)
+-            runtime.schedule_cycle(capacity)
+-            assert runtime.consume_admitted_requests() == ()
+-        clock.return_value = 62.0
+-        assert not runtime.on_request_arrival("young", AgentIdentity("young"), 1, capacity, "young")
++        assert runtime.needs_schedule_cycle(1.0)
+         runtime.schedule_cycle(capacity)
+         assert runtime.consume_admitted_requests() == ()
+         assert runtime.registry.require(old).wait_started_at_monotonic_s == 1.0
+-        if not resident_finished:
+-            resident = runtime.program_ref_for_request("resident")
+-            assert runtime.registry.require(resident).marked_for_pause
+-            runtime.on_request_completion("resident", 100)
+-        clock.return_value = 68.0
++        resident = runtime.program_ref_for_request("resident")
++        assert runtime.registry.require(resident).marked_for_pause
++        assert not runtime.needs_schedule_cycle(1.1)
++        clock.return_value = 1.1
++        runtime.on_request_completion("resident", 100)
++        assert runtime.needs_schedule_cycle(1.1)
+         runtime.schedule_cycle(capacity)
+         assert [entry.request_id for entry, _ in runtime.consume_admitted_requests()] == ["old"]
+         assert runtime.registry.require(old).wait_started_at_monotonic_s is None
++        assert not runtime.needs_schedule_cycle(1.2)
++
++
++def test_arrival_can_use_free_capacity_behind_a_non_fitting_waiter() -> None:
++    runtime = scheduler()
++    capacity = backend(1008)
++    with patch("agentinfer.scheduling.runtime.time.monotonic", return_value=0.0) as clock:
++        assert runtime.on_request_arrival("resident", AgentIdentity("resident"), 700, capacity, "resident")
++        runtime.schedule_cycle(capacity)
++        clock.return_value = 1.0
++        assert not runtime.on_request_arrival("large", AgentIdentity("large"), 400, capacity, "large")
++        clock.return_value = 1.1
++        assert runtime.on_request_arrival("small", AgentIdentity("small"), 50, capacity, "small")
++        assert runtime.request_pool.waiting_request_ids == ("large",)
++
++
++def test_arrival_admissions_of_other_waiters_are_delivered_on_next_host_poll() -> None:
++    runtime = scheduler()
++    capacity = backend(1008)
++    with patch("agentinfer.scheduling.runtime.time.monotonic", return_value=0.0) as clock:
++        assert runtime.on_request_arrival("resident", AgentIdentity("resident"), 700, capacity, "resident")
++        runtime.schedule_cycle(capacity)
++        clock.return_value = 1.0
++        assert not runtime.on_request_arrival("large", AgentIdentity("large"), 400, capacity, "large")
++        clock.return_value = 1.1
++        runtime.on_request_completion("resident", 700)
++        assert runtime.on_request_arrival("small", AgentIdentity("small"), 50, capacity, "small")
++        assert runtime.needs_schedule_cycle(1.1)
++        runtime.schedule_cycle(capacity)
++        assert [entry.request_id for entry, _ in runtime.consume_admitted_requests()] == ["large"]
+diff --git a/tests/scheduling/test_mori_strategy.py b/tests/scheduling/test_mori_strategy.py
+index 96b0831..6a53289 100644
+--- a/tests/scheduling/test_mori_strategy.py
++++ b/tests/scheduling/test_mori_strategy.py
+@@ -106,7 +106,7 @@ def set_tier(components, program: ProgramView, tier: MORITier, *, idleness: floa
+     components.strategy._set_factor(components.initial_factors, program.ref, sidecar)
+ 
+ 
+-def test_no_fit_admission_queues_without_displacing_a_legal_gpu_program() -> None:
++def test_no_fit_admission_reclaims_an_acting_sticky_gpu_reservation() -> None:
+     components = build_mori_strategy(MORIConfig(mode=MORIMode.FULL))
+     resident = view("resident", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=700)
+     candidate = view("candidate", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400)
+@@ -120,6 +120,47 @@ def test_no_fit_admission_queues_without_displacing_a_legal_gpu_program() -> Non
+         candidate.ref,
+     )
+ 
++    assert outcome.disposition is AdmissionDisposition.ADMITTED
++    assert [call.kind for call in calls] == [TransitionKind.PAUSE, TransitionKind.ADMIT]
++    assert components.initial_factors.for_program(resident.ref).tier is MORITier.CPU
++    assert components.initial_factors.for_program(candidate.ref).tier is MORITier.GPU
++
++
++def test_no_fit_admission_keeps_reasoning_victim_lazy_until_completion() -> None:
++    components = build_mori_strategy(MORIConfig(mode=MORIMode.FULL))
++    resident = view("resident", state=ProgramState.ACTIVE, status=ProgramStatus.REASONING, tokens=700)
++    candidate = view("candidate", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400)
++    set_tier(components, resident, MORITier.GPU)
++    calls: list[TransitionRequest] = []
++
++    outcome = components.strategy.handle_admission(
++        snapshot(resident, candidate, hbm=1000),
++        components.initial_factors,
++        accepting_controller(components.strategy, components.initial_factors, calls),
++        candidate.ref,
++    )
++
++    assert outcome.disposition is AdmissionDisposition.QUEUED
++    assert [call.kind for call in calls] == [TransitionKind.MARK_FOR_PAUSE, TransitionKind.QUEUE]
++    resident_factors = components.initial_factors.for_program(resident.ref)
++    assert resident_factors.tier is MORITier.GPU
++    assert resident_factors.pending_tier is MORITier.CPU
++
++
++def test_oversized_admission_does_not_displace_a_legal_gpu_program() -> None:
++    components = build_mori_strategy(MORIConfig(mode=MORIMode.FULL))
++    resident = view("resident", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=400)
++    candidate = view("candidate", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=1100)
++    set_tier(components, resident, MORITier.GPU)
++    calls: list[TransitionRequest] = []
++
++    outcome = components.strategy.handle_admission(
++        snapshot(resident, candidate, hbm=1000),
++        components.initial_factors,
++        accepting_controller(components.strategy, components.initial_factors, calls),
++        candidate.ref,
++    )
++
+     assert outcome.disposition is AdmissionDisposition.QUEUED
+     assert [call.kind for call in calls] == [TransitionKind.QUEUE]
+     assert components.initial_factors.for_program(resident.ref).tier is MORITier.GPU
+@@ -167,6 +208,45 @@ def test_lazy_demotion_remains_gpu_capacity_debt_until_completion() -> None:
+     assert victim_factors.pending_tier is MORITier.CPU
+ 
+ 
++def test_existing_waiter_reclaims_an_acting_gpu_reservation_without_timeout() -> None:
++    components = build_mori_strategy(MORIConfig(mode=MORIMode.FULL))
++    resident = view("resident", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=700)
++    waiting = view("waiting", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400, step_count=1)
++    set_tier(components, resident, MORITier.GPU)
++    set_tier(components, waiting, MORITier.CPU)
++    calls: list[TransitionRequest] = []
++
++    components.strategy.schedule_resume(
++        snapshot(resident, waiting, hbm=1000, dram=2000),
++        components.initial_factors,
++        accepting_controller(components.strategy, components.initial_factors, calls),
++    )
++
++    assert [call.kind for call in calls] == [TransitionKind.PAUSE, TransitionKind.RESUME]
++    assert components.initial_factors.for_program(resident.ref).tier is MORITier.CPU
++    assert components.initial_factors.for_program(waiting.ref).tier is MORITier.GPU
++
++
++def test_existing_waiter_reserves_lazy_reasoning_relief_without_timeout() -> None:
++    components = build_mori_strategy(MORIConfig(mode=MORIMode.FULL))
++    resident = view("resident", state=ProgramState.ACTIVE, status=ProgramStatus.REASONING, tokens=700)
++    waiting = view("waiting", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400, step_count=1)
++    set_tier(components, resident, MORITier.GPU)
++    set_tier(components, waiting, MORITier.CPU)
++    calls: list[TransitionRequest] = []
++
++    components.strategy.schedule_resume(
++        snapshot(resident, waiting, hbm=1000, dram=2000),
++        components.initial_factors,
++        accepting_controller(components.strategy, components.initial_factors, calls),
++    )
++
++    assert [call.kind for call in calls] == [TransitionKind.MARK_FOR_PAUSE]
++    resident_factors = components.initial_factors.for_program(resident.ref)
++    assert resident_factors.tier is MORITier.GPU
++    assert resident_factors.pending_tier is MORITier.CPU
++
++
+ def test_pending_cpu_destinations_prevent_lazy_demotion_overcommit() -> None:
+     components = build_mori_strategy(MORIConfig(mode=MORIMode.FULL))
+     first = view("first", state=ProgramState.ACTIVE, status=ProgramStatus.REASONING, tokens=400)
+@@ -216,6 +296,27 @@ def test_decode_buffer_is_fixed_and_rounded_at_hbm_block_granularity() -> None:
+     assert outcome.disposition is AdmissionDisposition.ADMITTED
+ 
+ 
++def test_capacity_targets_do_not_deduct_unproven_shared_context() -> None:
++    components = build_mori_strategy(MORIConfig(mode=MORIMode.FULL))
++    candidate = replace(
++        view("candidate", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=201),
++        tokens=ProgramTokenObservation(estimated_context_tokens=201, shared_prefix_tokens=80),
++    )
++    fixed = replace(snapshot(candidate, hbm=1000, dram=1000), hbm_block_size_tokens=16, dram_chunk_size_tokens=64)
++    calls: list[TransitionRequest] = []
++
++    outcome = components.strategy.handle_admission(
++        fixed,
++        components.initial_factors,
++        accepting_controller(components.strategy, components.initial_factors, calls),
++        candidate.ref,
++    )
++
++    assert outcome.required_tokens == 304
++    assert components.strategy._dram_target(candidate, fixed) == 256
++    assert outcome.disposition is AdmissionDisposition.ADMITTED
++
++
+ def test_completion_accumulates_cache_hit_report_from_server_observations() -> None:
+     components = build_mori_strategy(MORIConfig(mode=MORIMode.FULL))
+     program = view("program", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=400)
+@@ -305,7 +406,7 @@ def test_overlapping_completions_end_reasoning_only_after_the_last_request() ->
+ 
+ 
+ @pytest.mark.parametrize("tier,steps", [(MORITier.CPU, 1), (MORITier.WAITING, 1), (MORITier.WAITING, 0)])
+-def test_overdue_waiter_precedes_each_normal_promotion_group(tier, steps) -> None:
++def test_elapsed_wait_does_not_override_normal_promotion_order(tier, steps) -> None:
+     components = build_mori_strategy()
+     old = replace(
+         view("old", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=700),
+@@ -322,7 +423,7 @@ def test_overdue_waiter_precedes_each_normal_promotion_group(tier, steps) -> Non
+     components.strategy.schedule_resume(
+         fixed, components.initial_factors, accepting_controller(components.strategy, components.initial_factors, calls)
+     )
+-    assert [call.program for call in calls] == [old.ref]
++    assert [call.program for call in calls] == [young.ref]
+     assert dict(components.strategy.diagnostics(fixed, components.initial_factors)[0].fields)["max_wait_seconds"] == 100
+ 
+ 
+@@ -357,7 +458,7 @@ def test_normal_promotion_preserves_mori_decision_table() -> None:
+     ]
+ 
+ 
+-def test_new_arrival_cannot_bypass_pending_work_between_ticks() -> None:
++def test_new_arrival_joins_the_same_ranked_selection_between_ticks() -> None:
+     components = build_mori_strategy()
+     old = view("old", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=500)
+     new = view("new", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=100)
+@@ -368,5 +469,53 @@ def test_new_arrival_cannot_bypass_pending_work_between_ticks() -> None:
+         accepting_controller(components.strategy, components.initial_factors, calls),
+         new.ref,
+     )
+-    assert outcome.disposition is AdmissionDisposition.QUEUED
+-    assert [call.kind for call in calls] == [TransitionKind.QUEUE]
++    assert outcome.disposition is AdmissionDisposition.ADMITTED
++    assert [call.program for call in calls] == [new.ref, old.ref]
++
++
++def test_later_fitting_candidate_runs_while_first_waits_for_lazy_relief() -> None:
++    components = build_mori_strategy()
++    resident = view("resident", state=ProgramState.ACTIVE, status=ProgramStatus.REASONING, tokens=700)
++    large = view("large", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400, step_count=1)
++    small = view("small", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=50)
++    set_tier(components, resident, MORITier.GPU)
++    set_tier(components, large, MORITier.CPU)
++    calls = []
++    components.strategy.schedule_resume(
++        snapshot(resident, large, small),
++        components.initial_factors,
++        accepting_controller(components.strategy, components.initial_factors, calls),
++    )
++    assert [(call.kind, call.program) for call in calls] == [
++        (TransitionKind.ADMIT, small.ref),
++        (TransitionKind.MARK_FOR_PAUSE, resident.ref),
++    ]
++    assert components.initial_factors.for_program(large.ref).tier is MORITier.CPU
++
++
++def test_over_total_quota_candidate_does_not_block_a_later_fit() -> None:
++    components = build_mori_strategy()
++    large = view("large", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=1100, step_count=1)
++    small = view("small", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=50)
++    set_tier(components, large, MORITier.CPU)
++    calls = []
++    components.strategy.schedule_resume(
++        snapshot(large, small),
++        components.initial_factors,
++        accepting_controller(components.strategy, components.initial_factors, calls),
++    )
++    assert [call.program for call in calls] == [small.ref]
++
++
++def test_decode_buffer_does_not_block_a_prompt_that_fits_the_total_quota() -> None:
++    components = build_mori_strategy()
++    candidate = view("candidate", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=950)
++    calls = []
++    outcome = components.strategy.handle_admission(
++        snapshot(candidate, hbm=1000),
++        components.initial_factors,
++        accepting_controller(components.strategy, components.initial_factors, calls),
++        candidate.ref,
++    )
++    assert outcome.disposition is AdmissionDisposition.ADMITTED
++    assert outcome.required_tokens == 1000

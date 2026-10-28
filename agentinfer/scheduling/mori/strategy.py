@@ -14,6 +14,7 @@ from agentinfer.scheduling.cache_placement import CacheClass, ProgramCacheClassO
 from agentinfer.scheduling.domain import ProgramRef, ProgramState, ProgramStatus, ProgramView
 from agentinfer.scheduling.events import SchedulingEvent, StrategyDiagnostic
 from agentinfer.scheduling.factors import StrategyFactors
+from agentinfer.scheduling.mori.capacity import CapacityClaim, CapacityLedger, FootprintProvider
 from agentinfer.scheduling.mori.config import MORIConfig, MORIMode
 from agentinfer.scheduling.mori.factors import MORIGlobalFactors, MORIProgramFactors, MORITier
 from agentinfer.scheduling.snapshot import SchedulingSnapshot
@@ -40,6 +41,55 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         self._classes: dict[ProgramRef, CacheClass] = {}
         self._cache_class_epoch = 0
         self._observers: list[ProgramCacheClassObserver] = []
+        self._footprints: FootprintProvider | None = None
+
+    @property
+    def uses_serial_lineages(self) -> bool:
+        """Require independent branch owners and one authorized request per owner."""
+        return True
+
+    def bind_footprints(self, provider: FootprintProvider | None) -> None:
+        """Attach native block evidence, or detach it at adapter shutdown."""
+        self._footprints = provider
+
+    def on_context_replaced(self, program: ProgramRef) -> None:
+        """Invalidate previous-prompt block proof and wake placement planning."""
+        if self._footprints is not None:
+            self._footprints.invalidate_footprint(program)
+        if self._factors is not None:
+            self._request_schedule(self._factors, time.monotonic())
+
+    def on_context_growth(
+        self, program: ProgramRef, now: float, *, previous_tokens: int, current_tokens: int, block_size: int
+    ) -> None:
+        """Wake only when rounded context plus decode headroom grows, preserving block proof."""
+        buffer = self.config.decode_buffer_tokens
+        if self._factors is not None and self._round_up(previous_tokens + buffer, block_size) < self._round_up(
+            current_tokens + buffer, block_size
+        ):
+            self._request_schedule(self._factors, now)
+
+    def on_execution_changed(self, factors: MORIFactors, program: ProgramRef, now: float, *, running: bool) -> None:
+        """Accumulate native execution intervals, excluding admission and preemption waits."""
+        sidecar = self._factor(factors, program)
+        if running:
+            if not sidecar.execution_observed:
+                sidecar = replace(
+                    sidecar,
+                    execution_observed=True,
+                    pending_reasoning_seconds=0.0,
+                    reasoning_started_at_monotonic_s=now,
+                )
+            elif sidecar.reasoning_started_at_monotonic_s is None:
+                sidecar = replace(sidecar, reasoning_started_at_monotonic_s=now)
+        elif sidecar.execution_observed and sidecar.reasoning_started_at_monotonic_s is not None:
+            sidecar = replace(
+                sidecar,
+                pending_reasoning_seconds=sidecar.pending_reasoning_seconds
+                + max(0.0, now - sidecar.reasoning_started_at_monotonic_s),
+                reasoning_started_at_monotonic_s=None,
+            )
+        self._set_factor(factors, program, sidecar)
 
     @property
     def cycle_order(self) -> SchedulingCycleOrder:
@@ -104,38 +154,47 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             required = self._gpu_target(view, snapshot)
 
             if view.state is ProgramState.ACTIVE and sidecar.tier is MORITier.GPU:
-                # The exact prompt was already committed to the Program view by
-                # ProgramScheduler. Repair aggregate growth before returning,
-                # but never pretend lazy relief is immediately free capacity.
-                self._repair_gpu_capacity(snapshot, strategy_factors, transitions)
-                self.counters["admission_existing_gpu"] += 1
-                return AdmissionOutcome(
-                    AdmissionDisposition.ADMITTED,
-                    "mori_existing_gpu",
-                    required_tokens=required,
+                # This is a new serial step, not an already executing request.
+                # A larger prompt needs a new lease even on an existing GPU owner.
+                gpu, cpu = self._ledgers(snapshot, strategy_factors)
+                if not view.marked_for_pause and gpu.used <= self._gpu_quota(snapshot):
+                    self.counters["admission_existing_gpu"] += 1
+                    return AdmissionOutcome(
+                        AdmissionDisposition.ADMITTED, "mori_existing_gpu", required_tokens=required
+                    )
+                cpu_claim = self._claim(view, snapshot, gpu=False)
+                target = (
+                    MORITier.CPU
+                    if (
+                        self.config.mode is MORIMode.FULL
+                        and cpu.used + cpu.incremental(cpu_claim) <= self._dram_quota(snapshot)
+                    )
+                    else MORITier.WAITING
                 )
+                self._set_factor(strategy_factors, candidate, replace(sidecar, pending_tier=target))
+                result = transitions.pause(candidate, reason="mori_unstarted_step_needs_lease")
+                self._require_applied(result)
+                self._request_schedule(strategy_factors, snapshot.observed_at_monotonic_s)
+                return AdmissionOutcome(
+                    AdmissionDisposition.QUEUED, "mori_step_capacity_queue", required_tokens=required
+                )
+
+            # Ingress uses only existing slack. Victim selection is coalesced
+            # into the host's next planning cycle, never repeated per waiter.
+            self._request_schedule(strategy_factors, snapshot.observed_at_monotonic_s)
+            gpu, _cpu = self._ledgers(snapshot, strategy_factors)
+            other_waiters = any(
+                p.ref != candidate and p.state is ProgramState.PAUSED and p.status is ProgramStatus.REASONING
+                for p in snapshot.programs
+            )
+            if not other_waiters and gpu.used + gpu.incremental(
+                self._claim(view, snapshot, gpu=True)
+            ) <= self._gpu_quota(snapshot):
+                result = transitions.admit(candidate, reason="mori_free_capacity", backend_id=snapshot.backend_id)
+                self._require_applied(result)
+                return AdmissionOutcome(AdmissionDisposition.ADMITTED, "mori_free_capacity", required_tokens=required)
 
             available = self._remaining_gpu_tokens(snapshot, strategy_factors)
-            waiting_refs = set(snapshot.waiting_programs)
-            has_waiters = any(
-                program.ref != candidate and program.ref in waiting_refs and program.status is ProgramStatus.REASONING
-                for program in snapshot.programs
-            )
-            if available >= required and not has_waiters:
-                result = (
-                    transitions.resume(candidate, reason="mori_promote_gpu", backend_id=snapshot.backend_id)
-                    if view.step_count > 0
-                    else transitions.admit(candidate, reason="mori_new_gpu", backend_id=snapshot.backend_id)
-                )
-                if result.applied:
-                    self.counters[f"admission_{sidecar.tier.value}_to_gpu"] += 1
-                    return AdmissionOutcome(
-                        AdmissionDisposition.ADMITTED,
-                        result.reason,
-                        required_tokens=required,
-                        transitioned_programs=(candidate,),
-                    )
-
             result = transitions.queue(candidate, reason="mori_capacity_queue")
             self._require_applied(result)
             self.counters["admission_queued"] += 1
@@ -157,57 +216,171 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
     ) -> None:
         started = time.thread_time()
         try:
-            available = self._remaining_gpu_tokens(snapshot, strategy_factors)
-            if available < 0:
-                self.counters["promotion_blocked_capacity_debt"] += 1
-                return
-            now = snapshot.observed_at_monotonic_s
-            candidates = [
-                program
-                for program in snapshot.programs
-                if program.state is ProgramState.PAUSED
-                and program.status is ProgramStatus.REASONING
-                and not program.marked_for_pause
-            ]
-            candidates.sort(key=lambda program: self._promotion_key(program, strategy_factors, snapshot, now))
-            oldest = next(
-                (
-                    program
-                    for program in candidates
-                    if self._wait_seconds(program, now) >= self.config.starvation_timeout_seconds
-                    and self._gpu_target(program, snapshot) <= self._gpu_quota(snapshot)
-                ),
-                None,
-            )
-            if oldest is not None and self._gpu_target(oldest, snapshot) > available:
-                # Reserve the next turn for the oldest feasible overdue waiter.
-                # Reasoning victims finish before their reservation is released;
-                # do not fill that promised capacity with smaller newcomers.
-                self._repair_gpu_capacity(
-                    snapshot,
-                    strategy_factors,
-                    transitions,
-                    waiting_reservation=self._gpu_target(oldest, snapshot),
-                )
-                self.counters["starvation_capacity_reclaims"] += 1
-                return
-            for candidate in candidates:
-                required = self._gpu_target(candidate, snapshot)
-                if required > available:
-                    self.counters["promotion_no_fit"] += 1
-                    continue
-                result = (
-                    transitions.resume(candidate.ref, reason="mori_cycle_promote", backend_id=snapshot.backend_id)
-                    if candidate.step_count > 0
-                    else transitions.admit(candidate.ref, reason="mori_cycle_admit", backend_id=snapshot.backend_id)
-                )
-                if not result.applied:
-                    self.counters["promotion_rejected"] += 1
-                    continue
-                available -= required
-                self.counters["promotion_applied"] += 1
+            self._select_pending(snapshot, strategy_factors, transitions)
         finally:
             self.decision_cpu_seconds += time.thread_time() - started
+
+    def _select_pending(
+        self,
+        snapshot: SchedulingSnapshot,
+        strategy_factors: MORIFactors,
+        transitions: TransitionController,
+    ) -> None:
+        """One ranked scan and at most one complete replacement plan per cycle."""
+        snapshot = self._cancel_obsolete_relief(snapshot, strategy_factors, transitions)
+        gpu, cpu = self._ledgers(snapshot, strategy_factors)
+        quota = self._gpu_quota(snapshot)
+        if gpu.used > quota:
+            self.counters["promotion_blocked_capacity_debt"] += 1
+            return
+        now = snapshot.observed_at_monotonic_s
+        escrow = strategy_factors.global_factors.relief_candidate
+        candidates = [
+            p
+            for p in snapshot.programs
+            if p.state is ProgramState.PAUSED and p.status is ProgramStatus.REASONING and not p.marked_for_pause
+        ]
+        candidates.sort(
+            key=lambda p: (
+                0 if p.ref == escrow else 1 if self._wait_seconds(p, now) >= self.config.max_wait_seconds else 2,
+                p.wait_started_at_monotonic_s or 0.0
+                if self._wait_seconds(p, now) >= self.config.max_wait_seconds
+                else 0.0,
+                self._promotion_key(p, strategy_factors, snapshot, now),
+            )
+        )
+        next_waiting = None
+        for candidate in candidates:
+            self.counters["planning_candidates"] += 1
+            claim = self._claim(candidate, snapshot, gpu=True)
+            if claim.tokens > quota:
+                self.counters["promotion_exceeds_total_quota"] += 1
+                continue
+            if gpu.used + gpu.incremental(claim) > quota:
+                next_waiting = next_waiting or candidate
+                if candidate.ref == escrow:
+                    # Already promised space belongs to this finite admission.
+                    # Backfill must not consume it while victims finish reasoning.
+                    break
+                continue
+            result = (transitions.resume if candidate.step_count else transitions.admit)(
+                candidate.ref, reason="mori_cycle_promote", backend_id=snapshot.backend_id
+            )
+            if result.applied:
+                gpu.add(candidate.ref, claim)
+                cpu.remove(candidate.ref)
+                self.counters["promotion_applied"] += 1
+                if candidate.ref == escrow:
+                    self._set_relief(strategy_factors, None)
+                    escrow = None
+        if next_waiting is None:
+            return
+        if escrow is not None:
+            self.counters["promotion_waiting_lazy_relief"] += 1
+            return
+        candidate = next_waiting
+        aged = self._wait_seconds(candidate, now) >= self.config.max_wait_seconds
+        candidate_idle = self._idleness(self._factor(strategy_factors, candidate.ref), now)
+        all_acting = all(p.status is ProgramStatus.ACTING for p in snapshot.programs if p.ref in gpu.claims)
+        victims = []
+        for program in snapshot.programs:
+            sidecar = self._factor(strategy_factors, program.ref)
+            if program.ref not in gpu.claims or sidecar.pending_tier is not None or program.marked_for_pause:
+                continue
+            resident_age = now - sidecar.resident_since if sidecar.resident_since is not None else float("inf")
+            acting_age = (
+                now - sidecar.acting_started_at_monotonic_s
+                if sidecar.acting_started_at_monotonic_s is not None
+                else 0.0
+            )
+            stable = resident_age >= self.config.min_residency_seconds
+            mismatch = self._idleness(sidecar, now) >= candidate_idle + self.config.idleness_margin
+            idle_engine = all_acting and acting_age >= self.config.min_residency_seconds
+            if aged or (program.status is ProgramStatus.ACTING and stable and (mismatch or idle_engine)):
+                victims.append(program)
+        victims.sort(key=lambda p: self._demotion_key(p, strategy_factors, now))
+        projected = gpu.copy()
+        claim = self._claim(candidate, snapshot, gpu=True)
+        selected = []
+        for victim in victims:
+            self.counters["planning_victims"] += 1
+            projected.remove(victim.ref)
+            selected.append(victim)
+            if projected.used + projected.incremental(claim) <= quota:
+                break
+        if not selected or projected.used + projected.incremental(claim) > quota:
+            self.counters["sticky_placement_kept"] += 1
+            deadlines = []
+            if candidate.wait_started_at_monotonic_s is not None:
+                deadlines.append(candidate.wait_started_at_monotonic_s + self.config.max_wait_seconds)
+            for program in snapshot.programs:
+                sidecar = self._factor(strategy_factors, program.ref)
+                if program.ref in gpu.claims and program.status is ProgramStatus.ACTING:
+                    for started in (sidecar.resident_since, sidecar.acting_started_at_monotonic_s):
+                        if started is not None:
+                            deadlines.append(started + self.config.min_residency_seconds)
+            future = [deadline for deadline in deadlines if deadline > now]
+            if future:
+                self._request_schedule(strategy_factors, min(future))
+            return
+        self._set_relief(strategy_factors, candidate.ref)
+        for victim in selected:
+            self._demote(
+                victim,
+                snapshot,
+                strategy_factors,
+                transitions,
+                gpu,
+                cpu,
+                reason="mori_fairness_relief" if aged else "mori_phase_relief",
+                beneficiary=candidate.ref,
+            )
+        # Immediate Acting relief may now admit the beneficiary. No second scan.
+        if gpu.used + gpu.incremental(claim) <= quota:
+            result = (transitions.resume if candidate.step_count else transitions.admit)(
+                candidate.ref, reason="mori_relief_granted", backend_id=snapshot.backend_id
+            )
+            if result.applied:
+                self._set_relief(strategy_factors, None)
+                self.counters["promotion_applied"] += 1
+
+    @staticmethod
+    def _set_relief(factors: MORIFactors, candidate: ProgramRef | None) -> None:
+        """Assign or clear the sole beneficiary of uncommitted lazy relief."""
+        factors.set_global_factors(replace(factors.global_factors, relief_candidate=candidate))
+
+    def _cancel_obsolete_relief(
+        self, snapshot: SchedulingSnapshot, factors: MORIFactors, transitions: TransitionController
+    ) -> SchedulingSnapshot:
+        """Withdraw stale soft plans and return a snapshot reflecting accepted unmarks."""
+        candidate = factors.global_factors.relief_candidate
+        view = snapshot.program(candidate) if candidate is not None else None
+        valid = view is not None and view.state is ProgramState.PAUSED and view.status is ProgramStatus.REASONING
+        cancelled = set()
+        for program in snapshot.programs:
+            sidecar = self._factor(factors, program.ref)
+            if sidecar.relief_for is None or (valid and sidecar.relief_for == candidate):
+                continue
+            if program.marked_for_pause:
+                result = transitions.cancel_pause(program.ref, reason="mori_relief_cancelled")
+                if not result.applied:
+                    continue
+                cancelled.add(program.ref)
+            self._set_factor(factors, program.ref, replace(sidecar, pending_tier=None, relief_for=None))
+        if not valid:
+            self._set_relief(factors, None)
+
+        return (
+            replace(
+                snapshot,
+                programs=tuple(
+                    replace(program, marked_for_pause=False) if program.ref in cancelled else program
+                    for program in snapshot.programs
+                ),
+            )
+            if cancelled
+            else snapshot
+        )
 
     def repair_capacity(
         self,
@@ -217,6 +390,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
     ) -> None:
         started = time.thread_time()
         try:
+            snapshot = self._cancel_obsolete_relief(snapshot, strategy_factors, transitions)
             self._repair_cpu_capacity(snapshot, strategy_factors)
             self._repair_gpu_capacity(snapshot, strategy_factors, transitions)
         finally:
@@ -235,8 +409,22 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
     def on_schedule_cycle_start(self, snapshot: SchedulingSnapshot, strategy_factors: MORIFactors) -> None:
         del snapshot
         current = strategy_factors.global_factors
-        strategy_factors.set_global_factors(replace(current, schedule_cycles=current.schedule_cycles + 1))
+        strategy_factors.set_global_factors(
+            replace(current, schedule_cycles=current.schedule_cycles + 1, schedule_requested_at=None)
+        )
         self.counters["schedule_cycles"] += 1
+
+    def next_check_at(self, strategy_factors: MORIFactors) -> float | None:
+        """Wake on demand or capacity changes without waiting for a periodic tick."""
+        return strategy_factors.global_factors.schedule_requested_at
+
+    @staticmethod
+    def _request_schedule(strategy_factors: MORIFactors, now: float) -> None:
+        current = strategy_factors.global_factors
+        previous = current.schedule_requested_at
+        strategy_factors.set_global_factors(
+            replace(current, schedule_requested_at=now if previous is None else min(previous, now))
+        )
 
     def diagnostics(
         self,
@@ -294,6 +482,23 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                     ),
                     ("cache_class_epoch", self.cache_class_epoch),
                     ("decision_cpu_seconds", self.decision_cpu_seconds),
+                    ("min_residency_seconds", self.config.min_residency_seconds),
+                    ("idleness_margin", self.config.idleness_margin),
+                    ("configured_max_wait_seconds", self.config.max_wait_seconds),
+                    *(
+                        (name, self.counters[name])
+                        for name in (
+                            "planning_program_reads",
+                            "planning_candidates",
+                            "planning_victims",
+                            "sticky_placement_kept",
+                            "promotion_waiting_lazy_relief",
+                            "promotion_applied",
+                            "gpu_debt_waiting_lazy_relief",
+                            "demotion_to_cpu",
+                            "demotion_to_waiting",
+                        )
+                    ),
                 ),
             ),
         )
@@ -301,8 +506,33 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
     def on_request_pending(self, strategy_factors: MORIFactors, event: SchedulingEvent) -> None:
         if event.program is not None:
             self._factor(strategy_factors, event.program)
+            self._request_schedule(strategy_factors, event.occurred_at_monotonic_s)
 
     def on_program_status_changed(self, strategy_factors: MORIFactors, event: SchedulingEvent) -> None:
+        if (
+            event.program is not None
+            and event.current_status is ProgramStatus.ACTING
+            and event.reason == "request_cancelled"
+        ):
+            sidecar = self._factor(strategy_factors, event.program)
+            elapsed = (
+                max(0.0, event.occurred_at_monotonic_s - sidecar.reasoning_started_at_monotonic_s)
+                if sidecar.reasoning_started_at_monotonic_s is not None
+                else 0.0
+            )
+            self._set_factor(
+                strategy_factors,
+                event.program,
+                replace(
+                    sidecar,
+                    pending_reasoning_seconds=(sidecar.pending_reasoning_seconds if sidecar.execution_observed else 0.0)
+                    + elapsed,
+                    reasoning_started_at_monotonic_s=None,
+                    acting_started_at_monotonic_s=event.occurred_at_monotonic_s,
+                ),
+            )
+            self._request_schedule(strategy_factors, event.occurred_at_monotonic_s)
+            return
         if event.program is None or event.current_status is not ProgramStatus.REASONING:
             return
         sidecar = self._factor(strategy_factors, event.program)
@@ -315,6 +545,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             sidecar,
             cycles=cycles,
             pending_reasoning_seconds=0.0,
+            execution_observed=False,
             acting_started_at_monotonic_s=None,
             reasoning_started_at_monotonic_s=(
                 event.occurred_at_monotonic_s if event.current_state is ProgramState.ACTIVE else None
@@ -335,6 +566,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
     def on_request_finished(self, strategy_factors: MORIFactors, event: SchedulingEvent) -> None:
         if event.program is None:
             return
+        self._request_schedule(strategy_factors, event.occurred_at_monotonic_s)
         sidecar = self._factor(strategy_factors, event.program)
         latency = self._event_non_negative_float(event.field("request_latency_seconds"))
         scheduler_wait = self._event_non_negative_float(event.field("scheduler_queue_seconds"))
@@ -359,9 +591,11 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         reasoning_finished = event.current_status is ProgramStatus.ACTING
         reasoning = sidecar.pending_reasoning_seconds
         if reasoning_finished:
-            reasoning = (
+            reasoning = (sidecar.pending_reasoning_seconds if sidecar.execution_observed else 0.0) + (
                 max(0.0, event.occurred_at_monotonic_s - sidecar.reasoning_started_at_monotonic_s)
                 if sidecar.reasoning_started_at_monotonic_s is not None
+                else 0.0
+                if sidecar.execution_observed
                 else max(0.0, latency - scheduler_wait)
             )
         acting_started = event.occurred_at_monotonic_s if reasoning_finished else sidecar.acting_started_at_monotonic_s
@@ -380,6 +614,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
     def on_program_paused(self, strategy_factors: MORIFactors, event: SchedulingEvent) -> None:
         if event.program is None:
             return
+        self._request_schedule(strategy_factors, event.occurred_at_monotonic_s)
         sidecar = self._factor(strategy_factors, event.program)
         target = sidecar.pending_tier or MORITier.WAITING
         self._set_factor(
@@ -391,6 +626,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
     def on_program_released(self, strategy_factors: MORIFactors, event: SchedulingEvent) -> None:
         if event.program is None:
             return
+        self._request_schedule(strategy_factors, event.occurred_at_monotonic_s)
         strategy_factors.remove_program_factors(event.program)
         self._classes.pop(event.program, None)
         self._cache_class_epoch += 1
@@ -408,6 +644,8 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                 sidecar,
                 tier=MORITier.GPU,
                 pending_tier=None,
+                relief_for=None,
+                resident_since=event.occurred_at_monotonic_s,
                 reasoning_started_at_monotonic_s=(
                     event.occurred_at_monotonic_s
                     if event.current_status is ProgramStatus.REASONING
@@ -416,100 +654,121 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             ),
         )
 
-    def _repair_gpu_capacity(
+    def _claim(self, program: ProgramView, snapshot: SchedulingSnapshot, *, gpu: bool) -> CapacityClaim:
+        """Construct a rounded promise, discounting only plausible current-prompt block proof."""
+        tokens = self._gpu_target(program, snapshot) if gpu else self._dram_target(program, snapshot)
+        quantum = (snapshot.hbm_block_size_tokens if gpu else snapshot.dram_chunk_size_tokens) or 1
+        blocks = self._footprints.footprint(program.ref, "gpu" if gpu else "cpu") if self._footprints else frozenset()
+        # More evidence than this prompt can contain means it is stale or from an
+        # unsupported multi-group layout. Do not guess which subset is current.
+        if len(blocks) * quantum > self._round_up(program.tokens.estimated_context_tokens, quantum):
+            blocks = frozenset()
+        return CapacityClaim(tokens, blocks)
+
+    def _ledgers(self, snapshot: SchedulingSnapshot, factors: MORIFactors) -> tuple[CapacityLedger, CapacityLedger]:
+        """Build GPU commitments and CPU commitments plus pending destinations in one scan."""
+        gpu = CapacityLedger(snapshot.hbm_block_size_tokens or 1)
+        cpu = CapacityLedger(snapshot.dram_chunk_size_tokens or 1)
+        for program in snapshot.programs:
+            self.counters["planning_program_reads"] += 1
+            sidecar = self._factor(factors, program.ref)
+            if sidecar.tier is MORITier.GPU:
+                gpu.add(program.ref, self._claim(program, snapshot, gpu=True))
+            if sidecar.tier is MORITier.CPU or sidecar.pending_tier is MORITier.CPU:
+                cpu.add(program.ref, self._claim(program, snapshot, gpu=False))
+        return gpu, cpu
+
+    def _demote(
         self,
+        victim: ProgramView,
         snapshot: SchedulingSnapshot,
         factors: MORIFactors,
         transitions: TransitionController,
+        gpu: CapacityLedger,
+        cpu: CapacityLedger,
         *,
-        waiting_reservation: int = 0,
-    ) -> None:
-        """Reclaim quota debt or a feasible overdue waiter's next turn, without early relief."""
-        deficit = max(0, self._gpu_reserved_tokens(snapshot, factors) + waiting_reservation - self._gpu_quota(snapshot))
-        if deficit == 0:
-            return
-        promised = sum(
-            self._gpu_target(program, snapshot)
-            for program in snapshot.programs
-            if (sidecar := self._factor(factors, program.ref)).tier is MORITier.GPU
-            and sidecar.pending_tier in (MORITier.CPU, MORITier.WAITING)
+        reason: str,
+        beneficiary: ProgramRef | None = None,
+    ) -> bool:
+        """Reserve a destination; only finished Acting leases release GPU commitments now."""
+        cpu_claim = self._claim(victim, snapshot, gpu=False)
+        target = (
+            MORITier.CPU
+            if (
+                self.config.mode is MORIMode.FULL
+                and cpu.used + cpu.incremental(cpu_claim) <= self._dram_quota(snapshot)
+            )
+            else MORITier.WAITING
         )
-        needed = max(0, deficit - promised)
-        if needed == 0:
+        previous = self._factor(factors, victim.ref)
+        self._set_factor(factors, victim.ref, replace(previous, pending_tier=target, relief_for=beneficiary))
+        operation = transitions.pause if victim.status is ProgramStatus.ACTING else transitions.mark_for_pause
+        result = operation(victim.ref, reason=reason)
+        if not result.applied:
+            self._set_factor(factors, victim.ref, previous)
+            self.counters["demotion_rejected"] += 1
+            return False
+        if target is MORITier.CPU:
+            cpu.add(victim.ref, cpu_claim)
+        if victim.status is ProgramStatus.ACTING:
+            gpu.remove(victim.ref)
+        self.counters[f"demotion_to_{target.value}"] += 1
+        return True
+
+    def _repair_gpu_capacity(
+        self, snapshot: SchedulingSnapshot, factors: MORIFactors, transitions: TransitionController
+    ) -> None:
+        """Plan enough marginal relief to cover hard debt without spending pending releases."""
+        gpu, cpu = self._ledgers(snapshot, factors)
+        quota = self._gpu_quota(snapshot)
+        if gpu.used <= quota:
+            return
+        projected = gpu.copy()
+        for program in snapshot.programs:
+            sidecar = self._factor(factors, program.ref)
+            if sidecar.pending_tier is not None:
+                projected.remove(program.ref)
+        if projected.used <= quota:
             self.counters["gpu_debt_waiting_lazy_relief"] += 1
             return
-        now = snapshot.observed_at_monotonic_s
         victims = [
-            program
-            for program in snapshot.programs
-            if program.state is ProgramState.ACTIVE
-            and program.backend_id == snapshot.backend_id
-            and self._factor(factors, program.ref).tier is MORITier.GPU
-            and self._factor(factors, program.ref).pending_tier is None
-            and not program.marked_for_pause
+            p
+            for p in snapshot.programs
+            if p.ref in gpu.claims and not p.marked_for_pause and self._factor(factors, p.ref).pending_tier is None
         ]
-        victims.sort(key=lambda program: self._demotion_key(program, factors, now))
+        victims.sort(key=lambda p: self._demotion_key(p, factors, snapshot.observed_at_monotonic_s))
         for victim in victims:
-            target = self._lower_tier(victim, snapshot, factors)
-            sidecar = self._factor(factors, victim.ref)
-            self._set_factor(factors, victim.ref, replace(sidecar, pending_tier=target))
-            result = (
-                transitions.pause(victim.ref, reason="mori_capacity_demotion")
-                if victim.status is ProgramStatus.ACTING
-                else transitions.mark_for_pause(victim.ref, reason="mori_lazy_capacity_demotion")
-            )
-            if not result.applied:
-                self._set_factor(factors, victim.ref, sidecar)
-                self.counters["demotion_rejected"] += 1
-                continue
-            needed -= self._gpu_target(victim, snapshot)
-            self.counters[f"demotion_to_{target.value}"] += 1
-            if needed <= 0:
+            self.counters["planning_victims"] += 1
+            if self._demote(victim, snapshot, factors, transitions, gpu, cpu, reason="mori_capacity_debt"):
+                projected.remove(victim.ref)
+            if projected.used <= quota:
                 return
         self.counters["gpu_capacity_debt_unresolved"] += 1
 
     def _repair_cpu_capacity(self, snapshot: SchedulingSnapshot, factors: MORIFactors) -> None:
+        """Relinquish lower-priority CPU claims until the logical union fits its quota."""
         if self.config.mode is MORIMode.PLACEMENT_ONLY:
             return
+        _gpu, cpu = self._ledgers(snapshot, factors)
         quota = self._dram_quota(snapshot)
-        used = self._cpu_reserved_tokens(snapshot, factors)
-        if used <= quota:
+        if cpu.used <= quota:
             return
-        now = snapshot.observed_at_monotonic_s
-        victims: list[tuple[ProgramView, bool]] = []
-        for program in snapshot.programs:
-            sidecar = self._factor(factors, program.ref)
-            if sidecar.tier is MORITier.CPU:
-                victims.append((program, False))
-            elif sidecar.pending_tier is MORITier.CPU:
-                victims.append((program, True))
+        victims = [p for p in snapshot.programs if p.ref in cpu.claims]
         victims.sort(
-            key=lambda item: (
-                -self._idleness(self._factor(factors, item[0].ref), now),
-                item[0].ref.program_id,
-                item[0].ref.generation,
-            )
+            key=lambda p: (-self._idleness(self._factor(factors, p.ref), snapshot.observed_at_monotonic_s), p.ref)
         )
-        for victim, pending in victims:
+        for victim in victims:
             sidecar = self._factor(factors, victim.ref)
             replacement = (
-                replace(sidecar, pending_tier=MORITier.WAITING) if pending else replace(sidecar, tier=MORITier.WAITING)
+                replace(sidecar, tier=MORITier.WAITING)
+                if sidecar.tier is MORITier.CPU
+                else replace(sidecar, pending_tier=MORITier.WAITING)
             )
             self._set_factor(factors, victim.ref, replacement)
-            used -= self._dram_target(victim, snapshot)
+            cpu.remove(victim.ref)
             self.counters["cpu_capacity_to_waiting"] += 1
-            if used <= quota:
+            if cpu.used <= quota:
                 return
-
-    def _lower_tier(self, candidate: ProgramView, snapshot: SchedulingSnapshot, factors: MORIFactors) -> MORITier:
-        if self.config.mode is MORIMode.PLACEMENT_ONLY:
-            return MORITier.WAITING
-        required = self._dram_target(candidate, snapshot)
-        return (
-            MORITier.CPU
-            if self._cpu_reserved_tokens(snapshot, factors) + required <= self._dram_quota(snapshot)
-            else MORITier.WAITING
-        )
 
     def _promotion_key(
         self,
@@ -517,16 +776,12 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         factors: MORIFactors,
         snapshot: SchedulingSnapshot,
         now: float,
-    ) -> tuple[int, float, int, int, float, str, int]:
-        """Use oldest-first priority after the wait bound, then the normal MORI order."""
+    ) -> tuple[int, int, float, str, int]:
+        """Order by MORI tier, new context size, idleness and stable identity."""
         tier = self._factor(factors, program.ref).tier
         priority = 0 if tier is MORITier.CPU else 1 if program.step_count > 0 else 2
         new_context = self._gpu_target(program, snapshot) if priority == 2 else 0
-        waited = self._wait_seconds(program, now)
-        overdue = waited >= self.config.starvation_timeout_seconds
         return (
-            0 if overdue else 1,
-            -waited if overdue else 0.0,
             priority,
             new_context,
             self._idleness(self._factor(factors, program.ref), now),
@@ -557,24 +812,20 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         return self._gpu_quota(snapshot) - self._gpu_reserved_tokens(snapshot, factors)
 
     def _gpu_reserved_tokens(self, snapshot: SchedulingSnapshot, factors: MORIFactors) -> int:
-        return sum(
-            self._gpu_target(program, snapshot)
-            for program in snapshot.programs
-            if self._factor(factors, program.ref).tier is MORITier.GPU
-        )
+        return self._ledgers(snapshot, factors)[0].used
 
     def _cpu_reserved_tokens(self, snapshot: SchedulingSnapshot, factors: MORIFactors) -> int:
-        return sum(
-            self._dram_target(program, snapshot)
-            for program in snapshot.programs
-            if (sidecar := self._factor(factors, program.ref)).tier is MORITier.CPU
-            or sidecar.pending_tier is MORITier.CPU
-        )
+        return self._ledgers(snapshot, factors)[1].used
 
     def _gpu_target(self, program: ProgramView, snapshot: SchedulingSnapshot) -> int:
         block_size = snapshot.hbm_block_size_tokens or program.tokens.block_size_tokens or 1
         context = max(0, program.tokens.estimated_context_tokens)
-        return self._round_up(context + self.config.decode_buffer_tokens, block_size)
+        rounded_context = self._round_up(context, block_size)
+        target = self._round_up(context + self.config.decode_buffer_tokens, block_size)
+        # The speculative decode buffer alone must not make a physically
+        # feasible prompt wait forever. Native max-model-length checks and
+        # allocation remain authoritative for actual growth.
+        return max(rounded_context, min(target, self._gpu_quota(snapshot)))
 
     @staticmethod
     def _dram_target(program: ProgramView, snapshot: SchedulingSnapshot) -> int:
@@ -608,6 +859,11 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         elif sidecar.reasoning_started_at_monotonic_s is not None:
             has_partial = True
             partial_reasoning = max(0.0, now - sidecar.reasoning_started_at_monotonic_s)
+            if sidecar.execution_observed:
+                partial_reasoning += sidecar.pending_reasoning_seconds
+        elif sidecar.execution_observed:
+            has_partial = True
+            partial_reasoning = sidecar.pending_reasoning_seconds
         keep = max(0, self.config.window_size - int(has_partial))
         cycles = sidecar.cycles[-keep:] if keep else ()
         reasoning = sum(item[0] for item in cycles) + partial_reasoning

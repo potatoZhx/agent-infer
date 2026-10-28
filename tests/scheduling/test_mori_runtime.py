@@ -68,55 +68,77 @@ def test_server_observed_stream_and_final_usage_replace_prompt_estimate() -> Non
     assert completed.source is TokenObservationSource.BACKEND_USAGE
 
 
-def test_same_program_requests_overlap_and_act_only_after_the_last_completion() -> None:
+def test_same_external_program_overlaps_have_independent_owners() -> None:
     runtime = scheduler()
     lead = AgentIdentity("task:lead", task_id="task", agent_id="lead", agent_role="lead")
-
-    assert runtime.on_request_arrival("lead-1", lead, 100, backend(), "lead") is True
-    assert runtime.on_request_arrival("lead-2", lead, 120, backend(), "overlap") is True
-
+    assert runtime.on_request_arrival("lead-1", lead, 100, backend(), "lead")
+    assert runtime.on_request_arrival("lead-2", lead, 120, backend(), "overlap")
     lead_ref = runtime.program_ref_for_request("lead-1")
-    assert lead_ref is not None
-    assert runtime.program_ref_for_request("lead-2") == lead_ref
-    assert runtime.registry.require(lead_ref).status is ProgramStatus.REASONING
-
+    overlap_ref = runtime.program_ref_for_request("lead-2")
+    assert lead_ref != overlap_ref
     runtime.on_request_completion("lead-2", 140)
-    assert runtime.program_ref_for_request("lead-1") == lead_ref
-    assert runtime.program_ref_for_request("lead-2") is None
+    assert runtime.registry.get(overlap_ref) is None
     assert runtime.registry.require(lead_ref).status is ProgramStatus.REASONING
-    assert runtime.on_response_completion("task:lead", ProgramLifecycle.TERMINAL) is False
-    assert runtime.registry.current_ref("task:lead") == lead_ref
-
+    assert not runtime.on_response_completion("task:lead", ProgramLifecycle.TERMINAL)
     runtime.on_request_completion("lead-1", 130)
-    assert runtime.program_ref_for_request("lead-1") is None
     assert runtime.registry.require(lead_ref).status is ProgramStatus.ACTING
 
 
-@pytest.mark.parametrize("resident_finished", [True, False])
-def test_overdue_waiter_eventually_reclaims_a_sticky_gpu_reservation(resident_finished) -> None:
+def test_lazy_demotion_completion_wakes_waiter_before_the_next_periodic_tick() -> None:
     runtime = scheduler()
     capacity = backend(208)
     with patch("agentinfer.scheduling.runtime.time.monotonic", return_value=0.0) as clock:
         assert runtime.on_request_arrival("resident", AgentIdentity("resident"), 100, capacity, "resident")
-        if resident_finished:
-            runtime.on_request_completion("resident", 100)
+        runtime.schedule_cycle(capacity)
         clock.return_value = 1.0
         assert not runtime.on_request_arrival("old", AgentIdentity("old"), 100, capacity, "old")
         old = runtime.program_ref_for_request("old")
-        for tick in range(2, 62, 5):
-            clock.return_value = float(tick)
-            runtime.schedule_cycle(capacity)
-            assert runtime.consume_admitted_requests() == ()
-        clock.return_value = 62.0
-        assert not runtime.on_request_arrival("young", AgentIdentity("young"), 1, capacity, "young")
+        assert runtime.needs_schedule_cycle(1.0)
         runtime.schedule_cycle(capacity)
         assert runtime.consume_admitted_requests() == ()
         assert runtime.registry.require(old).wait_started_at_monotonic_s == 1.0
-        if not resident_finished:
-            resident = runtime.program_ref_for_request("resident")
-            assert runtime.registry.require(resident).marked_for_pause
-            runtime.on_request_completion("resident", 100)
-        clock.return_value = 68.0
+        resident = runtime.program_ref_for_request("resident")
+        assert not runtime.registry.require(resident).marked_for_pause
+        clock.return_value = 31.0
+        runtime.schedule_cycle(capacity)
+        assert runtime.registry.require(resident).marked_for_pause
+        assert not runtime.needs_schedule_cycle(31.01)
+        clock.return_value = 31.1
+        runtime.on_request_completion("resident", 100)
+        assert runtime.needs_schedule_cycle(31.1)
         runtime.schedule_cycle(capacity)
         assert [entry.request_id for entry, _ in runtime.consume_admitted_requests()] == ["old"]
         assert runtime.registry.require(old).wait_started_at_monotonic_s is None
+        assert not runtime.needs_schedule_cycle(31.2)
+
+
+def test_arrival_can_use_free_capacity_behind_a_non_fitting_waiter() -> None:
+    runtime = scheduler()
+    capacity = backend(1008)
+    with patch("agentinfer.scheduling.runtime.time.monotonic", return_value=0.0) as clock:
+        assert runtime.on_request_arrival("resident", AgentIdentity("resident"), 700, capacity, "resident")
+        runtime.schedule_cycle(capacity)
+        clock.return_value = 1.0
+        assert not runtime.on_request_arrival("large", AgentIdentity("large"), 400, capacity, "large")
+        clock.return_value = 1.1
+        assert not runtime.on_request_arrival("small", AgentIdentity("small"), 50, capacity, "small")
+        runtime.schedule_cycle(capacity)
+        assert [entry.request_id for entry, _ in runtime.consume_admitted_requests()] == ["small"]
+        assert runtime.request_pool.waiting_request_ids == ("large",)
+
+
+def test_completion_wakes_selection_without_forcing_a_short_gap_demotion() -> None:
+    runtime = scheduler()
+    capacity = backend(1008)
+    with patch("agentinfer.scheduling.runtime.time.monotonic", return_value=0.0) as clock:
+        assert runtime.on_request_arrival("resident", AgentIdentity("resident"), 700, capacity, "resident")
+        runtime.schedule_cycle(capacity)
+        clock.return_value = 1.0
+        assert not runtime.on_request_arrival("large", AgentIdentity("large"), 400, capacity, "large")
+        clock.return_value = 1.1
+        runtime.on_request_completion("resident", 700)
+        assert not runtime.on_request_arrival("small", AgentIdentity("small"), 50, capacity, "small")
+        assert runtime.needs_schedule_cycle(1.1)
+        runtime.schedule_cycle(capacity)
+        assert [entry.request_id for entry, _ in runtime.consume_admitted_requests()] == ["small"]
+        assert runtime.request_pool.waiting_request_ids == ("large",)

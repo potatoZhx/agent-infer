@@ -40,6 +40,7 @@ class MORIHBMPolicy:
         owner = self.runtime_state.program_for_request(owner_request_id)
         if owner is None:
             return
+        self.runtime_state.footprints.add("gpu", block_id, owner)
         owners = set(self.index.owners(block_id))
         if owner in owners:
             return
@@ -61,9 +62,11 @@ class MORIHBMPolicy:
         self.index.update_owners(block_id, self._owners(owner_request_ids))
 
     def on_block_removed(self, block_id: int) -> None:
+        self.runtime_state.footprints.remove_block("gpu", block_id)
         self.index.remove(block_id)
 
     def on_cache_reset(self) -> None:
+        self.runtime_state.footprints.clear("gpu")
         self.index.clear()
 
     def close(self) -> None:

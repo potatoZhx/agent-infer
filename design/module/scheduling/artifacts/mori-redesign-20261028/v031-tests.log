@@ -1,0 +1,13 @@
+........................................................................ [ 17%]
+........................................................................ [ 34%]
+........................................................................ [ 52%]
+........................................................................ [ 69%]
+........................................................................ [ 86%]
+.......................................................                  [100%]
+=============================== warnings summary ===============================
+../../../../zx-envs/agentinfer-vllm-0.31.0/lib/python3.12/site-packages/torch/jit/_script.py:365: 14 warnings
+  /data/zx-envs/agentinfer-vllm-0.31.0/lib/python3.12/site-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+415 passed, 5 deselected, 14 warnings in 49.55s

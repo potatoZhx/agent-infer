@@ -14,7 +14,7 @@ asynchronous D2H/H2D transfers; it does not use the `OffloadingConnector` shared
 - the server middleware can resolve a Program identity for every request.
 
 Full mode fails startup if the HBM hook, SimpleCPU hook, or DRAM capacity snapshot is missing. At runtime, missing or
-malformed identity and overlapping requests for one Program receive a terminal request error. Invalid victim advice
+malformed identity receives a terminal request error. Overlapping requests use the branch rules below. Invalid victim advice
 falls back to the native free-queue order with a warning and a fallback counter. To evaluate placement alone,
 explicitly set `"mode":"placement_only"`.
 
@@ -102,12 +102,47 @@ The SimpleCPU adapter closes the following loop at startup and runtime:
 MORI does not actively prefetch. CPU tier is a protection priority; a later inference still triggers SimpleCPU's native
 on-demand H2D load.
 
-Queued requests older than `mori.starvation_timeout_seconds` (default `60.0`, finite and positive) take precedence
-across all promotion groups, oldest first. If the oldest feasible request cannot fit, MORI reserves its next turn by
-demoting idle GPU residents or marking reasoning residents for demotion after completion. New arrivals join the
-pending queue. This serving fairness extension can change sticky placement after the timeout; it is not a bound on
-response time. It still requires a request to fit the full GPU quota and in-flight reasoning requests to complete.
-Diagnostics include `max_wait_seconds`; normal MORI priority and idleness ordering apply before the timeout.
+MORI keeps a placement while it fits and there is no eligible replacement. Events wake a shared planning cycle;
+arrivals use existing slack without scanning for victims. Normal queue order is CPU returns, other returns, then new
+Programs by context size and relative idleness. A replacement must have a complete feasible victim plan. Acting
+victims require stable residence and either an idleness advantage or an otherwise idle GPU. An aged waiter may request
+lazy relief from Reasoning victims. The beneficiary owns the promised space until its admission or cancellation.
+Reasoning victims retain their GPU reservation until completion or confirmed native cancellation. Queued serial
+followers cannot prolong that drain.
+
+The engineering defaults in `agentcache.mori` are `min_residency_seconds=1.0`, `idleness_margin=0.05`, and
+`max_wait_seconds=30.0`. These extensions are not paper parameters. `max_wait_seconds` triggers fairness selection;
+it is not a maximum latency guarantee because running inference must finish. The old
+`mori.starvation_timeout_seconds` setting remains unsupported. Diagnostics distinguish observed `max_wait_seconds`
+from `configured_max_wait_seconds`.
+
+MORI requires one native KV cache group. Effective HBM capacity excludes the permanent null block. A request whose
+prompt plus maximum output exceeds that capacity is rejected before admission. The normal logical claim rounds
+context plus 100 decode tokens to HBM blocks; speculative headroom is capped by total capacity. CPU claims round
+context to CPU chunks. Shared capacity is discounted only with current-prompt native block identity evidence;
+unknown or invalidated evidence is charged conservatively. CPU placement does not certify that a complete CPU copy
+is ready. Native refcounts, transfer fences, allocation and recomputation remain authoritative.
+
+### Concurrent branches and lifecycle
+
+A normal serial client may keep its existing Program identity. If another request arrives before the previous one
+finishes, MORI creates a temporary independent owner. Completing that owner releases its protection, while native
+cache contents remain available for opportunistic reuse. It does not infer which result the application will adopt.
+The next real prompt determines the new context, including truncation or context switches.
+
+For a branch that should retain protection between rounds, send a stable `lineage_id` in canonical identity metadata:
+
+```json
+{"vllm_xargs":{"agentic_context":"{\"program_id\":\"session:lead\",\"lineage_id\":\"research\"}"}}
+```
+
+Requests within the same explicit lineage serialize. Different lineages have independent context, timing, tier and
+lifecycle. These internal owners do not create application parent-blocking relationships. Continue to use separate
+agent identities for actual subagents. The API middleware generates an internal `lifecycle_token` per attempt;
+clients should not set it. A delayed terminal receipt can release only that attempt's latest idle lineage.
+
+See the [2026-10-28 redesign and acceptance contract](../../../design/module/scheduling/mori-redesign-20261028.zh-CN.md)
+for the paper comparison, defaults, evidence and unrun GPU validation.
 
 ## Startup checks and troubleshooting
 

@@ -1,0 +1,102 @@
+........F........F......                                                 [100%]
+=================================== FAILURES ===================================
+______ test_anthropic_bridge_without_replay_sampling_keeps_vllm_defaults _______
+
+    def test_anthropic_bridge_without_replay_sampling_keeps_vllm_defaults() -> None:
+        from vllm.entrypoints.anthropic.protocol import AnthropicMessagesRequest
+        from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
+    
+        api_adapter._install_anthropic_identity_bridge()
+        anthropic_request = AnthropicMessagesRequest.model_validate(
+            {
+                "model": "qwen",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 8,
+                "metadata": {"caller": "benchkit"},
+            }
+        )
+    
+>       chat_request = AnthropicServingMessages._convert_anthropic_to_openai_request(anthropic_request)
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: type object 'AnthropicServingMessages' has no attribute '_convert_anthropic_to_openai_request'
+
+tests/agentcache/core/test_vllm_api_adapter.py:74: AttributeError
+__ test_identity_middleware_carries_anthropic_headers_to_internal_vllm_xargs ___
+
+    def test_identity_middleware_carries_anthropic_headers_to_internal_vllm_xargs() -> None:
+        """Anthropic Messages must preserve canonical identity through vLLM's Chat conversion."""
+        from vllm.entrypoints.anthropic.protocol import AnthropicMessagesRequest
+        from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
+    
+        captured_body = b""
+    
+        async def app(scope, receive, send) -> None:
+            nonlocal captured_body
+            message = await receive()
+            body = message.get("body")
+            assert isinstance(body, bytes)
+            captured_body = body
+    
+        middleware = AgentCacheIdentityMiddleware(app)
+        request_payload = {
+            "model": "qwen",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 8,
+            "metadata": {
+                "caller": "benchkit",
+                "_agentinfer_replay_sampling": {
+                    "seed": 7,
+                    "min_tokens": 8,
+                    "ignore_eos": True,
+                },
+            },
+        }
+        inbound = [
+            {
+                "type": "http.request",
+                "body": json.dumps(request_payload).encode(),
+                "more_body": False,
+            }
+        ]
+    
+        async def receive() -> dict[str, object]:
+            return inbound.pop(0)
+    
+        async def send(message: dict[str, object]) -> None:
+            return None
+    
+        asyncio.run(
+            middleware(
+                {
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/v1/messages",
+                    "headers": [
+                        (b"x-claude-code-session-id", b"session-a"),
+                        (b"x-claude-code-agent-id", b"child-a"),
+                    ],
+                },
+                receive,
+                send,
+            )
+        )
+    
+        adapted_payload = json.loads(captured_body)
+        assert adapted_payload["metadata"]["caller"] == "benchkit"
+        assert "vllm_xargs" not in adapted_payload
+        anthropic_request = AnthropicMessagesRequest.model_validate(adapted_payload)
+>       chat_request = AnthropicServingMessages._convert_anthropic_to_openai_request(anthropic_request)
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: type object 'AnthropicServingMessages' has no attribute '_convert_anthropic_to_openai_request'
+
+tests/agentcache/core/test_vllm_api_adapter.py:303: AttributeError
+=============================== warnings summary ===============================
+../../../../zx-envs/agentinfer-vllm-0.31.0/lib/python3.12/site-packages/torch/jit/_script.py:365: 14 warnings
+  /data/zx-envs/agentinfer-vllm-0.31.0/lib/python3.12/site-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/agentcache/core/test_vllm_api_adapter.py::test_anthropic_bridge_without_replay_sampling_keeps_vllm_defaults
+FAILED tests/agentcache/core/test_vllm_api_adapter.py::test_identity_middleware_carries_anthropic_headers_to_internal_vllm_xargs
+2 failed, 22 passed, 14 warnings in 46.21s

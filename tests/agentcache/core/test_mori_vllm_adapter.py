@@ -277,7 +277,7 @@ def test_full_adapter_cleans_process_state_when_native_unregister_fails() -> Non
 
 
 @pytest.mark.parametrize("bridge_type", [AgentCacheSyncSchedulerBridge, AgentCacheAsyncSchedulerBridge])
-@pytest.mark.parametrize("invalid", ["missing", "malformed"])
+@pytest.mark.parametrize("invalid", ["missing", "malformed", "oversized"])
 def test_mori_rejects_only_invalid_request_and_delivers_terminal_output(bridge_type, invalid) -> None:
     config = SimpleNamespace(
         scheduler_config=SimpleNamespace(async_scheduling=bridge_type is AgentCacheAsyncSchedulerBridge),
@@ -307,6 +307,10 @@ def test_mori_rejects_only_invalid_request_and_delivers_terminal_output(bridge_t
     identity = {"agentic_context": {"program_id": "program"}}
     good = request("good", identity)
     bad = request("bad", None if invalid == "missing" else {"agentic_context": "{"})
+    if invalid == "oversized":
+        bad = request("bad", identity)
+        bad.num_prompt_tokens = 1601
+        bad.num_tokens = 1601
     with (
         patch.object(Scheduler, "__init__", initialize),
         patch.object(AsyncScheduler, "__init__", initialize),
@@ -378,14 +382,16 @@ def test_mori_bridge_accepts_overlapping_requests_for_one_program(bridge_type) -
 
         first_ref = MORI_RUNTIME_STATE.program_for_request("first")
         assert first_ref is not None
-        assert MORI_RUNTIME_STATE.program_for_request("second") == first_ref
+        second_ref = MORI_RUNTIME_STATE.program_for_request("second")
+        assert second_ref is not None and second_ref != first_ref
         assert bridge.requests == {"first": first, "second": second}
 
         first_output = {7: EngineCoreOutputs(outputs=[EngineCoreOutput("first", [], finish_reason=FinishReason.STOP)])}
         bridge._agentcache.after_output(bridge, first_output, {})
         assert MORI_RUNTIME_STATE.program_for_request("first") is None
-        assert MORI_RUNTIME_STATE.program_for_request("second") == first_ref
-        assert bridge._agentcache.controller.registry.require(first_ref).status is ProgramStatus.REASONING
+        assert MORI_RUNTIME_STATE.program_for_request("second") == second_ref
+        assert bridge._agentcache.controller.registry.require(second_ref).status is ProgramStatus.REASONING
+        assert bridge._agentcache.controller.registry.require(first_ref).status is ProgramStatus.ACTING
 
         second_output = {
             7: EngineCoreOutputs(outputs=[EngineCoreOutput("second", [], finish_reason=FinishReason.STOP)])
@@ -426,7 +432,7 @@ def test_retained_abort_uses_host_contract_and_releases_program_binding(monkeypa
         parallel_config=SimpleNamespace(data_parallel_index=0),
         additional_config={"agentcache": {"strategy": "mori", "mori": {"mode": "placement_only"}}},
     )
-    hooks = _VllmAdmissionHooks(owner, config, SimpleNamespace(num_blocks=1), 16)
+    hooks = _VllmAdmissionHooks(owner, config, SimpleNamespace(num_blocks=13), 16)
     request = SimpleNamespace(
         request_id="retained",
         client_index=7,
@@ -436,8 +442,17 @@ def test_retained_abort_uses_host_contract_and_releases_program_binding(monkeypa
         events=[],
     )
     native = []
+    resident = SimpleNamespace(
+        request_id="resident",
+        num_prompt_tokens=100,
+        sampling_params=SimpleNamespace(extra_args={"agentic_context": {"program_id": "resident"}}),
+        trace_headers={},
+        events=[],
+    )
+    # Retain because capacity is occupied, not because the prompt can never fit.
+    hooks.add_request(owner, resident, native.append)
     hooks.add_request(owner, request, native.append)
-    assert not native
+    assert native == [resident]
     assert MORI_RUNTIME_STATE.program_for_request("retained") is not None
     finished = hooks.finish_requests(owner, "retained", RequestStatus.FINISHED_ABORTED, lambda ids, status: [])
     assert finished == ([request] if returns_requests else [("retained", 7)])
@@ -445,6 +460,64 @@ def test_retained_abort_uses_host_contract_and_releases_program_binding(monkeypa
     assert hooks.controller.retained_request_count == 0
     assert hooks.controller.program_ref_for_request("retained") is None
     assert MORI_RUNTIME_STATE.program_for_request("retained") is None
+    hooks.close()
+
+
+@pytest.mark.parametrize("returns_requests", [False, True])
+def test_running_abort_keeps_lease_until_native_finish_confirmation(monkeypatch, returns_requests) -> None:
+    """A cancellation intent alone cannot convert an executing lease into Acting."""
+    monkeypatch.setattr("agentinfer.agentcache.core.scheduler._NATIVE_FINISH_RETURNS_REQUESTS", returns_requests)
+    owner = SimpleNamespace(requests={}, kv_cache_manager=None)
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_index=0),
+        additional_config={"agentcache": {"strategy": "mori", "mori": {"mode": "placement_only"}}},
+    )
+    hooks = _VllmAdmissionHooks(owner, config, SimpleNamespace(num_blocks=33), 16)
+    request = SimpleNamespace(
+        request_id="running",
+        client_index=7,
+        num_prompt_tokens=100,
+        num_tokens=120,
+        sampling_params=SimpleNamespace(extra_args={"agentic_context": {"program_id": "program"}}),
+        trace_headers={},
+        events=[],
+    )
+    hooks.add_request(owner, request, lambda req: owner.requests.update({req.request_id: req}))
+    ref = hooks.controller.program_ref_for_request("running")
+    assert hooks.finish_requests(owner, "running", RequestStatus.FINISHED_ABORTED, lambda ids, status: []) == []
+    assert hooks.controller.program_ref_for_request("running") == ref
+    assert hooks.controller.registry.require(ref).status is ProgramStatus.REASONING
+    receipt = [request] if returns_requests else [("running", 7)]
+    hooks.finish_requests(owner, "running", RequestStatus.FINISHED_ABORTED, lambda ids, status: receipt)
+    assert hooks.controller.program_ref_for_request("running") is None
+    assert hooks.controller.registry.require(ref).status is ProgramStatus.ACTING
+    hooks.close()
+
+
+@pytest.mark.parametrize(("prompt", "output", "accepted"), [(191, 1, True), (192, 1, False), (193, 1, False)])
+def test_mori_capacity_excludes_null_block_and_checks_decode_upper_bound(prompt, output, accepted) -> None:
+    """A single request must fit the allocatable pool through its maximum decode."""
+    owner = SimpleNamespace(requests={}, kv_cache_manager=None)
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_index=0),
+        additional_config={"agentcache": {"strategy": "mori", "mori": {"mode": "placement_only"}}},
+    )
+    hooks = _VllmAdmissionHooks(owner, config, SimpleNamespace(num_blocks=13), 16)
+    request = SimpleNamespace(
+        request_id="request",
+        client_index=7,
+        num_prompt_tokens=prompt,
+        sampling_params=SimpleNamespace(max_tokens=output, extra_args={"agentic_context": {"program_id": "program"}}),
+        trace_headers={},
+        events=[],
+    )
+    native = []
+    hooks.add_request(owner, request, native.append)
+    assert hooks.local_hbm_kv_tokens == 192
+    assert bool(native) is accepted
+    if not accepted:
+        assert request.status is RequestStatus.FINISHED_ERROR
+        assert hooks.controller.program_ref_for_request("request") is None
     hooks.close()
 
 

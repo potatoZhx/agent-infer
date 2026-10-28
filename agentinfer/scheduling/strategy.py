@@ -60,6 +60,29 @@ class SchedulingStrategy(Generic[StrategyGlobalFactorsT, StrategyProgramFactorsT
         return True
 
     @property
+    def uses_serial_lineages(self) -> bool:
+        """Opt into independent overlap owners and serial requests within a named lineage."""
+        return False
+
+    def on_context_replaced(self, program: ProgramRef) -> None:
+        """Invalidate optional cache-footprint evidence when a new prompt becomes current."""
+
+    def on_context_growth(
+        self, program: ProgramRef, now: float, *, previous_tokens: int, current_tokens: int, block_size: int
+    ) -> None:
+        """Observe growth; the strategy decides when its rounded reservation needs repair."""
+
+    def on_execution_changed(
+        self,
+        factors: StrategyFactors[StrategyGlobalFactorsT, StrategyProgramFactorsT],
+        program: ProgramRef,
+        now: float,
+        *,
+        running: bool,
+    ) -> None:
+        """Observe native scheduling/preemption boundaries when the adapter provides them."""
+
+    @property
     def observes_streaming_context_growth(self) -> bool:
         """Opt into using streamed output tokens in placement capacity estimates."""
         return False

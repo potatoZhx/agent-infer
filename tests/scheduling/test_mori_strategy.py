@@ -38,6 +38,7 @@ EVENT_KIND = {
     TransitionKind.QUEUE: SchedulingEventKind.REQUEST_PENDING,
     TransitionKind.PAUSE: SchedulingEventKind.PROGRAM_PAUSED,
     TransitionKind.MARK_FOR_PAUSE: SchedulingEventKind.PROGRAM_MARKED_FOR_PAUSE,
+    TransitionKind.CANCEL_PAUSE: SchedulingEventKind.PROGRAM_PAUSE_CANCELLED,
     TransitionKind.RESUME: SchedulingEventKind.PROGRAM_RESUMED,
     TransitionKind.RELEASE: SchedulingEventKind.PROGRAM_RELEASED,
 }
@@ -106,10 +107,51 @@ def set_tier(components, program: ProgramView, tier: MORITier, *, idleness: floa
     components.strategy._set_factor(components.initial_factors, program.ref, sidecar)
 
 
-def test_no_fit_admission_queues_without_displacing_a_legal_gpu_program() -> None:
+def test_no_fit_admission_preserves_acting_reservation_until_planning() -> None:
     components = build_mori_strategy(MORIConfig(mode=MORIMode.FULL))
     resident = view("resident", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=700)
     candidate = view("candidate", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400)
+    set_tier(components, resident, MORITier.GPU)
+    calls: list[TransitionRequest] = []
+
+    outcome = components.strategy.handle_admission(
+        snapshot(resident, candidate, hbm=1000),
+        components.initial_factors,
+        accepting_controller(components.strategy, components.initial_factors, calls),
+        candidate.ref,
+    )
+
+    assert outcome.disposition is AdmissionDisposition.QUEUED
+    assert [call.kind for call in calls] == [TransitionKind.QUEUE]
+    assert components.initial_factors.for_program(resident.ref).tier is MORITier.GPU
+    assert components.initial_factors.for_program(candidate.ref).tier is MORITier.WAITING
+
+
+def test_no_fit_admission_keeps_reasoning_victim_lazy_until_completion() -> None:
+    components = build_mori_strategy(MORIConfig(mode=MORIMode.FULL))
+    resident = view("resident", state=ProgramState.ACTIVE, status=ProgramStatus.REASONING, tokens=700)
+    candidate = view("candidate", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400)
+    set_tier(components, resident, MORITier.GPU)
+    calls: list[TransitionRequest] = []
+
+    outcome = components.strategy.handle_admission(
+        snapshot(resident, candidate, hbm=1000),
+        components.initial_factors,
+        accepting_controller(components.strategy, components.initial_factors, calls),
+        candidate.ref,
+    )
+
+    assert outcome.disposition is AdmissionDisposition.QUEUED
+    assert [call.kind for call in calls] == [TransitionKind.QUEUE]
+    resident_factors = components.initial_factors.for_program(resident.ref)
+    assert resident_factors.tier is MORITier.GPU
+    assert resident_factors.pending_tier is None
+
+
+def test_oversized_admission_does_not_displace_a_legal_gpu_program() -> None:
+    components = build_mori_strategy(MORIConfig(mode=MORIMode.FULL))
+    resident = view("resident", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=400)
+    candidate = view("candidate", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=1100)
     set_tier(components, resident, MORITier.GPU)
     calls: list[TransitionRequest] = []
 
@@ -167,6 +209,46 @@ def test_lazy_demotion_remains_gpu_capacity_debt_until_completion() -> None:
     assert victim_factors.pending_tier is MORITier.CPU
 
 
+def test_existing_waiter_reclaims_an_acting_gpu_reservation_without_timeout() -> None:
+    components = build_mori_strategy(MORIConfig(mode=MORIMode.FULL))
+    resident = view("resident", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=700)
+    waiting = view("waiting", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400, step_count=1)
+    set_tier(components, resident, MORITier.GPU, idleness=0.9)
+    set_tier(components, waiting, MORITier.CPU)
+    calls: list[TransitionRequest] = []
+
+    components.strategy.schedule_resume(
+        snapshot(resident, waiting, hbm=1000, dram=2000),
+        components.initial_factors,
+        accepting_controller(components.strategy, components.initial_factors, calls),
+    )
+
+    assert [call.kind for call in calls] == [TransitionKind.PAUSE, TransitionKind.RESUME]
+    assert components.initial_factors.for_program(resident.ref).tier is MORITier.CPU
+    assert components.initial_factors.for_program(waiting.ref).tier is MORITier.GPU
+
+
+def test_aged_waiter_reserves_lazy_reasoning_relief() -> None:
+    components = build_mori_strategy(MORIConfig(mode=MORIMode.FULL))
+    resident = view("resident", state=ProgramState.ACTIVE, status=ProgramStatus.REASONING, tokens=700)
+    waiting = view("waiting", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400, step_count=1)
+    waiting = replace(waiting, wait_started_at_monotonic_s=0.0)
+    set_tier(components, resident, MORITier.GPU)
+    set_tier(components, waiting, MORITier.CPU)
+    calls: list[TransitionRequest] = []
+
+    components.strategy.schedule_resume(
+        snapshot(resident, waiting, hbm=1000, dram=2000),
+        components.initial_factors,
+        accepting_controller(components.strategy, components.initial_factors, calls),
+    )
+
+    assert [call.kind for call in calls] == [TransitionKind.MARK_FOR_PAUSE]
+    resident_factors = components.initial_factors.for_program(resident.ref)
+    assert resident_factors.tier is MORITier.GPU
+    assert resident_factors.pending_tier is MORITier.CPU
+
+
 def test_pending_cpu_destinations_prevent_lazy_demotion_overcommit() -> None:
     components = build_mori_strategy(MORIConfig(mode=MORIMode.FULL))
     first = view("first", state=ProgramState.ACTIVE, status=ProgramStatus.REASONING, tokens=400)
@@ -213,6 +295,27 @@ def test_decode_buffer_is_fixed_and_rounded_at_hbm_block_granularity() -> None:
     )
 
     assert outcome.required_tokens == 208
+    assert outcome.disposition is AdmissionDisposition.ADMITTED
+
+
+def test_capacity_targets_do_not_deduct_unproven_shared_context() -> None:
+    components = build_mori_strategy(MORIConfig(mode=MORIMode.FULL))
+    candidate = replace(
+        view("candidate", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=201),
+        tokens=ProgramTokenObservation(estimated_context_tokens=201, shared_prefix_tokens=80),
+    )
+    fixed = replace(snapshot(candidate, hbm=1000, dram=1000), hbm_block_size_tokens=16, dram_chunk_size_tokens=64)
+    calls: list[TransitionRequest] = []
+
+    outcome = components.strategy.handle_admission(
+        fixed,
+        components.initial_factors,
+        accepting_controller(components.strategy, components.initial_factors, calls),
+        candidate.ref,
+    )
+
+    assert outcome.required_tokens == 304
+    assert components.strategy._dram_target(candidate, fixed) == 256
     assert outcome.disposition is AdmissionDisposition.ADMITTED
 
 
@@ -305,7 +408,7 @@ def test_overlapping_completions_end_reasoning_only_after_the_last_request() -> 
 
 
 @pytest.mark.parametrize("tier,steps", [(MORITier.CPU, 1), (MORITier.WAITING, 1), (MORITier.WAITING, 0)])
-def test_overdue_waiter_precedes_each_normal_promotion_group(tier, steps) -> None:
+def test_aged_wait_has_an_explicit_progress_exception(tier, steps) -> None:
     components = build_mori_strategy()
     old = replace(
         view("old", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=700),
@@ -357,7 +460,7 @@ def test_normal_promotion_preserves_mori_decision_table() -> None:
     ]
 
 
-def test_new_arrival_cannot_bypass_pending_work_between_ticks() -> None:
+def test_new_arrival_joins_the_same_ranked_selection_between_ticks() -> None:
     components = build_mori_strategy()
     old = view("old", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=500)
     new = view("new", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=100)
@@ -370,3 +473,57 @@ def test_new_arrival_cannot_bypass_pending_work_between_ticks() -> None:
     )
     assert outcome.disposition is AdmissionDisposition.QUEUED
     assert [call.kind for call in calls] == [TransitionKind.QUEUE]
+    calls.clear()
+    components.strategy.schedule_resume(
+        snapshot(old, new),
+        components.initial_factors,
+        accepting_controller(components.strategy, components.initial_factors, calls),
+    )
+    assert [call.program for call in calls] == [new.ref, old.ref]
+
+
+def test_later_fitting_candidate_runs_without_speculative_demotion() -> None:
+    components = build_mori_strategy()
+    resident = view("resident", state=ProgramState.ACTIVE, status=ProgramStatus.REASONING, tokens=700)
+    large = view("large", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400, step_count=1)
+    small = view("small", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=50)
+    set_tier(components, resident, MORITier.GPU)
+    set_tier(components, large, MORITier.CPU)
+    calls = []
+    components.strategy.schedule_resume(
+        snapshot(resident, large, small),
+        components.initial_factors,
+        accepting_controller(components.strategy, components.initial_factors, calls),
+    )
+    assert [(call.kind, call.program) for call in calls] == [
+        (TransitionKind.ADMIT, small.ref),
+    ]
+    assert components.initial_factors.for_program(large.ref).tier is MORITier.CPU
+
+
+def test_over_total_quota_candidate_does_not_block_a_later_fit() -> None:
+    components = build_mori_strategy()
+    large = view("large", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=1100, step_count=1)
+    small = view("small", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=50)
+    set_tier(components, large, MORITier.CPU)
+    calls = []
+    components.strategy.schedule_resume(
+        snapshot(large, small),
+        components.initial_factors,
+        accepting_controller(components.strategy, components.initial_factors, calls),
+    )
+    assert [call.program for call in calls] == [small.ref]
+
+
+def test_decode_buffer_does_not_block_a_prompt_that_fits_the_total_quota() -> None:
+    components = build_mori_strategy()
+    candidate = view("candidate", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=950)
+    calls = []
+    outcome = components.strategy.handle_admission(
+        snapshot(candidate, hbm=1000),
+        components.initial_factors,
+        accepting_controller(components.strategy, components.initial_factors, calls),
+        candidate.ref,
+    )
+    assert outcome.disposition is AdmissionDisposition.ADMITTED
+    assert outcome.required_tokens == 1000

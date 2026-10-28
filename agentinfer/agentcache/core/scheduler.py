@@ -138,7 +138,10 @@ class _VllmAdmissionHooks:
         self.expected_agents = expected
         # EngineCore passes resolve_kv_cache_block_sizes() as block_size, which already includes DCP and PCP.
         self.block_size = int(block_size)
-        self.local_hbm_kv_tokens = int(kv_cache_config.num_blocks) * self.block_size
+        if settings.get("strategy") == "mori" and len(getattr(kv_cache_config, "kv_cache_groups", ())) > 1:
+            raise ValueError("MORI capacity accounting requires one native KV cache group")
+        reserved_blocks = 1 if settings.get("strategy") == "mori" else 0
+        self.local_hbm_kv_tokens = max(0, int(kv_cache_config.num_blocks) - reserved_blocks) * self.block_size
         self.tracked_native: set[str] = set()
         self._rejected_requests: list[Request] = []
         self._local_prefix_observations: dict[str, tuple[int, int]] = {}
@@ -150,6 +153,9 @@ class _VllmAdmissionHooks:
         )
         strategy = getattr(self.controller, "strategy", None)
         self._mori_adapter = install_vllm_mori(owner, strategy) if isinstance(strategy, MORIStrategy) else None
+        if self._mori_adapter is not None:
+            # Token-equivalent union accounting is exact only for one native KV group.
+            MORI_RUNTIME_STATE.footprints.enabled = len(getattr(kv_cache_config, "kv_cache_groups", ())) == 1
         self._install_prefix_lookup_observer(owner)
         self.lifecycle_receiver: UnixLifecycleReceiver | None = None
         socket_path = settings.get("lifecycle_socket_path") or os.environ.get(LIFECYCLE_SOCKET_ENV)
@@ -172,6 +178,20 @@ class _VllmAdmissionHooks:
                 return
             native_add(request)
             return
+        if (
+            isinstance(getattr(self.controller, "strategy", None), MORIStrategy)
+            and request.num_prompt_tokens > self.local_hbm_kv_tokens
+        ):
+            self._reject_request(request, "mori_prompt_exceeds_hbm_capacity")
+            return
+        max_output = getattr(request.sampling_params, "max_tokens", None)
+        if (
+            isinstance(getattr(self.controller, "strategy", None), MORIStrategy)
+            and isinstance(max_output, int)
+            and request.num_prompt_tokens + max_output > self.local_hbm_kv_tokens
+        ):
+            self._reject_request(request, "mori_request_exceeds_hbm_capacity")
+            return
         retained_at_monotonic_s = time.monotonic()
         try:
             dispatch_now = self.controller.on_request_arrival(
@@ -182,7 +202,7 @@ class _VllmAdmissionHooks:
                 request,
             )
         except RequestAdmissionError:
-            self._reject_request(request, "overlapping_program_requests")
+            self._reject_request(request, "invalid_program_admission")
             return
         if isinstance(getattr(self.controller, "strategy", None), MORIStrategy):
             program = self.controller.program_ref_for_request(request.request_id)
@@ -323,6 +343,13 @@ class _VllmAdmissionHooks:
 
     def observe_prefix_cache(self, scheduler_output: object) -> None:
         """Forward vLLM's post-prefix-lookup computed-token boundary without touching KV ownership."""
+        observe_execution = getattr(self.controller, "on_native_execution", None)
+        if callable(observe_execution):
+            for request_id in getattr(scheduler_output, "preempted_req_ids", ()) or ():
+                observe_execution(request_id, running=False)
+            for request_id, count in (getattr(scheduler_output, "num_scheduled_tokens", {}) or {}).items():
+                if count > 0:
+                    observe_execution(request_id, running=True)
         for request in getattr(scheduler_output, "scheduled_new_reqs", ()):
             request_id = str(getattr(request, "req_id", ""))
             if request_id in self.tracked_native:
@@ -349,7 +376,10 @@ class _VllmAdmissionHooks:
             else ((request_ids,) if isinstance(request_ids, str) else tuple(request_ids))
         )
         cancelled: list[NativeFinishedRequest] = []
+        retained_ids = set(self.controller.retained_request_ids)
         for request_id in normalized:
+            if request_id not in retained_ids:
+                continue
             entry = self.controller.cancel_request(request_id)
             if entry is not None:
                 MORI_RUNTIME_STATE.unbind_request(request_id)
@@ -516,7 +546,11 @@ class _VllmAdmissionHooks:
         if self.lifecycle_receiver is None:
             return
         for signal in self.lifecycle_receiver.receive():
-            released = self.controller.on_response_completion(signal.program_id, signal.lifecycle)
+            scoped = getattr(self.controller, "on_scoped_response_completion", None)
+            if isinstance(getattr(self.controller, "strategy", None), MORIStrategy) and callable(scoped):
+                released = scoped(signal.program_id, signal.lifecycle, signal.lifecycle_token)
+            else:
+                released = self.controller.on_response_completion(signal.program_id, signal.lifecycle)
             logger.info(
                 "AgentCache API lifecycle program=%s lifecycle=%s released=%s",
                 signal.program_id,

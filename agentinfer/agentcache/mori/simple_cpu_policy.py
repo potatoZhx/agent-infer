@@ -48,6 +48,7 @@ class MORISimpleCPUOffloadPolicy:
         owner = self.runtime_state.program_for_request(owner_request_id)
         if owner is None:
             return
+        self.runtime_state.footprints.add("cpu", block_id, owner)
         owners = set(self.index.owners(block_id))
         if owner in owners:
             return
@@ -63,9 +64,11 @@ class MORISimpleCPUOffloadPolicy:
         self.index.mark_ready(block_id, ready)
 
     def on_block_removed(self, block_id: int) -> None:
+        self.runtime_state.footprints.remove_block("cpu", block_id)
         self.index.remove(block_id)
 
     def on_cache_reset(self) -> None:
+        self.runtime_state.footprints.clear("cpu")
         self.index.clear()
 
     def propose(

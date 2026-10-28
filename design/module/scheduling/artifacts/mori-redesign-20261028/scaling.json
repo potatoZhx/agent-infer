@@ -1,0 +1,86 @@
+{
+  "command": "PYTHONPATH=. python design/module/scheduling/artifacts/mori-redesign-20261028/probe_scaling.py",
+  "scope": "Instrumented CPU scheduling only; no GPU/E2E claim",
+  "scaling": [
+    {
+      "waiters": 64,
+      "median_thread_ms": 0.41939299999999013,
+      "factor_reads": 389,
+      "repetitions": 3,
+      "samples": [
+        {
+          "thread_ms": 0.548884999999999,
+          "factor_reads": 389
+        },
+        {
+          "thread_ms": 0.41939299999999013,
+          "factor_reads": 389
+        },
+        {
+          "thread_ms": 0.39157700000000406,
+          "factor_reads": 389
+        }
+      ]
+    },
+    {
+      "waiters": 128,
+      "median_thread_ms": 0.7672410000000018,
+      "factor_reads": 773,
+      "repetitions": 3,
+      "samples": [
+        {
+          "thread_ms": 0.7672410000000018,
+          "factor_reads": 773
+        },
+        {
+          "thread_ms": 0.7647509999999802,
+          "factor_reads": 773
+        },
+        {
+          "thread_ms": 0.776834000000004,
+          "factor_reads": 773
+        }
+      ]
+    },
+    {
+      "waiters": 256,
+      "median_thread_ms": 1.4911700000000139,
+      "factor_reads": 1541,
+      "repetitions": 3,
+      "samples": [
+        {
+          "thread_ms": 1.4911700000000139,
+          "factor_reads": 1541
+        },
+        {
+          "thread_ms": 1.4654600000000018,
+          "factor_reads": 1541
+        },
+        {
+          "thread_ms": 1.5105799999999836,
+          "factor_reads": 1541
+        }
+      ]
+    },
+    {
+      "waiters": 512,
+      "median_thread_ms": 2.885365000000001,
+      "factor_reads": 3077,
+      "repetitions": 3,
+      "samples": [
+        {
+          "thread_ms": 2.971202000000006,
+          "factor_reads": 3077
+        },
+        {
+          "thread_ms": 2.885365000000001,
+          "factor_reads": 3077
+        },
+        {
+          "thread_ms": 2.871782999999989,
+          "factor_reads": 3077
+        }
+      ]
+    }
+  ]
+}

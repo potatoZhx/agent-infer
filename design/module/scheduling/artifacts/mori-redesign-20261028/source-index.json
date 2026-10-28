@@ -1,0 +1,2448 @@
+{
+  "agentinfer/agentcache/core/api_adapter.py": {
+    "absolute_path": "/data/zx/agent-kvc/.worktrees/mori/agentinfer/agentcache/core/api_adapter.py",
+    "lines": 638,
+    "functions": [
+      {
+        "name": "_parse_anthropic_replay_sampling",
+        "start": 73,
+        "end": 95
+      },
+      {
+        "name": "_rank_socket_path",
+        "start": 225,
+        "end": 231
+      },
+      {
+        "name": "_adapt_identity_request_body",
+        "start": 234,
+        "end": 276
+      },
+      {
+        "name": "_install_anthropic_identity_bridge",
+        "start": 279,
+        "end": 319
+      },
+      {
+        "name": "_replay_receive",
+        "start": 322,
+        "end": 334
+      },
+      {
+        "name": "_scope_with_content_length",
+        "start": 337,
+        "end": 350
+      },
+      {
+        "name": "_endpoint_for_scope",
+        "start": 565,
+        "end": 573
+      },
+      {
+        "name": "_request_headers",
+        "start": 576,
+        "end": 588
+      },
+      {
+        "name": "_request_dp_rank",
+        "start": 591,
+        "end": 603
+      },
+      {
+        "name": "_response_lifecycle",
+        "start": 606,
+        "end": 638
+      },
+      {
+        "name": "__post_init__",
+        "start": 113,
+        "end": 117
+      },
+      {
+        "name": "__init__",
+        "start": 123,
+        "end": 133
+      },
+      {
+        "name": "receive",
+        "start": 135,
+        "end": 154
+      },
+      {
+        "name": "close",
+        "start": 156,
+        "end": 166
+      },
+      {
+        "name": "__init__",
+        "start": 172,
+        "end": 175
+      },
+      {
+        "name": "send",
+        "start": 177,
+        "end": 207
+      },
+      {
+        "name": "_discover_internal_rank_sockets",
+        "start": 209,
+        "end": 222
+      },
+      {
+        "name": "build_base_request",
+        "start": 301,
+        "end": 316
+      },
+      {
+        "name": "replay",
+        "start": 326,
+        "end": 332
+      },
+      {
+        "name": "__init__",
+        "start": 356,
+        "end": 358
+      },
+      {
+        "name": "__call__",
+        "start": 360,
+        "end": 404
+      },
+      {
+        "name": "__init__",
+        "start": 410,
+        "end": 416
+      },
+      {
+        "name": "__call__",
+        "start": 418,
+        "end": 454
+      },
+      {
+        "name": "_finish",
+        "start": 456,
+        "end": 488
+      },
+      {
+        "name": "__init__",
+        "start": 494,
+        "end": 500
+      },
+      {
+        "name": "start",
+        "start": 502,
+        "end": 513
+      },
+      {
+        "name": "feed",
+        "start": 515,
+        "end": 533
+      },
+      {
+        "name": "finish",
+        "start": 535,
+        "end": 544
+      },
+      {
+        "name": "_observe_sse_line",
+        "start": 546,
+        "end": 551
+      },
+      {
+        "name": "_observe_json",
+        "start": 553,
+        "end": 562
+      },
+      {
+        "name": "observed_receive",
+        "start": 427,
+        "end": 437
+      },
+      {
+        "name": "observed_send",
+        "start": 439,
+        "end": 452
+      }
+    ]
+  },
+  "agentinfer/agentcache/core/controller.py": {
+    "absolute_path": "/data/zx/agent-kvc/.worktrees/mori/agentinfer/agentcache/core/controller.py",
+    "lines": 411,
+    "functions": [
+      {
+        "name": "build_controller",
+        "start": 88,
+        "end": 100
+      },
+      {
+        "name": "build_mori_controller",
+        "start": 103,
+        "end": 142
+      },
+      {
+        "name": "build_progress_ttl_controller",
+        "start": 145,
+        "end": 311
+      },
+      {
+        "name": "_observability_setting",
+        "start": 314,
+        "end": 332
+      },
+      {
+        "name": "_int_setting",
+        "start": 335,
+        "end": 340
+      },
+      {
+        "name": "_bool_setting",
+        "start": 343,
+        "end": 354
+      },
+      {
+        "name": "_mode_setting",
+        "start": 357,
+        "end": 365
+      },
+      {
+        "name": "_mori_mode_setting",
+        "start": 368,
+        "end": 376
+      },
+      {
+        "name": "_resume_order_setting",
+        "start": 379,
+        "end": 391
+      },
+      {
+        "name": "_float_setting",
+        "start": 394,
+        "end": 411
+      }
+    ]
+  },
+  "agentinfer/agentcache/core/scheduler.py": {
+    "absolute_path": "/data/zx/agent-kvc/.worktrees/mori/agentinfer/agentcache/core/scheduler.py",
+    "lines": 660,
+    "functions": [
+      {
+        "name": "_metadata_from_request",
+        "start": 652,
+        "end": 660
+      },
+      {
+        "name": "retained_request_count",
+        "start": 49,
+        "end": 50
+      },
+      {
+        "name": "retained_request_ids",
+        "start": 53,
+        "end": 54
+      },
+      {
+        "name": "requires_program_identity",
+        "start": 57,
+        "end": 58
+      },
+      {
+        "name": "prefix_cache_candidates",
+        "start": 60,
+        "end": 61
+      },
+      {
+        "name": "on_request_arrival",
+        "start": 63,
+        "end": 71
+      },
+      {
+        "name": "schedule_cycle",
+        "start": 73,
+        "end": 74
+      },
+      {
+        "name": "needs_schedule_cycle",
+        "start": 76,
+        "end": 77
+      },
+      {
+        "name": "run_due_lightweight_checks",
+        "start": 79,
+        "end": 80
+      },
+      {
+        "name": "consume_admitted_requests",
+        "start": 82,
+        "end": 85
+      },
+      {
+        "name": "on_stream_output",
+        "start": 87,
+        "end": 88
+      },
+      {
+        "name": "program_ref_for_request",
+        "start": 90,
+        "end": 91
+      },
+      {
+        "name": "on_prefix_cache_observation",
+        "start": 93,
+        "end": 101
+      },
+      {
+        "name": "on_request_completion",
+        "start": 103,
+        "end": 104
+      },
+      {
+        "name": "on_response_completion",
+        "start": 106,
+        "end": 107
+      },
+      {
+        "name": "cancel_request",
+        "start": 109,
+        "end": 110
+      },
+      {
+        "name": "__init__",
+        "start": 116,
+        "end": 165
+      },
+      {
+        "name": "add_request",
+        "start": 167,
+        "end": 214
+      },
+      {
+        "name": "_reject_request",
+        "start": 216,
+        "end": 225
+      },
+      {
+        "name": "publish_rejections",
+        "start": 227,
+        "end": 237
+      },
+      {
+        "name": "before_schedule",
+        "start": 239,
+        "end": 257
+      },
+      {
+        "name": "_add_to_native_waiting",
+        "start": 260,
+        "end": 276
+      },
+      {
+        "name": "_observe_retained_prefix_cache",
+        "start": 278,
+        "end": 308
+      },
+      {
+        "name": "after_output",
+        "start": 310,
+        "end": 342
+      },
+      {
+        "name": "observe_prefix_cache",
+        "start": 344,
+        "end": 367
+      },
+      {
+        "name": "cancel_retained",
+        "start": 369,
+        "end": 392
+      },
+      {
+        "name": "finish_requests",
+        "start": 394,
+        "end": 419
+      },
+      {
+        "name": "_install_prefix_lookup_observer",
+        "start": 421,
+        "end": 443
+      },
+      {
+        "name": "_ref_count_shared_tokens",
+        "start": 446,
+        "end": 457
+      },
+      {
+        "name": "unfinished_count",
+        "start": 459,
+        "end": 461
+      },
+      {
+        "name": "close",
+        "start": 463,
+        "end": 470
+      },
+      {
+        "name": "backend_pool_info",
+        "start": 472,
+        "end": 513
+      },
+      {
+        "name": "_native_used_kv_tokens",
+        "start": 515,
+        "end": 527
+      },
+      {
+        "name": "_native_waiting_kv_tokens",
+        "start": 530,
+        "end": 542
+      },
+      {
+        "name": "_drain_lifecycle_signals",
+        "start": 544,
+        "end": 559
+      },
+      {
+        "name": "__init__",
+        "start": 565,
+        "end": 572
+      },
+      {
+        "name": "add_request",
+        "start": 574,
+        "end": 575
+      },
+      {
+        "name": "schedule",
+        "start": 577,
+        "end": 581
+      },
+      {
+        "name": "update_from_output",
+        "start": 583,
+        "end": 592
+      },
+      {
+        "name": "finish_requests",
+        "start": 594,
+        "end": 595
+      },
+      {
+        "name": "get_num_unfinished_requests",
+        "start": 597,
+        "end": 598
+      },
+      {
+        "name": "shutdown",
+        "start": 600,
+        "end": 604
+      },
+      {
+        "name": "__init__",
+        "start": 610,
+        "end": 617
+      },
+      {
+        "name": "add_request",
+        "start": 619,
+        "end": 620
+      },
+      {
+        "name": "schedule",
+        "start": 622,
+        "end": 626
+      },
+      {
+        "name": "update_from_output",
+        "start": 628,
+        "end": 637
+      },
+      {
+        "name": "finish_requests",
+        "start": 639,
+        "end": 640
+      },
+      {
+        "name": "get_num_unfinished_requests",
+        "start": 642,
+        "end": 643
+      },
+      {
+        "name": "shutdown",
+        "start": 645,
+        "end": 649
+      },
+      {
+        "name": "observed_get_computed_blocks",
+        "start": 431,
+        "end": 440
+      }
+    ]
+  },
+  "agentinfer/agentcache/mori/footprints.py": {
+    "absolute_path": "/data/zx/agent-kvc/.worktrees/mori/agentinfer/agentcache/mori/footprints.py",
+    "lines": 54,
+    "functions": [
+      {
+        "name": "__init__",
+        "start": 13,
+        "end": 16
+      },
+      {
+        "name": "add",
+        "start": 18,
+        "end": 23
+      },
+      {
+        "name": "remove_block",
+        "start": 25,
+        "end": 31
+      },
+      {
+        "name": "invalidate",
+        "start": 33,
+        "end": 40
+      },
+      {
+        "name": "get",
+        "start": 42,
+        "end": 44
+      },
+      {
+        "name": "clear",
+        "start": 46,
+        "end": 54
+      }
+    ]
+  },
+  "agentinfer/agentcache/mori/hbm_policy.py": {
+    "absolute_path": "/data/zx/agent-kvc/.worktrees/mori/agentinfer/agentcache/mori/hbm_policy.py",
+    "lines": 86,
+    "functions": [
+      {
+        "name": "__init__",
+        "start": 20,
+        "end": 31
+      },
+      {
+        "name": "on_block_ready",
+        "start": 33,
+        "end": 36
+      },
+      {
+        "name": "on_block_owner_added",
+        "start": 38,
+        "end": 53
+      },
+      {
+        "name": "on_block_touched",
+        "start": 55,
+        "end": 56
+      },
+      {
+        "name": "on_block_evictability_changed",
+        "start": 58,
+        "end": 59
+      },
+      {
+        "name": "on_block_owners_changed",
+        "start": 61,
+        "end": 62
+      },
+      {
+        "name": "on_block_removed",
+        "start": 64,
+        "end": 66
+      },
+      {
+        "name": "on_cache_reset",
+        "start": 68,
+        "end": 70
+      },
+      {
+        "name": "close",
+        "start": 72,
+        "end": 75
+      },
+      {
+        "name": "propose",
+        "start": 77,
+        "end": 79
+      },
+      {
+        "name": "_owners",
+        "start": 81,
+        "end": 86
+      }
+    ]
+  },
+  "agentinfer/agentcache/mori/runtime_state.py": {
+    "absolute_path": "/data/zx/agent-kvc/.worktrees/mori/agentinfer/agentcache/mori/runtime_state.py",
+    "lines": 124,
+    "functions": [
+      {
+        "name": "reclassify_program",
+        "start": 19,
+        "end": 19
+      },
+      {
+        "name": "release_program",
+        "start": 21,
+        "end": 21
+      },
+      {
+        "name": "__init__",
+        "start": 27,
+        "end": 32
+      },
+      {
+        "name": "bind_provider",
+        "start": 34,
+        "end": 41
+      },
+      {
+        "name": "register_index",
+        "start": 43,
+        "end": 45
+      },
+      {
+        "name": "unregister_index",
+        "start": 47,
+        "end": 49
+      },
+      {
+        "name": "unbind_provider",
+        "start": 51,
+        "end": 59
+      },
+      {
+        "name": "footprint",
+        "start": 61,
+        "end": 63
+      },
+      {
+        "name": "invalidate_footprint",
+        "start": 65,
+        "end": 67
+      },
+      {
+        "name": "bind_request",
+        "start": 69,
+        "end": 74
+      },
+      {
+        "name": "unbind_request",
+        "start": 76,
+        "end": 82
+      },
+      {
+        "name": "program_for_request",
+        "start": 84,
+        "end": 85
+      },
+      {
+        "name": "clear_requests",
+        "start": 87,
+        "end": 90
+      },
+      {
+        "name": "cache_class_for_program",
+        "start": 92,
+        "end": 94
+      },
+      {
+        "name": "on_cache_class_changed",
+        "start": 96,
+        "end": 104
+      },
+      {
+        "name": "on_program_released",
+        "start": 106,
+        "end": 111
+      },
+      {
+        "name": "reset",
+        "start": 113,
+        "end": 121
+      }
+    ]
+  },
+  "agentinfer/agentcache/mori/simple_cpu_policy.py": {
+    "absolute_path": "/data/zx/agent-kvc/.worktrees/mori/agentinfer/agentcache/mori/simple_cpu_policy.py",
+    "lines": 88,
+    "functions": [
+      {
+        "name": "__init__",
+        "start": 24,
+        "end": 35
+      },
+      {
+        "name": "on_block_ready",
+        "start": 37,
+        "end": 44
+      },
+      {
+        "name": "on_block_owner_added",
+        "start": 46,
+        "end": 61
+      },
+      {
+        "name": "on_block_evictability_changed",
+        "start": 63,
+        "end": 64
+      },
+      {
+        "name": "on_block_removed",
+        "start": 66,
+        "end": 68
+      },
+      {
+        "name": "on_cache_reset",
+        "start": 70,
+        "end": 72
+      },
+      {
+        "name": "propose",
+        "start": 74,
+        "end": 80
+      },
+      {
+        "name": "close",
+        "start": 82,
+        "end": 85
+      }
+    ]
+  },
+  "agentinfer/scheduling/events.py": {
+    "absolute_path": "/data/zx/agent-kvc/.worktrees/mori/agentinfer/scheduling/events.py",
+    "lines": 135,
+    "functions": [
+      {
+        "name": "__post_init__",
+        "start": 91,
+        "end": 110
+      },
+      {
+        "name": "field",
+        "start": 112,
+        "end": 114
+      },
+      {
+        "name": "__post_init__",
+        "start": 125,
+        "end": 135
+      }
+    ]
+  },
+  "agentinfer/scheduling/identity.py": {
+    "absolute_path": "/data/zx/agent-kvc/.worktrees/mori/agentinfer/scheduling/identity.py",
+    "lines": 332,
+    "functions": [
+      {
+        "name": "parse_agent_identity",
+        "start": 105,
+        "end": 184
+      },
+      {
+        "name": "encode_agent_identity",
+        "start": 187,
+        "end": 191
+      },
+      {
+        "name": "_agent_hint_identity",
+        "start": 194,
+        "end": 219
+      },
+      {
+        "name": "_vllm_agentic_context",
+        "start": 222,
+        "end": 244
+      },
+      {
+        "name": "_normalized_headers",
+        "start": 247,
+        "end": 249
+      },
+      {
+        "name": "_framework_identity_headers",
+        "start": 252,
+        "end": 261
+      },
+      {
+        "name": "_context_string",
+        "start": 264,
+        "end": 272
+      },
+      {
+        "name": "_context_bool",
+        "start": 275,
+        "end": 286
+      },
+      {
+        "name": "_agent_component",
+        "start": 289,
+        "end": 299
+      },
+      {
+        "name": "_program_id",
+        "start": 302,
+        "end": 307
+      },
+      {
+        "name": "_related_program_id",
+        "start": 310,
+        "end": 320
+      },
+      {
+        "name": "_optional_string",
+        "start": 323,
+        "end": 332
+      },
+      {
+        "name": "__post_init__",
+        "start": 59,
+        "end": 77
+      },
+      {
+        "name": "as_context",
+        "start": 79,
+        "end": 95
+      }
+    ]
+  },
+  "agentinfer/scheduling/lineage.py": {
+    "absolute_path": "/data/zx/agent-kvc/.worktrees/mori/agentinfer/scheduling/lineage.py",
+    "lines": 72,
+    "functions": [
+      {
+        "name": "__init__",
+        "start": 17,
+        "end": 25
+      },
+      {
+        "name": "resolve",
+        "start": 27,
+        "end": 43
+      },
+      {
+        "name": "bind",
+        "start": 45,
+        "end": 50
+      },
+      {
+        "name": "temporary",
+        "start": 52,
+        "end": 54
+      },
+      {
+        "name": "family",
+        "start": 56,
+        "end": 58
+      },
+      {
+        "name": "release",
+        "start": 60,
+        "end": 72
+      }
+    ]
+  },
+  "agentinfer/scheduling/mori/capacity.py": {
+    "absolute_path": "/data/zx/agent-kvc/.worktrees/mori/agentinfer/scheduling/mori/capacity.py",
+    "lines": 80,
+    "functions": [
+      {
+        "name": "footprint",
+        "start": 17,
+        "end": 17
+      },
+      {
+        "name": "invalidate_footprint",
+        "start": 19,
+        "end": 19
+      },
+      {
+        "name": "__init__",
+        "start": 38,
+        "end": 42
+      },
+      {
+        "name": "incremental",
+        "start": 44,
+        "end": 46
+      },
+      {
+        "name": "add",
+        "start": 48,
+        "end": 54
+      },
+      {
+        "name": "reclaimable",
+        "start": 56,
+        "end": 59
+      },
+      {
+        "name": "remove",
+        "start": 61,
+        "end": 72
+      },
+      {
+        "name": "copy",
+        "start": 74,
+        "end": 80
+      }
+    ]
+  },
+  "agentinfer/scheduling/mori/config.py": {
+    "absolute_path": "/data/zx/agent-kvc/.worktrees/mori/agentinfer/scheduling/mori/config.py",
+    "lines": 42,
+    "functions": [
+      {
+        "name": "__post_init__",
+        "start": 30,
+        "end": 42
+      }
+    ]
+  },
+  "agentinfer/scheduling/mori/factors.py": {
+    "absolute_path": "/data/zx/agent-kvc/.worktrees/mori/agentinfer/scheduling/mori/factors.py",
+    "lines": 67,
+    "functions": [
+      {
+        "name": "__post_init__",
+        "start": 30,
+        "end": 36
+      },
+      {
+        "name": "__post_init__",
+        "start": 54,
+        "end": 67
+      }
+    ]
+  },
+  "agentinfer/scheduling/mori/strategy.py": {
+    "absolute_path": "/data/zx/agent-kvc/.worktrees/mori/agentinfer/scheduling/mori/strategy.py",
+    "lines": 917,
+    "functions": [
+      {
+        "name": "__init__",
+        "start": 36,
+        "end": 44
+      },
+      {
+        "name": "uses_serial_lineages",
+        "start": 47,
+        "end": 49
+      },
+      {
+        "name": "bind_footprints",
+        "start": 51,
+        "end": 53
+      },
+      {
+        "name": "on_context_replaced",
+        "start": 55,
+        "end": 60
+      },
+      {
+        "name": "on_context_growth",
+        "start": 62,
+        "end": 70
+      },
+      {
+        "name": "on_execution_changed",
+        "start": 72,
+        "end": 92
+      },
+      {
+        "name": "cycle_order",
+        "start": 95,
+        "end": 96
+      },
+      {
+        "name": "requires_program_identity",
+        "start": 99,
+        "end": 100
+      },
+      {
+        "name": "observes_streaming_context_growth",
+        "start": 103,
+        "end": 105
+      },
+      {
+        "name": "cache_class_epoch",
+        "start": 108,
+        "end": 109
+      },
+      {
+        "name": "bind_factors",
+        "start": 111,
+        "end": 114
+      },
+      {
+        "name": "subscribe_cache_class_observer",
+        "start": 116,
+        "end": 119
+      },
+      {
+        "name": "unsubscribe_cache_class_observer",
+        "start": 121,
+        "end": 124
+      },
+      {
+        "name": "cache_class_for_program",
+        "start": 126,
+        "end": 128
+      },
+      {
+        "name": "idleness_for_program",
+        "start": 130,
+        "end": 139
+      },
+      {
+        "name": "handle_admission",
+        "start": 141,
+        "end": 209
+      },
+      {
+        "name": "schedule_resume",
+        "start": 211,
+        "end": 221
+      },
+      {
+        "name": "_select_pending",
+        "start": 223,
+        "end": 345
+      },
+      {
+        "name": "_set_relief",
+        "start": 348,
+        "end": 350
+      },
+      {
+        "name": "_cancel_obsolete_relief",
+        "start": 352,
+        "end": 383
+      },
+      {
+        "name": "repair_capacity",
+        "start": 385,
+        "end": 397
+      },
+      {
+        "name": "handle_request_completion",
+        "start": 399,
+        "end": 407
+      },
+      {
+        "name": "on_schedule_cycle_start",
+        "start": 409,
+        "end": 415
+      },
+      {
+        "name": "next_check_at",
+        "start": 417,
+        "end": 419
+      },
+      {
+        "name": "_request_schedule",
+        "start": 422,
+        "end": 427
+      },
+      {
+        "name": "diagnostics",
+        "start": 429,
+        "end": 504
+      },
+      {
+        "name": "on_request_pending",
+        "start": 506,
+        "end": 509
+      },
+      {
+        "name": "on_program_status_changed",
+        "start": 511,
+        "end": 558
+      },
+      {
+        "name": "on_program_admitted",
+        "start": 560,
+        "end": 561
+      },
+      {
+        "name": "on_program_resumed",
+        "start": 563,
+        "end": 564
+      },
+      {
+        "name": "on_request_finished",
+        "start": 566,
+        "end": 612
+      },
+      {
+        "name": "on_program_paused",
+        "start": 614,
+        "end": 624
+      },
+      {
+        "name": "on_program_released",
+        "start": 626,
+        "end": 634
+      },
+      {
+        "name": "_on_gpu_transition",
+        "start": 636,
+        "end": 655
+      },
+      {
+        "name": "_claim",
+        "start": 657,
+        "end": 666
+      },
+      {
+        "name": "_ledgers",
+        "start": 668,
+        "end": 679
+      },
+      {
+        "name": "_demote",
+        "start": 681,
+        "end": 716
+      },
+      {
+        "name": "_repair_gpu_capacity",
+        "start": 718,
+        "end": 746
+      },
+      {
+        "name": "_repair_cpu_capacity",
+        "start": 748,
+        "end": 771
+      },
+      {
+        "name": "_promotion_key",
+        "start": 773,
+        "end": 790
+      },
+      {
+        "name": "_wait_seconds",
+        "start": 793,
+        "end": 796
+      },
+      {
+        "name": "_demotion_key",
+        "start": 798,
+        "end": 809
+      },
+      {
+        "name": "_remaining_gpu_tokens",
+        "start": 811,
+        "end": 812
+      },
+      {
+        "name": "_gpu_reserved_tokens",
+        "start": 814,
+        "end": 815
+      },
+      {
+        "name": "_cpu_reserved_tokens",
+        "start": 817,
+        "end": 818
+      },
+      {
+        "name": "_gpu_target",
+        "start": 820,
+        "end": 828
+      },
+      {
+        "name": "_dram_target",
+        "start": 831,
+        "end": 833
+      },
+      {
+        "name": "_gpu_quota",
+        "start": 836,
+        "end": 839
+      },
+      {
+        "name": "_dram_quota",
+        "start": 842,
+        "end": 845
+      },
+      {
+        "name": "_round_up",
+        "start": 848,
+        "end": 849
+      },
+      {
+        "name": "_idleness",
+        "start": 851,
+        "end": 872
+      },
+      {
+        "name": "_factor",
+        "start": 874,
+        "end": 880
+      },
+      {
+        "name": "_set_factor",
+        "start": 882,
+        "end": 891
+      },
+      {
+        "name": "_class_for_tier",
+        "start": 894,
+        "end": 899
+      },
+      {
+        "name": "_event_non_negative_float",
+        "start": 902,
+        "end": 906
+      },
+      {
+        "name": "_event_non_negative_int",
+        "start": 909,
+        "end": 912
+      },
+      {
+        "name": "_require_applied",
+        "start": 915,
+        "end": 917
+      }
+    ]
+  },
+  "agentinfer/scheduling/request_pool.py": {
+    "absolute_path": "/data/zx/agent-kvc/.worktrees/mori/agentinfer/scheduling/request_pool.py",
+    "lines": 133,
+    "functions": [
+      {
+        "name": "__post_init__",
+        "start": 41,
+        "end": 46
+      },
+      {
+        "name": "__init__",
+        "start": 52,
+        "end": 55
+      },
+      {
+        "name": "waiting_request_ids",
+        "start": 58,
+        "end": 62
+      },
+      {
+        "name": "unfinished_count",
+        "start": 65,
+        "end": 67
+      },
+      {
+        "name": "add",
+        "start": 69,
+        "end": 74
+      },
+      {
+        "name": "for_program",
+        "start": 76,
+        "end": 78
+      },
+      {
+        "name": "_remove",
+        "start": 80,
+        "end": 88
+      },
+      {
+        "name": "get",
+        "start": 90,
+        "end": 92
+      },
+      {
+        "name": "entries",
+        "start": 95,
+        "end": 97
+      },
+      {
+        "name": "admit",
+        "start": 99,
+        "end": 107
+      },
+      {
+        "name": "consume_admitted",
+        "start": 109,
+        "end": 117
+      },
+      {
+        "name": "consume_admitted_request",
+        "start": 119,
+        "end": 128
+      },
+      {
+        "name": "cancel",
+        "start": 130,
+        "end": 133
+      }
+    ]
+  },
+  "agentinfer/scheduling/runtime.py": {
+    "absolute_path": "/data/zx/agent-kvc/.worktrees/mori/agentinfer/scheduling/runtime.py",
+    "lines": 946,
+    "functions": [
+      {
+        "name": "__init__",
+        "start": 79,
+        "end": 110
+      },
+      {
+        "name": "retained_request_count",
+        "start": 113,
+        "end": 115
+      },
+      {
+        "name": "requires_program_identity",
+        "start": 118,
+        "end": 120
+      },
+      {
+        "name": "retained_request_ids",
+        "start": 123,
+        "end": 125
+      },
+      {
+        "name": "prefix_cache_candidates",
+        "start": 127,
+        "end": 144
+      },
+      {
+        "name": "needs_schedule_cycle",
+        "start": 146,
+        "end": 157
+      },
+      {
+        "name": "run_due_lightweight_checks",
+        "start": 159,
+        "end": 168
+      },
+      {
+        "name": "on_request_arrival",
+        "start": 170,
+        "end": 291
+      },
+      {
+        "name": "schedule_cycle",
+        "start": 293,
+        "end": 317
+      },
+      {
+        "name": "consume_admitted_requests",
+        "start": 319,
+        "end": 326
+      },
+      {
+        "name": "_record_scheduler_admission",
+        "start": 328,
+        "end": 332
+      },
+      {
+        "name": "on_stream_output",
+        "start": 334,
+        "end": 364
+      },
+      {
+        "name": "on_native_execution",
+        "start": 366,
+        "end": 371
+      },
+      {
+        "name": "program_ref_for_request",
+        "start": 373,
+        "end": 376
+      },
+      {
+        "name": "on_prefix_cache_observation",
+        "start": 378,
+        "end": 442
+      },
+      {
+        "name": "on_request_completion",
+        "start": 444,
+        "end": 519
+      },
+      {
+        "name": "_has_current_request",
+        "start": 521,
+        "end": 523
+      },
+      {
+        "name": "_has_authorized_request",
+        "start": 525,
+        "end": 534
+      },
+      {
+        "name": "_finish_lineage_step",
+        "start": 536,
+        "end": 576
+      },
+      {
+        "name": "_set_lifecycle_token",
+        "start": 578,
+        "end": 587
+      },
+      {
+        "name": "on_scoped_response_completion",
+        "start": 589,
+        "end": 599
+      },
+      {
+        "name": "on_response_completion",
+        "start": 601,
+        "end": 637
+      },
+      {
+        "name": "cancel_request",
+        "start": 639,
+        "end": 680
+      },
+      {
+        "name": "_apply_transition",
+        "start": 682,
+        "end": 743
+      },
+      {
+        "name": "_admit_program_requests",
+        "start": 745,
+        "end": 750
+      },
+      {
+        "name": "_advance_snapshot",
+        "start": 753,
+        "end": 782
+      },
+      {
+        "name": "_snapshot",
+        "start": 784,
+        "end": 813
+      },
+      {
+        "name": "_shared_prefix_observation_due",
+        "start": 815,
+        "end": 819
+      },
+      {
+        "name": "_restart_shared_prefix_freshness",
+        "start": 821,
+        "end": 836
+      },
+      {
+        "name": "_shared_prefix_fresh_until",
+        "start": 838,
+        "end": 843
+      },
+      {
+        "name": "_replace_backend_info",
+        "start": 845,
+        "end": 849
+      },
+      {
+        "name": "_embedded_backend_rank",
+        "start": 852,
+        "end": 859
+      },
+      {
+        "name": "_pop_binding",
+        "start": 861,
+        "end": 870
+      },
+      {
+        "name": "_dispatch_event",
+        "start": 872,
+        "end": 892
+      },
+      {
+        "name": "_log_periodic_diagnostics",
+        "start": 894,
+        "end": 900
+      },
+      {
+        "name": "_log_diagnostic",
+        "start": 903,
+        "end": 911
+      },
+      {
+        "name": "_strategy_next_check_at",
+        "start": 913,
+        "end": 918
+      },
+      {
+        "name": "_event",
+        "start": 920,
+        "end": 946
+      }
+    ]
+  },
+  "agentinfer/scheduling/strategy.py": {
+    "absolute_path": "/data/zx/agent-kvc/.worktrees/mori/agentinfer/scheduling/strategy.py",
+    "lines": 336,
+    "functions": [
+      {
+        "name": "cycle_order",
+        "start": 43,
+        "end": 50
+      },
+      {
+        "name": "requires_program_identity",
+        "start": 53,
+        "end": 55
+      },
+      {
+        "name": "allows_overlapping_program_requests",
+        "start": 58,
+        "end": 60
+      },
+      {
+        "name": "uses_serial_lineages",
+        "start": 63,
+        "end": 65
+      },
+      {
+        "name": "on_context_replaced",
+        "start": 67,
+        "end": 68
+      },
+      {
+        "name": "on_context_growth",
+        "start": 70,
+        "end": 73
+      },
+      {
+        "name": "on_execution_changed",
+        "start": 75,
+        "end": 83
+      },
+      {
+        "name": "observes_streaming_context_growth",
+        "start": 86,
+        "end": 88
+      },
+      {
+        "name": "handle_admission",
+        "start": 102,
+        "end": 116
+      },
+      {
+        "name": "schedule_resume",
+        "start": 119,
+        "end": 131
+      },
+      {
+        "name": "repair_capacity",
+        "start": 134,
+        "end": 146
+      },
+      {
+        "name": "handle_request_completion",
+        "start": 148,
+        "end": 166
+      },
+      {
+        "name": "on_schedule_cycle_start",
+        "start": 168,
+        "end": 178
+      },
+      {
+        "name": "diagnostics",
+        "start": 180,
+        "end": 191
+      },
+      {
+        "name": "event_diagnostics",
+        "start": 193,
+        "end": 204
+      },
+      {
+        "name": "next_check_at",
+        "start": 206,
+        "end": 219
+      },
+      {
+        "name": "handle_scheduled_check",
+        "start": 221,
+        "end": 237
+      },
+      {
+        "name": "next_lightweight_check_at",
+        "start": 239,
+        "end": 244
+      },
+      {
+        "name": "handle_lightweight_check",
+        "start": 246,
+        "end": 251
+      },
+      {
+        "name": "shared_prefix_freshness_seconds",
+        "start": 253,
+        "end": 265
+      },
+      {
+        "name": "handle_scheduling_event",
+        "start": 267,
+        "end": 280
+      },
+      {
+        "name": "on_request_pending",
+        "start": 282,
+        "end": 287
+      },
+      {
+        "name": "on_program_admitted",
+        "start": 289,
+        "end": 294
+      },
+      {
+        "name": "on_request_finished",
+        "start": 296,
+        "end": 301
+      },
+      {
+        "name": "on_program_status_changed",
+        "start": 303,
+        "end": 308
+      },
+      {
+        "name": "on_program_paused",
+        "start": 310,
+        "end": 315
+      },
+      {
+        "name": "on_program_resumed",
+        "start": 317,
+        "end": 322
+      },
+      {
+        "name": "on_program_marked_for_pause",
+        "start": 324,
+        "end": 329
+      },
+      {
+        "name": "on_program_released",
+        "start": 331,
+        "end": 336
+      }
+    ]
+  },
+  "agentinfer/scheduling/transitions.py": {
+    "absolute_path": "/data/zx/agent-kvc/.worktrees/mori/agentinfer/scheduling/transitions.py",
+    "lines": 169,
+    "functions": [
+      {
+        "name": "__post_init__",
+        "start": 61,
+        "end": 69
+      },
+      {
+        "name": "__post_init__",
+        "start": 90,
+        "end": 99
+      },
+      {
+        "name": "__init__",
+        "start": 109,
+        "end": 111
+      },
+      {
+        "name": "apply",
+        "start": 113,
+        "end": 124
+      },
+      {
+        "name": "take_applied_requests",
+        "start": 126,
+        "end": 130
+      },
+      {
+        "name": "admit",
+        "start": 132,
+        "end": 134
+      },
+      {
+        "name": "queue",
+        "start": 136,
+        "end": 138
+      },
+      {
+        "name": "pause",
+        "start": 140,
+        "end": 142
+      },
+      {
+        "name": "mark_for_pause",
+        "start": 144,
+        "end": 146
+      },
+      {
+        "name": "resume",
+        "start": 148,
+        "end": 150
+      },
+      {
+        "name": "cancel_pause",
+        "start": 152,
+        "end": 154
+      },
+      {
+        "name": "release",
+        "start": 156,
+        "end": 158
+      },
+      {
+        "name": "_request",
+        "start": 160,
+        "end": 169
+      }
+    ]
+  },
+  "tests/agentcache/core/test_mori_controller.py": {
+    "absolute_path": "/data/zx/agent-kvc/.worktrees/mori/tests/agentcache/core/test_mori_controller.py",
+    "lines": 69,
+    "functions": [
+      {
+        "name": "backend",
+        "start": 16,
+        "end": 36
+      },
+      {
+        "name": "test_controller_selects_mori_without_a_dynamic_factory",
+        "start": 39,
+        "end": 45
+      },
+      {
+        "name": "test_full_mori_fails_closed_without_dram_capacity",
+        "start": 48,
+        "end": 50
+      },
+      {
+        "name": "test_placement_only_is_an_explicit_ablation_without_dram",
+        "start": 53,
+        "end": 59
+      },
+      {
+        "name": "test_decode_buffer_cannot_be_overridden",
+        "start": 62,
+        "end": 64
+      },
+      {
+        "name": "test_controller_rejects_removed_starvation_timeout",
+        "start": 67,
+        "end": 69
+      }
+    ]
+  },
+  "tests/agentcache/core/test_mori_vllm_adapter.py": {
+    "absolute_path": "/data/zx/agent-kvc/.worktrees/mori/tests/agentcache/core/test_mori_vllm_adapter.py",
+    "lines": 571,
+    "functions": [
+      {
+        "name": "reset_runtime_state",
+        "start": 30,
+        "end": 33
+      },
+      {
+        "name": "test_placement_only_adapter_can_close_and_rebind_in_process",
+        "start": 36,
+        "end": 48
+      },
+      {
+        "name": "test_failed_mori_startup_does_not_install_prefix_observer",
+        "start": 51,
+        "end": 65
+      },
+      {
+        "name": "test_full_adapter_rejects_missing_hbm_hook_without_leaking_provider",
+        "start": 68,
+        "end": 92
+      },
+      {
+        "name": "test_full_adapter_unregisters_hbm_and_cpu_indexes_on_close",
+        "start": 95,
+        "end": 124
+      },
+      {
+        "name": "test_full_adapter_installs_and_uninstalls_simple_cpu_provider",
+        "start": 127,
+        "end": 163
+      },
+      {
+        "name": "test_simple_cpu_snapshot_is_normalized_to_tokens",
+        "start": 166,
+        "end": 188
+      },
+      {
+        "name": "test_simple_cpu_snapshot_rejects_impossible_residency",
+        "start": 191,
+        "end": 207
+      },
+      {
+        "name": "test_simple_cpu_registration_rolls_back_on_hbm_failure",
+        "start": 210,
+        "end": 235
+      },
+      {
+        "name": "test_full_adapter_cleans_process_state_when_native_unregister_fails",
+        "start": 238,
+        "end": 276
+      },
+      {
+        "name": "test_mori_rejects_only_invalid_request_and_delivers_terminal_output",
+        "start": 281,
+        "end": 342
+      },
+      {
+        "name": "test_mori_bridge_accepts_overlapping_requests_for_one_program",
+        "start": 346,
+        "end": 402
+      },
+      {
+        "name": "test_simple_cpu_bind_failure_does_not_leak_an_index_or_unbind_existing_owner",
+        "start": 405,
+        "end": 423
+      },
+      {
+        "name": "test_retained_abort_uses_host_contract_and_releases_program_binding",
+        "start": 427,
+        "end": 463
+      },
+      {
+        "name": "test_running_abort_keeps_lease_until_native_finish_confirmation",
+        "start": 467,
+        "end": 494
+      },
+      {
+        "name": "test_mori_capacity_excludes_null_block_and_checks_decode_upper_bound",
+        "start": 498,
+        "end": 521
+      },
+      {
+        "name": "test_retained_prefix_observation_accepts_vllm_cache_hit_results",
+        "start": 529,
+        "end": 549
+      },
+      {
+        "name": "test_retained_prefix_observation_continues_after_incomplete_cache_hit",
+        "start": 553,
+        "end": 571
+      },
+      {
+        "name": "lookup",
+        "start": 54,
+        "end": 55
+      },
+      {
+        "name": "initialize",
+        "start": 288,
+        "end": 290
+      },
+      {
+        "name": "native_add",
+        "start": 292,
+        "end": 293
+      },
+      {
+        "name": "request",
+        "start": 295,
+        "end": 305
+      },
+      {
+        "name": "initialize",
+        "start": 353,
+        "end": 355
+      },
+      {
+        "name": "native_add",
+        "start": 357,
+        "end": 358
+      },
+      {
+        "name": "request",
+        "start": 360,
+        "end": 370
+      },
+      {
+        "name": "__init__",
+        "start": 75,
+        "end": 76
+      },
+      {
+        "name": "close",
+        "start": 78,
+        "end": 79
+      },
+      {
+        "name": "close",
+        "start": 102,
+        "end": 103
+      },
+      {
+        "name": "register_mori_block_selection_provider",
+        "start": 108,
+        "end": 110
+      },
+      {
+        "name": "unregister_mori_block_selection_provider",
+        "start": 112,
+        "end": 113
+      },
+      {
+        "name": "register_mori_offload_tier_provider",
+        "start": 132,
+        "end": 134
+      },
+      {
+        "name": "unregister_mori_offload_tier_provider",
+        "start": 136,
+        "end": 137
+      },
+      {
+        "name": "register_mori_block_selection_provider",
+        "start": 140,
+        "end": 142
+      },
+      {
+        "name": "unregister_mori_block_selection_provider",
+        "start": 144,
+        "end": 145
+      },
+      {
+        "name": "register_mori_offload_tier_provider",
+        "start": 215,
+        "end": 217
+      },
+      {
+        "name": "unregister_mori_offload_tier_provider",
+        "start": 219,
+        "end": 220
+      },
+      {
+        "name": "__init__",
+        "start": 244,
+        "end": 245
+      },
+      {
+        "name": "close",
+        "start": 247,
+        "end": 248
+      },
+      {
+        "name": "register_mori_block_selection_provider",
+        "start": 252,
+        "end": 253
+      },
+      {
+        "name": "unregister_mori_block_selection_provider",
+        "start": 256,
+        "end": 257
+      }
+    ]
+  },
+  "tests/agentcache/core/test_vllm_api_adapter.py": {
+    "absolute_path": "/data/zx/agent-kvc/.worktrees/mori/tests/agentcache/core/test_vllm_api_adapter.py",
+    "lines": 540,
+    "functions": [
+      {
+        "name": "test_anthropic_replay_sampling_metadata_is_strictly_validated",
+        "start": 32,
+        "end": 37
+      },
+      {
+        "name": "test_anthropic_replay_sampling_metadata_rejects_malformed_values",
+        "start": 52,
+        "end": 57
+      },
+      {
+        "name": "test_anthropic_bridge_without_replay_sampling_keeps_vllm_defaults",
+        "start": 60,
+        "end": 78
+      },
+      {
+        "name": "test_openai_lifecycle_uses_post_tool_parser_semantics",
+        "start": 81,
+        "end": 109
+      },
+      {
+        "name": "test_anthropic_lifecycle_distinguishes_end_turn_and_tool_use",
+        "start": 112,
+        "end": 126
+      },
+      {
+        "name": "test_streamed_tool_call_is_not_overwritten_by_later_stop_reason",
+        "start": 129,
+        "end": 140
+      },
+      {
+        "name": "test_streaming_observer_rejects_an_unbounded_sse_event",
+        "start": 143,
+        "end": 150
+      },
+      {
+        "name": "test_api_json_observers_do_not_leak_decoder_errors",
+        "start": 154,
+        "end": 162
+      },
+      {
+        "name": "test_identity_middleware_writes_canonical_agent_hint_to_vllm_xargs",
+        "start": 165,
+        "end": 224
+      },
+      {
+        "name": "test_middleware_initialization_explicitly_attaches_vllm_logging",
+        "start": 227,
+        "end": 238
+      },
+      {
+        "name": "test_identity_middleware_carries_anthropic_headers_to_internal_vllm_xargs",
+        "start": 241,
+        "end": 312
+      },
+      {
+        "name": "test_identity_middleware_passes_oversized_request_through_without_unbounded_buffering",
+        "start": 315,
+        "end": 346
+      },
+      {
+        "name": "test_identity_middleware_ignores_provider_private_dsh_headers",
+        "start": 349,
+        "end": 361
+      },
+      {
+        "name": "test_identity_adapter_ignores_unsupported_body_locations",
+        "start": 364,
+        "end": 374
+      },
+      {
+        "name": "test_middleware_delivers_terminal_program_signal_without_rewriting_response",
+        "start": 377,
+        "end": 438
+      },
+      {
+        "name": "test_lifecycle_channel_isolated_by_dp_rank",
+        "start": 441,
+        "end": 452
+      },
+      {
+        "name": "test_lifecycle_receipt_matches_server_attempt_token_in_both_middleware_orders",
+        "start": 457,
+        "end": 526
+      },
+      {
+        "name": "test_lifecycle_channel_broadcasts_to_internal_dp_ranks_without_explicit_rank",
+        "start": 529,
+        "end": 540
+      },
+      {
+        "name": "app",
+        "start": 169,
+        "end": 175
+      },
+      {
+        "name": "receive",
+        "start": 196,
+        "end": 197
+      },
+      {
+        "name": "send",
+        "start": 199,
+        "end": 200
+      },
+      {
+        "name": "app",
+        "start": 232,
+        "end": 233
+      },
+      {
+        "name": "app",
+        "start": 248,
+        "end": 253
+      },
+      {
+        "name": "receive",
+        "start": 277,
+        "end": 278
+      },
+      {
+        "name": "send",
+        "start": 280,
+        "end": 281
+      },
+      {
+        "name": "app",
+        "start": 319,
+        "end": 324
+      },
+      {
+        "name": "receive",
+        "start": 332,
+        "end": 333
+      },
+      {
+        "name": "send",
+        "start": 335,
+        "end": 336
+      },
+      {
+        "name": "app",
+        "start": 383,
+        "end": 398
+      },
+      {
+        "name": "receive",
+        "start": 417,
+        "end": 418
+      },
+      {
+        "name": "send",
+        "start": 420,
+        "end": 421
+      },
+      {
+        "name": "app",
+        "start": 466,
+        "end": 482
+      },
+      {
+        "name": "receive",
+        "start": 503,
+        "end": 504
+      },
+      {
+        "name": "send",
+        "start": 506,
+        "end": 507
+      }
+    ]
+  },
+  "tests/agentcache/test_mori_native_patch.py": {
+    "absolute_path": "/data/zx/agent-kvc/.worktrees/mori/tests/agentcache/test_mori_native_patch.py",
+    "lines": 103,
+    "functions": [
+      {
+        "name": "native_pool_class",
+        "start": 23,
+        "end": 39
+      },
+      {
+        "name": "test_invalid_advice_falls_back_atomically_and_updates_provider",
+        "start": 43,
+        "end": 62
+      },
+      {
+        "name": "test_allocated_advice_falls_back_and_valid_advice_preserves_native_safety",
+        "start": 65,
+        "end": 80
+      },
+      {
+        "name": "test_native_reallocation_invalidates_old_footprint_before_new_owner",
+        "start": 83,
+        "end": 103
+      },
+      {
+        "name": "propose",
+        "start": 49,
+        "end": 52
+      }
+    ]
+  },
+  "tests/scheduling/test_mori_capacity.py": {
+    "absolute_path": "/data/zx/agent-kvc/.worktrees/mori/tests/scheduling/test_mori_capacity.py",
+    "lines": 134,
+    "functions": [
+      {
+        "name": "test_union_and_marginal_reclaim_are_not_max_or_full_context_sum",
+        "start": 23,
+        "end": 30
+      },
+      {
+        "name": "test_union_ledger_matches_brute_force_with_private_growth_promises",
+        "start": 33,
+        "end": 50
+      },
+      {
+        "name": "test_recycled_block_and_new_prompt_invalidate_only_relevant_proof",
+        "start": 53,
+        "end": 66
+      },
+      {
+        "name": "test_native_ownership_reestablishes_proof_after_prompt_change_and_clears_on_reuse",
+        "start": 70,
+        "end": 87
+      },
+      {
+        "name": "test_planner_does_not_claim_shared_blocks_as_full_victim_relief",
+        "start": 90,
+        "end": 112
+      },
+      {
+        "name": "test_non_fitting_waiter_scan_grows_linearly_in_program_reads",
+        "start": 115,
+        "end": 134
+      },
+      {
+        "name": "footprint",
+        "start": 98,
+        "end": 99
+      }
+    ]
+  },
+  "tests/scheduling/test_mori_lineages.py": {
+    "absolute_path": "/data/zx/agent-kvc/.worktrees/mori/tests/scheduling/test_mori_lineages.py",
+    "lines": 256,
+    "functions": [
+      {
+        "name": "runtime",
+        "start": 21,
+        "end": 24
+      },
+      {
+        "name": "test_lineage_and_lifecycle_token_round_trip",
+        "start": 27,
+        "end": 29
+      },
+      {
+        "name": "test_short_overlap_never_replaces_long_working_set_or_status",
+        "start": 32,
+        "end": 45
+      },
+      {
+        "name": "test_named_lineage_serializes_and_uses_the_next_real_prompt",
+        "start": 48,
+        "end": 59
+      },
+      {
+        "name": "test_temporary_slot_reuse_advances_generation_and_rejects_old_events",
+        "start": 62,
+        "end": 75
+      },
+      {
+        "name": "test_executing_lease_cannot_pause_even_if_phase_observation_is_wrong",
+        "start": 78,
+        "end": 83
+      },
+      {
+        "name": "test_returning_larger_prompt_must_obtain_new_capacity_before_dispatch",
+        "start": 86,
+        "end": 96
+      },
+      {
+        "name": "test_growth_wakes_on_reservation_boundary_including_decode_headroom",
+        "start": 99,
+        "end": 110
+      },
+      {
+        "name": "test_drain_excludes_queued_requests_and_new_overlaps_cannot_extend_it",
+        "start": 113,
+        "end": 134
+      },
+      {
+        "name": "test_cancel_deferred_request_does_not_end_running_lease",
+        "start": 137,
+        "end": 146
+      },
+      {
+        "name": "test_cancel_confirmed_running_request_completes_pending_drain",
+        "start": 149,
+        "end": 161
+      },
+      {
+        "name": "test_short_acting_gap_stays_sticky_then_makes_progress",
+        "start": 164,
+        "end": 177
+      },
+      {
+        "name": "test_cancelled_beneficiary_withdraws_uncommitted_lazy_demotion",
+        "start": 180,
+        "end": 192
+      },
+      {
+        "name": "test_late_terminal_receipt_does_not_release_newer_context_or_other_lineage",
+        "start": 195,
+        "end": 206
+      },
+      {
+        "name": "test_family_terminal_waits_for_all_accepted_lineage_work",
+        "start": 209,
+        "end": 219
+      },
+      {
+        "name": "test_native_queue_and_preemption_wait_are_excluded_from_reasoning",
+        "start": 222,
+        "end": 235
+      },
+      {
+        "name": "test_finished_named_families_reuse_slots_without_unbounded_generation_keys",
+        "start": 238,
+        "end": 256
+      }
+    ]
+  },
+  "tests/scheduling/test_mori_runtime.py": {
+    "absolute_path": "/data/zx/agent-kvc/.worktrees/mori/tests/scheduling/test_mori_runtime.py",
+    "lines": 144,
+    "functions": [
+      {
+        "name": "backend",
+        "start": 21,
+        "end": 41
+      },
+      {
+        "name": "scheduler",
+        "start": 44,
+        "end": 51
+      },
+      {
+        "name": "test_server_observed_stream_and_final_usage_replace_prompt_estimate",
+        "start": 54,
+        "end": 68
+      },
+      {
+        "name": "test_same_external_program_overlaps_have_independent_owners",
+        "start": 71,
+        "end": 84
+      },
+      {
+        "name": "test_lazy_demotion_completion_wakes_waiter_before_the_next_periodic_tick",
+        "start": 87,
+        "end": 112
+      },
+      {
+        "name": "test_arrival_can_use_free_capacity_behind_a_non_fitting_waiter",
+        "start": 115,
+        "end": 127
+      },
+      {
+        "name": "test_completion_wakes_selection_without_forcing_a_short_gap_demotion",
+        "start": 130,
+        "end": 144
+      }
+    ]
+  },
+  "tests/scheduling/test_mori_strategy.py": {
+    "absolute_path": "/data/zx/agent-kvc/.worktrees/mori/tests/scheduling/test_mori_strategy.py",
+    "lines": 529,
+    "functions": [
+      {
+        "name": "view",
+        "start": 47,
+        "end": 64
+      },
+      {
+        "name": "snapshot",
+        "start": 67,
+        "end": 77
+      },
+      {
+        "name": "accepting_controller",
+        "start": 80,
+        "end": 102
+      },
+      {
+        "name": "set_tier",
+        "start": 105,
+        "end": 107
+      },
+      {
+        "name": "test_no_fit_admission_preserves_acting_reservation_until_planning",
+        "start": 110,
+        "end": 127
+      },
+      {
+        "name": "test_no_fit_admission_keeps_reasoning_victim_lazy_until_completion",
+        "start": 130,
+        "end": 148
+      },
+      {
+        "name": "test_oversized_admission_does_not_displace_a_legal_gpu_program",
+        "start": 151,
+        "end": 167
+      },
+      {
+        "name": "test_capacity_repair_demotes_acting_before_reasoning_and_more_idle_first",
+        "start": 170,
+        "end": 190
+      },
+      {
+        "name": "test_lazy_demotion_remains_gpu_capacity_debt_until_completion",
+        "start": 193,
+        "end": 209
+      },
+      {
+        "name": "test_existing_waiter_reclaims_an_acting_gpu_reservation_without_timeout",
+        "start": 212,
+        "end": 228
+      },
+      {
+        "name": "test_aged_waiter_reserves_lazy_reasoning_relief",
+        "start": 231,
+        "end": 249
+      },
+      {
+        "name": "test_pending_cpu_destinations_prevent_lazy_demotion_overcommit",
+        "start": 252,
+        "end": 267
+      },
+      {
+        "name": "test_idleness_uses_only_committed_reasoning_and_elapsed_acting",
+        "start": 270,
+        "end": 281
+      },
+      {
+        "name": "test_decode_buffer_is_fixed_and_rounded_at_hbm_block_granularity",
+        "start": 284,
+        "end": 298
+      },
+      {
+        "name": "test_capacity_targets_do_not_deduct_unproven_shared_context",
+        "start": 301,
+        "end": 319
+      },
+      {
+        "name": "test_completion_accumulates_cache_hit_report_from_server_observations",
+        "start": 322,
+        "end": 354
+      },
+      {
+        "name": "test_overlapping_completions_end_reasoning_only_after_the_last_request",
+        "start": 357,
+        "end": 407
+      },
+      {
+        "name": "test_aged_wait_has_an_explicit_progress_exception",
+        "start": 411,
+        "end": 429
+      },
+      {
+        "name": "test_normal_promotion_preserves_mori_decision_table",
+        "start": 432,
+        "end": 460
+      },
+      {
+        "name": "test_new_arrival_joins_the_same_ranked_selection_between_ticks",
+        "start": 463,
+        "end": 482
+      },
+      {
+        "name": "test_later_fitting_candidate_runs_without_speculative_demotion",
+        "start": 485,
+        "end": 501
+      },
+      {
+        "name": "test_over_total_quota_candidate_does_not_block_a_later_fit",
+        "start": 504,
+        "end": 515
+      },
+      {
+        "name": "test_decode_buffer_does_not_block_a_prompt_that_fits_the_total_quota",
+        "start": 518,
+        "end": 529
+      },
+      {
+        "name": "apply",
+        "start": 81,
+        "end": 100
+      }
+    ]
+  }
+}

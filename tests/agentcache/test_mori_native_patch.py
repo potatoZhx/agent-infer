@@ -14,6 +14,7 @@ import pytest
 
 from agentinfer.agentcache.mori.hbm_policy import MORIHBMPolicy
 from agentinfer.agentcache.mori.runtime_state import MORIRuntimeState
+from agentinfer.scheduling import ProgramRef
 
 pytestmark = pytest.mark.cpu_test
 
@@ -75,5 +76,28 @@ def test_allocated_advice_falls_back_and_valid_advice_preserves_native_safety(na
     assert policy.index.propose_exact(2) == (5, 7)
     with pytest.raises(ValueError, match="Cannot get"):
         pool.get_new_blocks(3)
+    pool.unregister_mori_block_selection_provider(policy)
+    policy.close()
+
+
+def test_native_reallocation_invalidates_old_footprint_before_new_owner(native_pool_class) -> None:
+    """The shipped native callback prevents shared-capacity proof surviving ID reuse."""
+    pool = native_pool_class(num_gpu_blocks=3, enable_caching=False, hash_block_size=16)
+    state = MORIRuntimeState()
+    state.footprints.enabled = True
+    old, new = ProgramRef("old", 0), ProgramRef("new", 0)
+    state.bind_request("old", old)
+    state.bind_request("new", new)
+    policy = MORIHBMPolicy(state)
+    pool.register_mori_block_selection_provider(policy)
+    block = pool.get_new_blocks(1)[0]
+    pool.observe_mori_block_owner("old", [block])
+    assert state.footprint(old, "gpu") == frozenset({block.block_id})
+    pool.free_blocks([block])
+    policy.propose = lambda count, protected: (block.block_id,)
+    assert pool.get_new_blocks(1) == [block]
+    assert not state.footprint(old, "gpu")
+    pool.observe_mori_block_owner("new", [block])
+    assert state.footprint(new, "gpu") == frozenset({block.block_id})
     pool.unregister_mori_block_selection_provider(policy)
     policy.close()

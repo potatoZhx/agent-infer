@@ -1,0 +1,6 @@
+{
+  "head": "c714745d682f77409cbb8666587a70eef18246f3",
+  "diff_sha256": "9750d2702d11ca912ca16883b5cc4d7d40a419858a77d3d01d2d0a82ad6d88f8",
+  "status": " M agentinfer/agentcache/core/controller.py\n M agentinfer/agentcache/core/scheduler.py\n M agentinfer/scheduling/mori/config.py\n M agentinfer/scheduling/mori/factors.py\n M agentinfer/scheduling/mori/strategy.py\n M design/module/scheduling/mori-scheduling.md\n M docs/en/how-to/use-mori.md\n M docs/zh/how-to/use-mori.md\n M tests/agentcache/core/test_mori_controller.py\n M tests/agentcache/core/test_mori_vllm_adapter.py\n M tests/scheduling/test_mori_runtime.py\n M tests/scheduling/test_mori_strategy.py\n?? design/module/scheduling/artifacts/mori-redesign-20261028/\n",
+  "gpu_validation": "not run; benchmark remains paused"
+}

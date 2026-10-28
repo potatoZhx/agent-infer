@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
+from agentinfer.agentcache.mori.footprints import FootprintBook
 from agentinfer.scheduling.cache_placement import (
     CacheClass,
     ProgramCacheClassObserver,
@@ -26,13 +27,18 @@ class MORIRuntimeState(ProgramCacheClassObserver):
     def __init__(self) -> None:
         self._provider: ProgramCacheClassProvider | None = None
         self._requests: dict[str, ProgramRef] = {}
+        self._program_requests: dict[ProgramRef, set[str]] = {}
         self._indexes: list[_OwnerIndex] = []
+        self.footprints = FootprintBook()
 
     def bind_provider(self, provider: ProgramCacheClassProvider) -> None:
         if self._provider is not None and self._provider is not provider:
             raise RuntimeError("MORI runtime state is already bound to another scheduler")
         self._provider = provider
         provider.subscribe_cache_class_observer(self)
+        bind = getattr(provider, "bind_footprints", None)
+        if callable(bind):
+            bind(self)
 
     def register_index(self, index: _OwnerIndex) -> None:
         if index not in self._indexes:
@@ -46,16 +52,34 @@ class MORIRuntimeState(ProgramCacheClassObserver):
         if self._provider is not provider:
             return
         provider.unsubscribe_cache_class_observer(self)
+        bind = getattr(provider, "bind_footprints", None)
+        if callable(bind):
+            bind(None)
+        self.footprints.clear()
         self._provider = None
+
+    def footprint(self, program: ProgramRef, tier: str) -> frozenset[int]:
+        """Expose current-prompt block identity evidence to the placement planner."""
+        return self.footprints.get(program, tier)
+
+    def invalidate_footprint(self, program: ProgramRef) -> None:
+        """Forget block proof without deleting native contents or LRU ownership."""
+        self.footprints.invalidate(program)
 
     def bind_request(self, request_id: str, program: ProgramRef) -> None:
         current = self._requests.get(request_id)
         if current is not None and current != program:
             raise RuntimeError("native request id was rebound to another Program generation")
         self._requests[request_id] = program
+        self._program_requests.setdefault(program, set()).add(request_id)
 
     def unbind_request(self, request_id: str) -> None:
-        self._requests.pop(request_id, None)
+        owner = self._requests.pop(request_id, None)
+        if owner is not None:
+            requests = self._program_requests[owner]
+            requests.discard(request_id)
+            if not requests:
+                del self._program_requests[owner]
 
     def program_for_request(self, request_id: str) -> ProgramRef | None:
         return self._requests.get(request_id)
@@ -63,6 +87,7 @@ class MORIRuntimeState(ProgramCacheClassObserver):
     def clear_requests(self) -> None:
         """Drop native request bindings when the owning scheduler shuts down."""
         self._requests.clear()
+        self._program_requests.clear()
 
     def cache_class_for_program(self, program: ProgramRef) -> CacheClass:
         provider = self._provider
@@ -79,19 +104,21 @@ class MORIRuntimeState(ProgramCacheClassObserver):
             index.reclassify_program(program)
 
     def on_program_released(self, program: ProgramRef) -> None:
+        self.footprints.invalidate(program)
         for index in tuple(self._indexes):
             index.release_program(program)
-        stale = [request_id for request_id, owner in self._requests.items() if owner == program]
-        for request_id in stale:
+        for request_id in self._program_requests.pop(program, ()):
             self._requests.pop(request_id, None)
 
     def reset(self) -> None:
         """Reset process-local registrations after shutdown or in unit tests."""
         if self._provider is not None:
-            self._provider.unsubscribe_cache_class_observer(self)
-        self._provider = None
+            self.unbind_provider(self._provider)
         self._requests.clear()
+        self._program_requests.clear()
         self._indexes.clear()
+        self.footprints.clear()
+        self.footprints.enabled = False
 
 
 MORI_RUNTIME_STATE = MORIRuntimeState()

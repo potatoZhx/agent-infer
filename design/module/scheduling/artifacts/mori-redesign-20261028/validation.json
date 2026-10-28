@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "date_utc": "2026-10-28T04:50:17.092600+00:00",
+  "worktree": "/data/zx/agent-kvc/.worktrees/mori",
+  "branch": "codex/mori-formal",
+  "base_commit": "c714745d682f77409cbb8666587a70eef18246f3",
+  "candidate": "uncommitted working tree; exact changed-file hashes in candidate-files.json",
+  "baseline": "baseline.json and before.patch preserve the user experiment diff, not just HEAD",
+  "environment": {
+    "host": "dedicated-developjob-8gpu2-a029z-64896bc8cf-8p2lw",
+    "platform": "Linux-5.10.134-16.103.al8.x86_64-x86_64-with-glibc2.35",
+    "python": "3.12.13 (main, Mar  4 2026, 09:23:07) [GCC 11.4.0]",
+    "system_vllm": "0.32.0",
+    "target_python": "/data/zx-envs/agentinfer-vllm-0.31.0/bin/python",
+    "target_vllm": "0.31.0",
+    "dependency_setup": "uv pip install --python /data/zx-envs/agentinfer-vllm-0.31.0/bin/python 'pytest>=7.0' 'pytest-timeout>=2.3'",
+    "native_source": "/tmp/mori-review-fixes-20261027/upstream",
+    "native_source_sha256": {
+      "vllm/v1/core/block_pool.py": "05c73052934a9d4664ccd5df562ce71011278d9a511932da102ef2efff00e934",
+      "vllm/v1/core/kv_cache_manager.py": "bd9bf46a2101f9368d4941867415a239d18d95e0b956f82f885ce25e10e69f3b",
+      "vllm/v1/simple_kv_offload/manager.py": "37f9b154293922790bd1e8692f16663a4ff819e86a6042bf2e87b903c8dc63f6"
+    }
+  },
+  "checks": [
+    {
+      "name": "system-tests",
+      "command": "MORI_VLLM_SOURCE=/tmp/mori-review-fixes-20261027/upstream PYTHONPATH=. python -m pytest -q tests/scheduling tests/agentcache -m 'not gpu_test'",
+      "exit_code": 0,
+      "summary": "415 passed, 5 deselected, 16 warnings in 23.26s",
+      "raw_log": "design/module/scheduling/artifacts/mori-redesign-20261028/system-tests.log"
+    },
+    {
+      "name": "v031-tests",
+      "command": "MORI_VLLM_SOURCE=/tmp/mori-review-fixes-20261027/upstream PYTHONPATH=. /data/zx-envs/agentinfer-vllm-0.31.0/bin/python -m pytest -q tests/scheduling tests/agentcache -m 'not gpu_test'",
+      "exit_code": 0,
+      "summary": "415 passed, 5 deselected, 14 warnings in 49.55s",
+      "raw_log": "design/module/scheduling/artifacts/mori-redesign-20261028/v031-tests.log"
+    },
+    {
+      "name": "proxy-tests",
+      "command": "PYTHONPATH=. python -m pytest -q tests/agentbench/request_proxy -m 'not gpu_test'",
+      "exit_code": 0,
+      "summary": "41 passed in 1.62s",
+      "raw_log": "design/module/scheduling/artifacts/mori-redesign-20261028/proxy-tests.log"
+    },
+    {
+      "name": "precommit-all",
+      "command": "pre-commit run --all-files",
+      "exit_code": 0,
+      "summary": "all hooks passed (non-applicable hooks skipped)",
+      "raw_log": "design/module/scheduling/artifacts/mori-redesign-20261028/precommit-all.log"
+    },
+    {
+      "name": "precommit-new",
+      "command": "pre-commit run --files agentinfer/agentcache/mori/footprints.py agentinfer/scheduling/lineage.py agentinfer/scheduling/mori/capacity.py design/module/scheduling/artifacts/mori-redesign-20261028/probe_scaling.py design/module/scheduling/mori-redesign-20261028.zh-CN.md tests/scheduling/test_mori_capacity.py tests/scheduling/test_mori_lineages.py",
+      "exit_code": 0,
+      "summary": "all hooks passed (non-applicable hooks skipped)",
+      "raw_log": "design/module/scheduling/artifacts/mori-redesign-20261028/precommit-new.log"
+    },
+    {
+      "name": "precommit-final-slots",
+      "command": "pre-commit run --files agentinfer/scheduling/lineage.py tests/scheduling/test_mori_lineages.py",
+      "exit_code": 0,
+      "summary": "all hooks passed (non-applicable hooks skipped)",
+      "raw_log": "design/module/scheduling/artifacts/mori-redesign-20261028/precommit-final-slots.log"
+    },
+    {
+      "name": "precommit-final-design",
+      "command": "pre-commit run --files design/module/scheduling/mori-redesign-20261028.zh-CN.md",
+      "exit_code": 0,
+      "summary": "all hooks passed (non-applicable hooks skipped)",
+      "raw_log": "design/module/scheduling/artifacts/mori-redesign-20261028/precommit-final-design.log"
+    },
+    {
+      "name": "scaling",
+      "command": "PYTHONPATH=. python design/module/scheduling/artifacts/mori-redesign-20261028/probe_scaling.py",
+      "exit_code": 0,
+      "summary": "64/128/256/512 waiter samples recorded in scaling.json",
+      "raw_log": "design/module/scheduling/artifacts/mori-redesign-20261028/scaling.log"
+    }
+  ],
+  "full_gpu_or_e2e_benchmark_run": false,
+  "not_run_reason": "User previously paused GPU experiments. CPU state-machine, adapter, request-proxy and native HBM patch tests are the fallback; no throughput, TTFT or SWE-bench correctness improvement is claimed.",
+  "not_run": [
+    "GPU cold baseline/candidate matrix",
+    "native asynchronous D2H/H2D inference stress",
+    "SWE-bench FAIL_TO_PASS/PASS_TO_PASS comparison",
+    "residency/idleness/fairness parameter ablations"
+  ],
+  "cpu_probe": {
+    "raw_samples": "scaling.json",
+    "scope": "instrumented non-fitting waiter planner only",
+    "factor_reads": [
+      389,
+      773,
+      1541,
+      3077
+    ],
+    "waiters": [
+      64,
+      128,
+      256,
+      512
+    ]
+  },
+  "review_scope": "Local quick review of redesign against c714745 plus preserved experiment diff; main...HEAD inventory checked. Existing native patches retained; HBM patch exercised against pristine source. No PR opened or history changed.",
+  "resolved_during_review": [
+    "native cancellation intent must retain running lease until native confirmation",
+    "rounded decode reserve growth must wake before raw-context block boundary",
+    "stale soft-demotion cancellation must update the planning snapshot",
+    "recycled native block IDs must invalidate capacity proof",
+    "terminal named lineages must recycle internal ID slots while advancing generations",
+    "Anthropic tests must call the installed to_chat_completion_request entry point"
+  ],
+  "limits": [
+    "CPU tier is protection intent, not full READY coverage",
+    "unknown current-prompt footprints remain conservatively charged",
+    "MORI requires a single native KV cache group",
+    "temporary overlaps release protection on completion; persistent branches require lineage_id",
+    "per-arrival snapshots still cost O(P); only per-cycle repeated candidate/victim scans were removed",
+    "engineering defaults 1s residency, 0.05 idleness margin, 30s fairness are not paper constants or tuned GPU results"
+  ]
+}

@@ -228,6 +228,17 @@ offload manager 的 `num_chunks * tokens_per_chunk` 归一化得到，并经 `Dp
 
 ## Admission、promotion 与 demotion
 
+2026-10-28 调度修订（替代本节下方保留的首版和 2026-10-27 等待规则）：新到与 retained 候选统一按
+MORI tier、new-context 大小、idleness 和稳定 identity 选择，不再使用 `starvation_timeout_seconds` 或
+等待时长提权。无空闲容量时先尝试 Acting demotion；仍无法 fit 则继续扫描后续候选，不为队首保留空槽。
+完成本轮 fit 扫描后，才为首个仍未满足的可行候选安排 Reasoning lazy demotion；真正完成后的 pause 才释放
+reservation。arrival、completion、pause 和 release 通过既有 `next_check_at` 接口唤醒调度，不额外等待
+五秒 periodic tick；无新事件时保留原周期维护。
+
+本次继续使用完整 context 计费，不扣除可能包含 residual self KV 的 shared-prefix 观测。固定 decode
+buffer 在 prompt 本身可 fit 时截到总 HBM quota；prompt 本身超过 rank 的整个 HBM KV 容量时，由 vLLM
+bridge 在创建 Program binding 前返回 terminal error。native allocator 的实际分配安全边界不变。
+
 2026-10-27 服务安全修订：下述首版 sticky 顺序保留用于未超时请求。当前实现对等待超过
 `mori.starvation_timeout_seconds`（默认 60 秒）的请求使用跨组 oldest-first 顺序，并在必要时为最早可行请求
 回收 GPU reservation；Reasoning 仍只在完成后释放容量。新请求不能从 admission 快径绕过正在等待的请求。
@@ -441,3 +452,12 @@ overlap rejection、subagent isolation、shared-owner protection、两层 evicti
 snapshot/capability failure 和 idempotent cleanup。真实 GPU replay 仍是独立验收阶段；CPU 单元测试和 native patch
 smoke 不能替代 D2H/H2D、
 cache hit 与端到端时延报告。
+
+## 2026-10-28 lineage and capacity redesign
+
+The [append-only redesign contract](mori-redesign-20261028.zh-CN.md) supersedes the earlier overlap and immediate
+replacement behavior described above. MORI now isolates implicit overlapping requests, serializes explicit lineages,
+retains executing leases until completion, and coalesces victim selection into one planner cycle. It accounts for
+proven shared native blocks by union and retains conservative private promises when proof is absent. Engineering
+residency, idleness-margin and fairness settings are documented separately from paper behavior in the redesign.
+Validation artifacts are under `artifacts/mori-redesign-20261028/`; GPU/E2E validation remains explicitly deferred.

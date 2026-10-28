@@ -13,8 +13,8 @@ D2H/H2D 搬运，不依赖 `OffloadingConnector` 的共享内存分配器。
 - `lazy_offload=false`；
 - 每个请求能由服务端 middleware 解析出 Program identity。
 
-full 模式在缺少 HBM hook、SimpleCPU hook 或 DRAM 容量快照时拒绝启动。运行期缺失或格式错误的 identity、
-同一 Program 的重叠请求仅返回该请求的终止错误。无效 victim 建议会回退到 native free queue 顺序，并记录告警和
+full 模式在缺少 HBM hook、SimpleCPU hook 或 DRAM 容量快照时拒绝启动。运行期缺失或格式错误的 identity
+返回该请求的终止错误；重叠请求按下述分支规则处理。无效 victim 建议会回退到 native free queue 顺序，并记录告警和
 回退次数。需要只验证 placement 时，应显式配置 `"mode":"placement_only"`。
 
 ## 给 vLLM 应用两个窄补丁
@@ -100,11 +100,42 @@ SimpleCPU adapter 在启动和运行期间完成以下闭环：
 MORI 当前不主动 prefetch。CPU tier 表示保护优先级；需要再次推理时仍由 SimpleCPU 的 native on-demand load
 触发 H2D。
 
-等待超过 `mori.starvation_timeout_seconds`（默认 `60.0`，要求有限正数）的请求跨 promotion 组按等待时间从长到短
-优先处理。若最早的可行请求无法立即 fit，MORI 会暂停 Acting GPU resident，或标记 Reasoning resident 在完成后
-降级，为该请求保留下一轮容量。新到达请求进入已有等待队列。这是服务公平性扩展，会在超时后改变 sticky placement，
-不代表响应时间上界；仍要求请求完整 fit GPU quota，且正在推理的请求最终完成。diagnostics 增加 `max_wait_seconds`，
-超时前仍沿用正常的 MORI priority 和 idleness 顺序。
+MORI 在容量合法且没有满足置换条件的等待者时保持驻留。事件唤醒统一规划；到达路径仅使用已有余量，
+不逐请求扫描 victim。普通队列按 CPU returning、其他 returning、新 Program 的 context/idleness 排序。
+置换前必须证明整个 victim 集合能让候选进展。Acting victim 需要满足最小驻留时间，并具有相对 idleness
+优势，或 GPU 上都处于 Acting 且工具阶段已稳定。老等待者可以触发 Reasoning lazy demotion；承诺的空间
+保留给受益者，直到它获准或取消。Reasoning 完成或 native 确认取消后才释放 GPU 预留；串行排队的后续请求
+不会延长当前 drain。
+
+`agentcache.mori` 的工程默认值为 `min_residency_seconds=1.0`、`idleness_margin=0.05`、
+`max_wait_seconds=30.0`。这些不是论文参数。`max_wait_seconds` 触发公平性选择，不保证延迟上界，
+因为已有推理仍须结束。旧 `mori.starvation_timeout_seconds` 配置继续不受支持。diagnostics 中
+`max_wait_seconds` 是观测值，`configured_max_wait_seconds` 是配置值。
+
+当前 MORI 要求一个 native KV cache group。有效 HBM 容量扣除永久 null block；prompt 加最大输出超过
+有效容量的请求在准入前拒绝。逻辑 GPU 预算是 context 加 100 decode token 后按 block 取整，推测余量
+截到总容量；CPU 按 chunk 取整。只有当前 prompt 的有效 native block ID 证据才能用于共享抵扣，未知或
+失效证据保守计费。CPU placement 不保证完整 CPU 副本已 READY；native 仍负责 refcount、传输 fence、
+实际分配和必要的重算。
+
+### 并发分支与生命周期
+
+串行客户端可沿用原有 Program identity。前一请求未结束时到达的默认重叠请求获得临时独立 owner；该分支
+完成即释放保护，native 缓存仍可机会性复用。服务端不推断应用最终采用哪个输出，后续真实 prompt 决定
+新的 context，允许裁剪和切换上下文。
+
+需要跨轮次保留分支保护时，在 canonical identity 中传递稳定 `lineage_id`：
+
+```json
+{"vllm_xargs":{"agentic_context":"{\"program_id\":\"session:lead\",\"lineage_id\":\"research\"}"}}
+```
+
+同一显式 lineage 的请求串行执行；不同 lineage 的 context、计时、tier、生命周期相互独立。内部 owner
+不构造应用层的父级阻塞关系，真实 subagent 继续使用独立 agent identity。API middleware 为每次请求生成
+内部 `lifecycle_token`，客户端无需设置；迟到的 terminal 信号只能释放对应最新请求的空闲 lineage。
+
+完整设计、论文对照和验证边界见
+[2026-10-28 重构方案](../../../design/module/scheduling/mori-redesign-20261028.zh-CN.md)。
 
 ## 启动检查和排障
 
