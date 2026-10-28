@@ -1,0 +1,45 @@
+{
+  "legacy_cpu_policy": {
+    "incoming_tier": "gpu",
+    "resident_tier": "cpu",
+    "idle_chunk_evicted": true,
+    "scope": "real policy API, no DMA or full connector execution"
+  },
+  "response_stop": {
+    "mapped_lifecycle": "terminal",
+    "released_program": true,
+    "old_generation": 0,
+    "next_generation": 1,
+    "old_factors_removed": true
+  },
+  "prompt_replacement": {
+    "footprint_blocks_after_replace": [],
+    "old_block_still_has_owner": true,
+    "old_block_class": "busy",
+    "scope": "old prompt block protection, native contents are not modified"
+  },
+  "waiting_pressure_swap": {
+    "gpu_commitment_before": 800,
+    "gpu_quota": 1000,
+    "resident_idleness": 0.01,
+    "candidate_idleness": 0.99,
+    "actions": [
+      {
+        "kind": "pause",
+        "owner": "resident",
+        "reason": "mori_waiting_inference"
+      },
+      {
+        "kind": "resume",
+        "owner": "candidate",
+        "reason": "mori_cycle_promote"
+      }
+    ]
+  },
+  "before_first_native_execution": {
+    "idleness_at_admission": 0.9,
+    "idleness_after_100_seconds_queued": 0.08181818181818182,
+    "idleness_when_execution_starts": 0.9,
+    "scope": "strategy clock before first native execution notification"
+  }
+}

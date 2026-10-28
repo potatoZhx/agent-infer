@@ -274,7 +274,7 @@ def test_completed_demotion_is_not_a_persistent_plan(status: ProgramStatus) -> N
     survivor = view("survivor", state=ProgramState.ACTIVE, status=status, tokens=700)
     drained = view("drained", state=ProgramState.PAUSED, status=ProgramStatus.ACTING, tokens=400)
     waiting = view("waiting", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400, step_count=1)
-    set_tier(components, survivor, MORITier.GPU)
+    set_tier(components, survivor, MORITier.GPU, idleness=0.9)
     set_tier(components, drained, MORITier.CPU)
     calls = []
     components.strategy.schedule_resume(
@@ -305,19 +305,82 @@ def test_unfittable_high_priority_waiter_does_not_block_smaller_request() -> Non
     assert [(call.kind, call.program) for call in calls] == [(TransitionKind.ADMIT, backfill.ref)]
 
 
-def test_waiting_reasoning_reclaims_acting_even_with_equal_idleness() -> None:
+@pytest.mark.parametrize(("resident_idle", "waiting_idle"), [(1.0, 1.0), (0.01, 0.99), (0.0, 0.0)])
+def test_waiting_reasoning_cannot_displace_equal_or_busier_acting(resident_idle, waiting_idle) -> None:
     components = build_mori_strategy()
     resident = view("resident", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=700)
     waiting = view("waiting", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400)
-    for program, tier in [(resident, MORITier.GPU), (waiting, MORITier.CPU)]:
-        set_tier(components, program, tier, idleness=1.0)
+    set_tier(components, resident, MORITier.GPU, idleness=resident_idle)
+    set_tier(components, waiting, MORITier.CPU, idleness=waiting_idle)
     calls = []
     components.strategy.schedule_resume(
         snapshot(resident, waiting),
         components.initial_factors,
         accepting_controller(components.strategy, components.initial_factors, calls),
     )
-    assert [call.kind for call in calls] == [TransitionKind.PAUSE, TransitionKind.ADMIT]
+    assert calls == []
+
+
+def test_relative_exchange_requires_enough_eligible_marginal_relief_before_demoting():
+    components = build_mori_strategy()
+    idle = view("idle", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=100)
+    busy = view("busy", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=600)
+    large = view("large", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400, step_count=1)
+    small = view("small", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=1)
+    for program, tier, score in [(idle, MORITier.GPU, 0.9), (busy, MORITier.GPU, 0.1), (large, MORITier.CPU, 0.5)]:
+        set_tier(components, program, tier, idleness=score)
+    calls = []
+    components.strategy.schedule_resume(
+        snapshot(idle, busy, large, small, hbm=1020),
+        components.initial_factors,
+        accepting_controller(components.strategy, components.initial_factors, calls),
+    )
+    assert [(call.kind, call.program) for call in calls] == [(TransitionKind.ADMIT, small.ref)]
+
+
+def test_ineligible_cpu_candidate_does_not_consume_victims_for_busier_waiting_candidate():
+    components = build_mori_strategy()
+    victim = view("victim", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=700)
+    cpu = view("cpu", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400, step_count=1)
+    waiting = view("waiting", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400, step_count=1)
+    set_tier(components, victim, MORITier.GPU, idleness=0.5)
+    set_tier(components, cpu, MORITier.CPU, idleness=0.9)
+    set_tier(components, waiting, MORITier.WAITING, idleness=0.1)
+    calls = []
+    components.strategy.schedule_resume(
+        snapshot(victim, cpu, waiting, hbm=1000, dram=2000),
+        components.initial_factors,
+        accepting_controller(components.strategy, components.initial_factors, calls),
+    )
+    assert [(call.kind, call.program) for call in calls] == [
+        (TransitionKind.PAUSE, victim.ref),
+        (TransitionKind.RESUME, waiting.ref),
+    ]
+
+
+def test_rejected_relative_demotion_keeps_actual_budget_and_allows_slack_backfill():
+    components = build_mori_strategy()
+    victim = view("victim", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=700)
+    waiting = view("waiting", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400, step_count=1)
+    backfill = view("backfill", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=50)
+    set_tier(components, victim, MORITier.GPU, idleness=0.9)
+    set_tier(components, waiting, MORITier.CPU, idleness=0.1)
+    calls = []
+    accepted = accepting_controller(components.strategy, components.initial_factors, calls)
+
+    def reject_demotion(request):
+        if request.kind is TransitionKind.PAUSE:
+            return TransitionResult(request.kind, request.program, False, "still_authorized")
+        return accepted.apply(request)
+
+    components.strategy.schedule_resume(
+        snapshot(victim, waiting, backfill), components.initial_factors, TransitionController(reject_demotion)
+    )
+    assert [(call.kind, call.program) for call in calls] == [(TransitionKind.ADMIT, backfill.ref)]
+    assert components.initial_factors.for_program(victim.ref).tier is MORITier.GPU
+    assert components.initial_factors.for_program(victim.ref).pending_tier is None
+    assert components.initial_factors.for_program(waiting.ref).tier is MORITier.CPU
+    assert components.strategy.counters["demotion_rejected"] == 1
 
 
 def test_idleness_uses_only_committed_reasoning_and_elapsed_acting() -> None:

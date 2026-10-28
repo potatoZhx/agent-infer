@@ -1,0 +1,69 @@
+{
+  "observed_at_utc": "2026-10-28T14:16:58.354190+00:00",
+  "base_commit": "db7870d8e3db50d7f14afe200b4a521803fd4ecf",
+  "branch": "codex/mori-formal",
+  "scope": "Relative-idleness exchange semantics and per-round shared-block feasibility; native directory, transfer ACK protocol and async planner remain separate future stages.",
+  "checks": [
+    {
+      "name": "pytest",
+      "command": "MORI_VLLM_SOURCE=/tmp/mori-review-fixes-20261027/upstream PYTHONPATH=. /data/zx-envs/agentinfer-vllm-0.31.0/bin/python -m pytest tests/scheduling/ tests/agentcache/ -m cpu_test -q",
+      "exit_code": 0,
+      "output": "pytest.txt",
+      "passed": 477,
+      "deselected": 26,
+      "warnings": 14
+    },
+    {
+      "name": "probe",
+      "command": "MORI_VLLM_SOURCE=/tmp/mori-review-fixes-20261027/upstream PYTHONPATH=. /data/zx-envs/agentinfer-vllm-0.31.0/bin/python design/module/scheduling/artifacts/mori-relative-rebalance-20261028/probe.py",
+      "exit_code": 0,
+      "output": "probe.json"
+    },
+    {
+      "name": "pre-commit",
+      "command": "pre-commit run --files agentinfer/scheduling/mori/capacity.py agentinfer/scheduling/mori/strategy.py design/module/scheduling/artifacts/mori-paper-audit-20261028/probe.json design/module/scheduling/artifacts/mori-paper-audit-20261028/probe.py design/module/scheduling/artifacts/mori-paper-audit-20261028/pytest.txt design/module/scheduling/artifacts/mori-paper-audit-20261028/validation.json design/module/scheduling/artifacts/mori-relative-rebalance-20261028/pre-commit.txt design/module/scheduling/artifacts/mori-relative-rebalance-20261028/probe.json design/module/scheduling/artifacts/mori-relative-rebalance-20261028/probe.py design/module/scheduling/artifacts/mori-relative-rebalance-20261028/pytest.txt design/module/scheduling/artifacts/mori-relative-rebalance-20261028/validation.json design/module/scheduling/mori-implementation.zh-CN.md design/module/scheduling/mori-paper-audit-20261028.zh-CN.md design/module/scheduling/mori-relative-rebalance-20261028.zh-CN.md design/module/scheduling/mori-scheduling.md design/module/scheduling/mori-state-refactor-20261028.zh-CN.md docs/en/how-to/use-mori.md docs/zh/how-to/use-mori.md tests/scheduling/test_mori_capacity.py tests/scheduling/test_mori_runtime.py tests/scheduling/test_mori_strategy.py",
+      "exit_code": 0,
+      "output": "pre-commit.txt"
+    }
+  ],
+  "unchanged_method_source": {
+    "on_execution_changed": true,
+    "_idleness": true,
+    "_gpu_target": true,
+    "handle_admission": true,
+    "_demote": true,
+    "_repair_gpu_capacity": true
+  },
+  "config_file_unchanged": true,
+  "default_decode_buffer_tokens": 100,
+  "native_queue_timing_modified": false,
+  "gpu_benchmark_run": false,
+  "not_run_reason": "Focused scheduler refactor verified with CPU policy/runtime regressions and existing native Python patch tests. No native patch/deployment changes; no GPU 32/16 inference or DMA validation and no end-to-end performance claim.",
+  "source_sha256": {
+    "agentinfer/scheduling/mori/strategy.py": "d85d15bdae5a9a4b61ff6e603db4d0b33340f15154fda8aad2a0bc5557442698",
+    "agentinfer/scheduling/mori/capacity.py": "638fa9414ff1e3302cbcbb6d149ff495619831685326b4ed0ae1f71c38686c5d",
+    "agentinfer/scheduling/mori/config.py": "dadb793a15fcaea6ea7f82968929aed6dc7dc84e043f15844103d3c4ac53256d",
+    "tests/scheduling/test_mori_strategy.py": "609cb4871115592223edd0d7359fdeb9676b2a0be767a8f3abbb9c7043e2326f",
+    "tests/scheduling/test_mori_capacity.py": "36274e2581ad385a518ed5023d96d62d9ab4196b923a0d079d67120e9731b272",
+    "tests/scheduling/test_mori_runtime.py": "29a83e1a47697d10ef73a52b6fe683b4a194e734c67f3ddfec979b2c1c9e4de7",
+    "design/module/scheduling/artifacts/mori-relative-rebalance-20261028/probe.py": "bbcddcb7840338e316a5029250f5b042d3e17b24958e6cce66bf859ca6f23444"
+  },
+  "review": {
+    "scope": "Second pass over implementation diff, independent union oracle and runtime boundary tests",
+    "verified": [
+      "strict per-victim relative idleness",
+      "no changes for infeasible exchanges",
+      "shared candidate and victim blocks",
+      "earlier admissions update every projection boundary",
+      "rejected transitions retain actual GPU capacity",
+      "unfittable candidates allow later admissions",
+      "unchanged reasoning completion boundary"
+    ],
+    "remaining_design_work": [
+      "native instance directory and persistent ledgers",
+      "transfer completion/coverage protocol",
+      "off-thread planning",
+      "lifecycle and legacy connector findings from baseline audit"
+    ]
+  }
+}

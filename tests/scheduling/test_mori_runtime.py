@@ -129,7 +129,7 @@ def test_arrival_can_use_free_capacity_behind_a_non_fitting_waiter() -> None:
         assert runtime.request_pool.waiting_request_ids == ("large",)
 
 
-def test_completion_wakes_selection_and_reclaims_acting_for_waiting_inference() -> None:
+def test_completion_keeps_tied_placement_then_elapsed_acting_allows_rebalance() -> None:
     runtime = scheduler()
     capacity = backend(1008)
     with patch("agentinfer.scheduling.runtime.time.monotonic", return_value=0.0) as clock:
@@ -142,5 +142,13 @@ def test_completion_wakes_selection_and_reclaims_acting_for_waiting_inference() 
         assert not runtime.on_request_arrival("small", AgentIdentity("small"), 50, capacity, "small")
         assert runtime.needs_schedule_cycle(1.1)
         runtime.schedule_cycle(capacity)
-        assert [entry.request_id for entry, _ in runtime.consume_admitted_requests()] == ["small", "large"]
+        assert [entry.request_id for entry, _ in runtime.consume_admitted_requests()] == ["small"]
+        assert runtime.request_pool.waiting_request_ids == ("large",)
+        # Completion alone does not establish a relative idleness advantage.
+        # The next periodic cycle observes actual elapsed tool time; no new
+        # request or exclusive relief plan is needed to make progress.
+        clock.return_value = 6.2
+        assert runtime.needs_schedule_cycle(6.2)
+        runtime.schedule_cycle(capacity)
+        assert [entry.request_id for entry, _ in runtime.consume_admitted_requests()] == ["large"]
         assert runtime.request_pool.waiting_request_ids == ()

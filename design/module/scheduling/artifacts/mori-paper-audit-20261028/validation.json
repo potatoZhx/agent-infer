@@ -1,0 +1,32 @@
+{
+  "observed_at_utc": "2026-10-28T13:39:49.232309+00:00",
+  "base_commit": "db7870d8e3db50d7f14afe200b4a521803fd4ecf",
+  "paper_url": "https://arxiv.org/html/2606.00866",
+  "paper_version": "2606.00866v1",
+  "runtime_code_modified": false,
+  "probe_command": "PYTHONPATH=. /data/zx-envs/agentinfer-vllm-0.31.0/bin/python design/module/scheduling/artifacts/mori-paper-audit-20261028/probe.py",
+  "probe_exit_code": 0,
+  "probe_scenarios": 5,
+  "probe_output": "probe.json",
+  "pytest_command": "MORI_VLLM_SOURCE=/tmp/mori-review-fixes-20261027/upstream PYTHONPATH=. /data/zx-envs/agentinfer-vllm-0.31.0/bin/python -m pytest tests/scheduling/test_mori_strategy.py tests/scheduling/test_mori_branches.py tests/scheduling/test_mori_capacity.py tests/agentcache/test_mori_cpu_policy.py tests/agentcache/test_mori_native_patch.py -m cpu_test -q",
+  "pytest_exit_code": 0,
+  "pytest_passed": 76,
+  "pytest_warnings": 14,
+  "pytest_log": "pytest.txt",
+  "gpu_benchmark_run": false,
+  "not_run_reason": "Paper/source/design audit with CPU-only policy/state probes and native Python hook regressions; no DMA, inference, or performance claim.",
+  "source_sha256": {
+    "agentinfer/scheduling/mori/strategy.py": "91fa0baca4bee6a9e8cfd55dd2d21e32581e354f77d16f6e2bd710d118122d83",
+    "agentinfer/agentcache/mori_cpu_policy.py": "dc23d1a770ae314aab65c3d62c4643255758ee9c3070deece4e92ea46c301208",
+    "agentinfer/agentcache/core/api_adapter.py": "985796f6e1eb27ecd4fcb35e02c969e0c74c7d72a54e31e1d033215036c30f0c",
+    "agentinfer/scheduling/runtime.py": "f8d03f1e00cfd3a59a62e0dd1ffac1aeb7e84e914e24feb07977dc0f7495dda4",
+    "agentinfer/agentcache/core/scheduler.py": "787ea7c9b7a047b0335b56bcbd0d80a2ba1707237290adb88380f2352a0f3088",
+    "agentinfer/agentcache/mori/vllm_adapter.py": "f7098dca4f10bbcf4f2602a2e4a104794b34199dbcbe3dc2057506eaf7e12378",
+    "design/module/scheduling/artifacts/mori-paper-audit-20261028/probe.py": "b53ced568774cec30cd8dc60f6c04e80db51562a8c1ea4c093509d755e603ef8"
+  },
+  "pre_commit": {
+    "passed": true,
+    "command": "pre-commit run --files design/module/scheduling/mori-paper-audit-20261028.zh-CN.md design/module/scheduling/mori-state-refactor-20261028.zh-CN.md design/module/scheduling/artifacts/mori-paper-audit-20261028/probe.py",
+    "scope": "Artifacts probe.json, pytest.txt, validation.json also passed the earlier artifact check; final JSON writes parsed successfully."
+  }
+}

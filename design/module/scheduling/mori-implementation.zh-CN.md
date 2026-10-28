@@ -707,3 +707,15 @@ SimpleCPU 升为 API 2，BUSY 备份不能驱逐 IDLE CPU 缓存，拒绝写入�
 
 尚需重构的 native 事实目录、增量账本、迁移确认与异步规划见
 [状态与执行边界重构方案](mori-state-refactor-20261028.zh-CN.md)；该文明确区分已实现与后续设计。
+
+## 2026-10-28 后续修订：相对分界置换
+
+等待 Reasoning 不再无条件置换 GPU Acting。无现有容量超额时，先用余量；余量不足时仅交换严格比候选
+更 idle 的 Acting，且共享块边际收益必须能支持整组交换。平局保持 placement，不能 fit 就继续后续候选。
+超额修复保留 Acting 优先和 Reasoning 完成边界。100-token 预留与 native 内部排队计时按用户要求保留。
+
+回收前缀投影在本轮成功准入后增量更新，不构造候选独占的跨轮计划。
+实现与测试索引见[相对分界置换重构](mori-relative-rebalance-20261028.zh-CN.md)。
+源码：`agentinfer/scheduling/mori/strategy.py:206-289`、`capacity.py:83-138`；
+回归：`tests/scheduling/test_mori_capacity.py:56-83,143-267`、`test_mori_runtime.py:132-154`。
+完整 native 实例目录、迁移确认与后台规划仍属于后续阶段；本次只有 CPU 验证，没有 GPU 性能结论。

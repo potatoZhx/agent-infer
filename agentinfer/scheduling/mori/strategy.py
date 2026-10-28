@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import math
 import time
+from bisect import bisect_left
 from collections import Counter
 from dataclasses import replace
 
@@ -14,7 +15,7 @@ from agentinfer.scheduling.cache_placement import CacheClass, ProgramCacheClassO
 from agentinfer.scheduling.domain import ProgramRef, ProgramState, ProgramStatus, ProgramView
 from agentinfer.scheduling.events import SchedulingEvent, StrategyDiagnostic
 from agentinfer.scheduling.factors import StrategyFactors
-from agentinfer.scheduling.mori.capacity import CapacityClaim, CapacityLedger, FootprintProvider
+from agentinfer.scheduling.mori.capacity import CapacityClaim, CapacityLedger, FootprintProvider, ReliefProjection
 from agentinfer.scheduling.mori.config import MORIConfig, MORIMode
 from agentinfer.scheduling.mori.factors import MORIGlobalFactors, MORIProgramFactors, MORITier
 from agentinfer.scheduling.snapshot import SchedulingSnapshot
@@ -25,7 +26,7 @@ MORIFactors = StrategyFactors[MORIGlobalFactors, MORIProgramFactors]
 
 
 class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
-    """Capacity-triggered placement with relative idleness used only for ordering.
+    """Capacity repair and sticky placement with relative-idleness rebalancing.
 
     The strategy does not predict a future return, prefetch KV, or perform a
     transfer. It commits logical protection classes; native vLLM remains the
@@ -210,21 +211,24 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
     ) -> None:
         """Rank once, share a victim cursor, and skip candidates that cannot fit.
 
-        Waiting inference can reclaim Acting reservations, highest idleness
-        first. Running inference is drained only for actual GPU capacity debt;
-        no candidate owns future releases or blocks unrelated ready work.
+        Slack promotions and relative rebalancing are separate from capacity
+        repair. A waiting request may displace only strictly more idle Acting
+        owners, and only if their marginal relief makes that request feasible.
+        Running inference is drained only for actual GPU capacity debt.
         """
+        candidates = [
+            p
+            for p in snapshot.programs
+            if p.state is ProgramState.PAUSED and p.status is ProgramStatus.REASONING and not p.marked_for_pause
+        ]
+        if not candidates:
+            return
         gpu, cpu = self._ledgers(snapshot, strategy_factors)
         quota = self._gpu_quota(snapshot)
         if gpu.used > quota:
             self.counters["promotion_blocked_capacity_debt"] += 1
             return
         now = snapshot.observed_at_monotonic_s
-        candidates = [
-            p
-            for p in snapshot.programs
-            if p.state is ProgramState.PAUSED and p.status is ProgramStatus.REASONING and not p.marked_for_pause
-        ]
         candidates.sort(key=lambda p: self._promotion_key(p, strategy_factors, snapshot, now))
         victims = [
             p
@@ -235,30 +239,44 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             and self._factor(strategy_factors, p.ref).pending_tier is None
         ]
         victims.sort(key=lambda p: self._demotion_key(p, strategy_factors, now))
-        # Test feasibility without repeatedly scanning owners or needlessly
-        # demoting Acting programs for a candidate blocked by running inference.
-        available = gpu.copy()
-        for victim in victims:
-            available.remove(victim.ref)
-        victim_cursor = iter(victims)
+        idle_keys = [-self._idleness(self._factor(strategy_factors, p.ref), now) for p in victims]
+        projection = ReliefProjection(gpu, tuple(p.ref for p in victims))
+        removed = 0
+        exchange_valid = True
         for candidate in candidates:
             self.counters["planning_candidates"] += 1
             claim = self._claim(candidate, snapshot, gpu=True)
             if claim.tokens > quota:
                 self.counters["promotion_exceeds_total_quota"] += 1
                 continue
-            if available.used + available.incremental(claim) > quota:
-                self.counters["promotion_no_fit"] += 1
-                continue
-            while gpu.used + gpu.incremental(claim) > quota:
-                victim = next(victim_cursor, None)
-                if victim is None:
-                    break
-                self.counters["planning_victims"] += 1
-                if not self._demote(
-                    victim, snapshot, strategy_factors, transitions, gpu, cpu, reason="mori_waiting_inference"
-                ):
-                    available.add(victim.ref, gpu.claims[victim.ref])
+            if gpu.used + gpu.incremental(claim) > quota:
+                candidate_idle = self._idleness(self._factor(strategy_factors, candidate.ref), now)
+                eligible = max(removed, bisect_left(idle_keys, -candidate_idle))
+                if not exchange_valid or projection.required(eligible, claim) > quota:
+                    self.counters["promotion_no_fit"] += 1
+                    continue
+                # Find the smallest feasible prefix before changing placement.
+                # Repeatedly checking the candidate's shared blocks after each
+                # victim would multiply candidate-block and victim counts.
+                low, high = removed + 1, eligible
+                while low < high:
+                    middle = (low + high) // 2
+                    if projection.required(middle, claim) <= quota:
+                        high = middle
+                    else:
+                        low = middle + 1
+                while removed < low:
+                    victim = victims[removed]
+                    self.counters["planning_victims"] += 1
+                    if not self._demote(
+                        victim, snapshot, strategy_factors, transitions, gpu, cpu, reason="mori_relative_rebalance"
+                    ):
+                        # Do not reuse a projection after a rejected transition.
+                        # Slack admissions remain possible; retry exchanges on
+                        # the next fresh round without an exclusive beneficiary.
+                        exchange_valid = False
+                        break
+                    removed += 1
             if gpu.used + gpu.incremental(claim) > quota:
                 continue
             result = (transitions.resume if candidate.step_count else transitions.admit)(
@@ -266,7 +284,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             )
             if result.applied:
                 gpu.add(candidate.ref, claim)
-                available.add(candidate.ref, claim)
+                projection.admit(claim)
                 cpu.remove(candidate.ref)
                 self.counters["promotion_applied"] += 1
 

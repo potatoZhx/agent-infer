@@ -1,0 +1,106 @@
+{
+  "scope": "CPU policy and operation counts; no DMA, native inference, or latency measurement",
+  "exchanges": [
+    {
+      "resident_idleness": 0.01,
+      "candidate_idleness": 0.99,
+      "transitions": [],
+      "final_gpu_commitment": 800
+    },
+    {
+      "resident_idleness": 0.9,
+      "candidate_idleness": 0.1,
+      "transitions": [
+        {
+          "kind": "pause",
+          "program": "resident",
+          "reason": "mori_relative_rebalance"
+        },
+        {
+          "kind": "resume",
+          "program": "candidate",
+          "reason": "mori_cycle_promote"
+        }
+      ],
+      "final_gpu_commitment": 500
+    },
+    {
+      "resident_idleness": 0.5,
+      "candidate_idleness": 0.5,
+      "transitions": [],
+      "final_gpu_commitment": 800
+    }
+  ],
+  "no_fit_scaling": [
+    {
+      "candidates": 64,
+      "acting_victims": 64,
+      "reasoning_residents": 1,
+      "factor_reads": 513,
+      "projected_owner_removals": 64,
+      "projection_queries": 64,
+      "actual_transitions": 0,
+      "counters": {
+        "planning_program_reads": 129,
+        "planning_candidates": 64,
+        "promotion_no_fit": 64
+      }
+    },
+    {
+      "candidates": 128,
+      "acting_victims": 128,
+      "reasoning_residents": 1,
+      "factor_reads": 1025,
+      "projected_owner_removals": 128,
+      "projection_queries": 128,
+      "actual_transitions": 0,
+      "counters": {
+        "planning_program_reads": 257,
+        "planning_candidates": 128,
+        "promotion_no_fit": 128
+      }
+    },
+    {
+      "candidates": 256,
+      "acting_victims": 256,
+      "reasoning_residents": 1,
+      "factor_reads": 2049,
+      "projected_owner_removals": 256,
+      "projection_queries": 256,
+      "actual_transitions": 0,
+      "counters": {
+        "planning_program_reads": 513,
+        "planning_candidates": 256,
+        "promotion_no_fit": 256
+      }
+    },
+    {
+      "candidates": 512,
+      "acting_victims": 512,
+      "reasoning_residents": 1,
+      "factor_reads": 4097,
+      "projected_owner_removals": 512,
+      "projection_queries": 512,
+      "actual_transitions": 0,
+      "counters": {
+        "planning_program_reads": 1025,
+        "planning_candidates": 512,
+        "promotion_no_fit": 512
+      }
+    },
+    {
+      "candidates": 1024,
+      "acting_victims": 1024,
+      "reasoning_residents": 1,
+      "factor_reads": 8193,
+      "projected_owner_removals": 1024,
+      "projection_queries": 1024,
+      "actual_transitions": 0,
+      "counters": {
+        "planning_program_reads": 2049,
+        "planning_candidates": 1024,
+        "promotion_no_fit": 1024
+      }
+    }
+  ]
+}

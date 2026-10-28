@@ -102,12 +102,17 @@ The SimpleCPU adapter closes the following loop at startup and runtime:
 MORI does not actively prefetch. CPU tier is a protection priority; a later inference still triggers SimpleCPU's native
 on-demand H2D load.
 
-GPU membership is the admission decision: the current request goes directly to the engine, while serial followers
-wait for its completion. Growth beyond the aggregate GPU budget triggers Acting-first, highest-idleness demotion.
-Reasoning victims retain their GPU commitment until completion or confirmed native cancellation; serial followers
-cannot prolong that drain. Pending inference is ordered by CPU returns, other returns, then new Programs by context
-size and idleness. Candidates that cannot fit do not block later candidates. Waiting inference may reclaim Acting
-commitments in idleness order. Without pressure, placement stays unchanged.
+GPU membership is the admission decision: its request goes directly to the engine. Overlapping requests have
+independent server-owned branches and obtain their own placement. Growth beyond the aggregate GPU budget triggers
+Acting-first, highest-idleness demotion. Reasoning victims retain their GPU commitment until completion or confirmed
+native cancellation. Pending inference is ordered by CPU returns, other returns, then new Programs by context size
+and idleness. Candidates that cannot fit do not block later candidates.
+
+With no capacity debt, promotion first uses existing slack. If more room is needed, a candidate may displace only
+strictly more idle Acting residents, and only when their combined marginal relief is sufficient. Ties preserve
+placement. The check accounts for shared physical blocks and does not spend pending Reasoning releases. This strict
+relative exchange is a concrete interpretation of the paper's partition boundary, not its published pseudocode.
+Without waiting inference or capacity debt, placement stays unchanged. The default 100-token decode buffer remains.
 
 There is no beneficiary-owned future capacity, wait timeout, minimum residence or extra idleness margin.
 `agentcache.mori` accepts only `mode` and `window_size`; remove the former `min_residency_seconds`, `idleness_margin`,

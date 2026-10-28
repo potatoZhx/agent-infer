@@ -100,11 +100,16 @@ SimpleCPU adapter 在启动和运行期间完成以下闭环：
 MORI 当前不主动 prefetch。CPU tier 表示保护优先级；需要再次推理时仍由 SimpleCPU 的 native on-demand load
 触发 H2D。
 
-GPU tier 已经是准入决策：当前分支的请求直接提交引擎，后续串行请求仍等待当前请求完成。
+GPU tier 已经是准入决策：其请求直接提交引擎；重叠请求由服务端分配独立分支，分别获取 placement。
 上下文增长导致总量超额时，统一循环先降 Acting，再按 idleness 从高到低选择 Reasoning 做 lazy demotion。
-Reasoning 完成或 native 确认取消后才释放 GPU 预留；排队的串行后继不会延长 drain。
+Reasoning 完成或 native 确认取消后才释放 GPU 预留。
 等待者按 CPU returning、其他 returning、新 Program 的 context/idleness 排序；不能放入的候选不会阻塞
-后续候选。推理需求可以回收 Acting 的承诺，同状态按 idleness 排序；没有压力时保留 placement。
+后续候选。
+
+没有容量超额时，先用已有余量提升；余量不足时，候选只能置换严格比自己更 idle 的 Acting 驻留者，且整组
+边际回收必须足够，才会修改 placement。平局保持驻留。检查按实际共享块计算，不能提前兑现 Reasoning 的
+pending 释放。这是对论文相对分界描述的具体实现解释，不是论文公布的伪代码。没有等待推理或容量超额时
+保持 placement。默认 100-token decode 预留继续保留。
 不再保留候选独占的未来回收额度，也没有额外等待超时、最短驻留或 idleness 差值门槛。
 
 `agentcache.mori` 只接受 `mode` 和 `window_size`。已删除 `min_residency_seconds`、`idleness_margin`、

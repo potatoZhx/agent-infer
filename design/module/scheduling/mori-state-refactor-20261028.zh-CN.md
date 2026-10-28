@@ -158,3 +158,56 @@ typed-LRU 的增量反向索引继续保留。其重建建议分片生成新堆�
 性能验收记录 arrival 与 before_schedule 的 CPU 时间及 p50/p95/p99、Program/块读取量、变更块数量、
 事件积压、计划失效率、CPU READY 覆盖、D2H/H2D bytes 和重算率；最终用相同 trace 与配置跑 32/16 对照。
 只减少源码中的循环数量不足以证明性能改善。本轮未启动 GPU benchmark。
+
+## 7. 重构前论文复核补充（2026-10-28，基于 db7870d）
+
+再次逐项核对后，第 3–5 节仍不足以作为完整实施规格。详见
+[论文符合性复核](mori-paper-audit-20261028.zh-CN.md)，其中包含源码索引及五个 CPU-only 复现。
+该复核修正“只需重构状态与执行边界”的范围判断，尚未修改运行时代码。
+
+- 增加阶段 0：response stop/end_turn 不应默认代表整个 Program 终止；旧 OffloadingConnector 缺少新的
+  写入保护，需收紧 full 能力入口；等待推理置换 Acting、固定 decode buffer 和 max_tokens 上界拒绝必须
+  明确其工程性质，不能视为论文已规定；首次 native 执行前的排队时间也不能计入实时 idleness。
+  证据见复核 §3.1/3.2/3.5/3.6/3.8。
+- 阶段 A 除清空共享证据外，也要撤销旧 prompt 不再需要的 typed owner 保护，保留其他共享者。
+  不能仅更换 ledger 数据结构。证据见复核 §3.4。
+- 阶段 B 的 READY 目标限定为实际已物化、可缓存的范围；同时覆盖 H2D 和缺失段 prefill 的执行反馈。
+  不增加“完整 GPU KV READY 后才提交 native”的外部门槛。证据与执行建议见复核 §3.3。
+- 阶段 C 加入 HBM 普通 LRU fallback 的一致性恢复，以及 native 已提交请求均为 BUSY 的不变量验收。
+  当前代码没有另加 native batch 类型排序，多副本全局 Waiting/亲和/装箱也不属于本轮范围，见复核 §2/3.7。
+
+保留 generation、native 安全校验、CPU 备份写入保护和无排他受益者的推进路径；不恢复已删除的 lineage
+协议、escrow、驻留阈值或等待超时提权。具体执行顺序与新增验收见复核 §5。
+
+## 8. 状态与置换语义再次核对
+
+实施前以[审查报告 §7](mori-paper-audit-20261028.zh-CN.md#7-注释复核状态计时容量估计与跨层置换)为最新解释：
+
+- 请求到达仍进入 Reasoning；只修正所选计时口径的一致性，不把 native 待执行请求改为 Acting。
+  此前计时复现使用有历史的返回 Program，不是新 Program 的首个请求；原文未指定 native 事件计时 API。
+- 不因论文未给出 estimator 公式而直接删除全部增长预留或单请求可行性检查。固定 100-token 值是工程估计，
+  `max_tokens` 上界检查是服务能力约束；应分别说明和验证，保持 GPU owner 不二次申请额度。
+- 撤回“等待 Reasoning 无条件置换 Acting”作为默认论文基线的建议。超额修复与有余量提升保持论文规则；
+  无余量时的相对分界交换需单独定稿，不能把降层 victim 的状态排序扩展为全局抢占权，也不能虚计候选制造超额。
+- 若采用严格相对 idleness 交换，这是 §4.3 的实现解释，必须验证多 victim、共享块、平局和推进条件；
+  不恢复额外 idleness margin/驻留阈值/超时优先级，不声称论文已经给出该实现或无死锁证明。
+
+证据：审查报告 §7 所引论文 §4.1–4.3.1；`agentinfer/scheduling/mori/strategy.py:217-271,701-753`。
+本节是设计修订，尚未修改上述源码。
+
+## 9. 用户最终确认与本次调度语义落地
+
+本节覆盖 §7/8 中已被用户收回的实施建议：**不处理 native 初始排队计时，暂时保留 100-token 预留**。
+不新增执行时间戳协议，也不删除已有计时 hook；现有 `max_tokens` 服务能力检查保持原样。
+证据：`agentinfer/scheduling/mori/config.py:18-32`、`strategy.py:72-92,719-727`；
+相对基线的未改动校验见 `artifacts/mori-relative-rebalance-20261028/validation.json`。
+
+本次已实现“无条件等待推理置换”的重构：容量超额按原规则修复，有余量按原顺序提升；仅在候选严格比
+回收对象更 busy、所有对象均为 Acting、整组边际回收能使候选 fit 时交换。平局保持 placement，无法 fit
+就继续后面的候选，不建立跨轮独占计划。共享块通过一次构建的前缀容量投影计算，并在每次准入后更新。
+实现：`agentinfer/scheduling/mori/strategy.py:206-289`、`capacity.py:83-138`。
+
+完整算法、复杂度、进展边界和验证索引见
+[相对分界置换重构](mori-relative-rebalance-20261028.zh-CN.md)。Reasoning 完成边界、GPU 直通、重叠分支
+与 CPU 备份保护继续回归。该交付完成调度语义阶段，不代表 §3–5 的 A/B/C 原生目录、迁移确认和后台规划
+已经实现；这些阶段及复核中其他生命周期/兼容路径问题仍保留为后续工作。

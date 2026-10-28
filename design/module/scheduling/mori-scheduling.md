@@ -461,3 +461,17 @@ retains executing leases until completion, and coalesces victim selection into o
 proven shared native blocks by union and retains conservative private promises when proof is absent. Engineering
 residency, idleness-margin and fairness settings are documented separately from paper behavior in the redesign.
 Validation artifacts are under `artifacts/mori-redesign-20261028/`; GPU/E2E validation remains explicitly deferred.
+
+## 2026-10-28 relative rebalancing revision
+
+Later revisions removed client lineage, escrow, residence thresholds and timeout-based priority; see the
+[state refactor contract](mori-state-refactor-20261028.zh-CN.md). This revision further separates over-budget repair
+from slack promotion and relative exchange. Waiting inference can exchange only with strictly more idle Acting
+residents, and only if their marginal relief suffices; ties preserve placement and non-fitting candidates are skipped.
+Reasoning drains remain restricted to real capacity debt, with no early release of their commitments.
+
+The 100-token decode buffer and native queue timing are retained as requested. A per-round prefix projection handles
+shared-block relief without rescanning all victims for each candidate. This is not yet a persistent native directory
+or an asynchronous planner. Specification, implementation indices and CPU validation are in the
+[relative rebalance record](mori-relative-rebalance-20261028.zh-CN.md).
+Evidence: `agentinfer/scheduling/mori/strategy.py:206-289`, `capacity.py:83-138`.

@@ -78,3 +78,61 @@ class CapacityLedger:
         other.owners = self.owners.copy()
         other.used = self.used
         return other
+
+
+class ReliefProjection:
+    """Exact capacity after any prefix of an ordered victim list is removed.
+
+    Build once per round. Admissions update a range-add/point-query Fenwick
+    tree: a shared block stops providing a discount only after its last old
+    owner is removed. A newly admitted owner retains it for all future prefixes.
+    Queries cost O(log P + candidate blocks), without rescanning victim owners.
+    This is speculative arithmetic, never an allocation or a released promise.
+    """
+
+    def __init__(self, ledger: CapacityLedger, victims: tuple[ProgramRef, ...]) -> None:
+        self.quantum = ledger.quantum
+        positions = {ref: i + 1 for i, ref in enumerate(victims)}
+        self._last_owner: dict[int, int] = {}
+        self._permanent: set[int] = set()
+        for ref, claim in ledger.claims.items():
+            if ref not in positions:
+                self._permanent.update(claim.blocks)
+            else:
+                for block in claim.blocks:
+                    self._last_owner[block] = max(self._last_owner.get(block, 0), positions[ref])
+        projected = ledger.copy()
+        self._used = [projected.used]
+        for ref in victims:
+            projected.remove(ref)
+            self._used.append(projected.used)
+        self._deltas = [0] * (len(self._used) + 1)
+
+    def _add_from(self, start: int, tokens: int) -> None:
+        index = start + 1
+        while index < len(self._deltas):
+            self._deltas[index] += tokens
+            index += index & -index
+
+    def _present(self, block: int, removed: int) -> bool:
+        return block in self._permanent or self._last_owner.get(block, 0) > removed
+
+    def required(self, removed: int, claim: CapacityClaim) -> int:
+        """Total commitment including the candidate at a hypothetical boundary."""
+        total = self._used[removed] + claim.tokens
+        index = removed + 1
+        while index:
+            total += self._deltas[index]
+            index -= index & -index
+        return total - self.quantum * sum(self._present(block, removed) for block in claim.blocks)
+
+    def admit(self, claim: CapacityClaim) -> None:
+        """Reflect an actual admission in every later hypothetical prefix."""
+        self._add_from(0, claim.tokens)
+        for block in claim.blocks:
+            if block in self._permanent:
+                self._add_from(0, -self.quantum)
+            elif (last := self._last_owner.get(block, 0)) > 0:
+                self._add_from(0, -self.quantum)
+                self._add_from(last, self.quantum)
+            self._permanent.add(block)
