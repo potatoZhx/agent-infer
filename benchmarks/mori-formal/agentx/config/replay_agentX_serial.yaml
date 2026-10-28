@@ -1,0 +1,27 @@
+# Trace Replay defaults for AgentX full hash-block snapshots.
+
+experiment:
+  task_num: null  # required: set a positive integer in YAML or pass --task-num
+  max_concurrency: 1
+  task_timeout_seconds: 3600
+  run_timeout_seconds: null
+
+backend:
+  type: vllm
+  base_url: http://127.0.0.1:8000
+  metrics_url: null
+  tokenizer_base_url: null
+  model: Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8
+  endpoint: /v1/completions
+  chat_template_kwargs: {}
+  api_key_env: null
+
+replay:
+  trace_type: agentX
+  trace_path: null
+  trace_same_agent_gap_scale: 1.0
+  trace_same_agent_gap_offset_seconds: 0.0
+  interval_mode: trace
+  sample_seed: 0
+  max_inflight_requests: 1
+  request_timeout_seconds: 3600
