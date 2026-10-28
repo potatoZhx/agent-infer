@@ -210,6 +210,9 @@ tempCodeRunnerFile.py
 # Local backend calibration artifacts
 tools/calibration/results/
 
+# Local MORI benchmark outputs
+results/mori-formal/
+
 # PyPI configuration file
 .pypirc
 

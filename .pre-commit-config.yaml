@@ -17,8 +17,8 @@ repos:
   rev: v1.43.5
   hooks:
   - id: typos
-    # Preserve verbatim upstream license text, including original spelling.
-    exclude: ^Third_Party_Open_Source_Software_Notice\.txt$
+    # Preserve verbatim upstream license text and immutable request-trace identifiers.
+    exclude: ^(?:Third_Party_Open_Source_Software_Notice\.txt|benchmarks/mori-formal/swe-cc-local-trace/traces/cc-2\.1\.152-ptkvc-64g-terminal-32_16\.requests\.jsonl)$
     args: [--force-exclude]
 - repo: https://github.com/DavidAnson/markdownlint-cli2
   rev: v0.21.0
