@@ -132,19 +132,18 @@ finishes, MORI creates a temporary independent owner. Completing that owner rele
 cache contents remain available for opportunistic reuse. It does not infer which result the application will adopt.
 The next real prompt determines the new context, including truncation or context switches.
 
-For a branch that should retain protection between rounds, send a stable `lineage_id` in canonical identity metadata:
+There is no `lineage_id` protocol or client-provided branch declaration. A legacy key is ignored like other unknown
+metadata and is no longer serialized. Overlapping requests, including overlaps while the first request awaits
+admission, get separate temporary owners. There is no named-branch queue of serial followers.
 
-```json
-{"vllm_xargs":{"agentic_context":"{\"program_id\":\"session:lead\",\"lineage_id\":\"research\"}"}}
-```
+These internal owners do not create application parent-blocking relationships. Use separate agent identities for
+actual subagents. The API middleware generates an internal `lifecycle_token` per attempt; clients need not set it.
+A delayed terminal receipt can release only the latest idle attempt's owner. Completing or cancelling a temporary
+branch releases its logical protection; native cache contents may remain available for opportunistic reuse.
+Evidence: `agentinfer/scheduling/request_branches.py:14-58`, `agentinfer/scheduling/runtime.py:527-561`.
 
-Requests within the same explicit lineage serialize. Different lineages have independent context, timing, tier and
-lifecycle. These internal owners do not create application parent-blocking relationships. Continue to use separate
-agent identities for actual subagents. The API middleware generates an internal `lifecycle_token` per attempt;
-clients should not set it. A delayed terminal receipt can release only that attempt's latest idle lineage.
-
-See the [2026-10-28 redesign and acceptance contract](../../../design/module/scheduling/mori-redesign-20261028.zh-CN.md)
-for the paper comparison, defaults, evidence and unrun GPU validation.
+See the [state and execution refactor design](../../../design/module/scheduling/mori-state-refactor-20261028.zh-CN.md)
+for the protocol removal, evidence and the remaining proposed changes.
 
 ## Startup checks and troubleshooting
 

@@ -30,10 +30,10 @@ from agentinfer.scheduling.events import SchedulingEvent, SchedulingEventKind, S
 from agentinfer.scheduling.factors import StrategyFactors, StrategyGlobalFactorsT, StrategyProgramFactorsT
 from agentinfer.scheduling.identity import AgentIdentity
 from agentinfer.scheduling.lifecycle import ProgramLifecycle
-from agentinfer.scheduling.lineage import LineageRegistry
 from agentinfer.scheduling.observability import SchedulerObservabilityConfig
 from agentinfer.scheduling.program_registry import ProgramRegistry
 from agentinfer.scheduling.program_runtime import RuntimeProgram
+from agentinfer.scheduling.request_branches import RequestBranchRegistry
 from agentinfer.scheduling.request_pool import RequestPool, RequestPoolEntry, RequestPoolStatus, RetainedRequestT
 from agentinfer.scheduling.snapshot import SchedulingSnapshot
 from agentinfer.scheduling.strategy import SchedulingCycleOrder, SchedulingStrategy
@@ -69,8 +69,6 @@ class _RequestBinding:
     shared_prefix_tokens: int | None = None
     hbm_cached_prefix_tokens: int | None = None
     hbm_hit_ref_zero_tokens: int | None = None
-    deferred: bool = False
-    lifecycle_token: str | None = None
 
 
 class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, StrategyProgramFactorsT]):
@@ -95,7 +93,7 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
         self.registry = ProgramRegistry()
         self._request_bindings: dict[str, _RequestBinding] = {}
         self._program_requests: dict[ProgramRef, set[str]] = {}
-        self._lineages = LineageRegistry()
+        self._request_branches = RequestBranchRegistry()
         self._lifecycle_owners: dict[str, ProgramRef] = {}
         self._latest_lifecycle_tokens: dict[ProgramRef, str] = {}
         self._last_request_finished_at: dict[ProgramRef, float] = {}
@@ -133,7 +131,6 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
             program = self.registry.get(binding.program) if binding is not None else None
             if (
                 binding is not None
-                and not binding.deferred
                 and binding.track_segment_share
                 and program is not None
                 and program.state is ProgramState.PAUSED
@@ -180,16 +177,15 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
             raise ValueError(f"duplicate request_id: {request_id}")
         external_id = metadata.program_id
         temporary = False
-        if self.strategy.uses_serial_lineages:
+        if self.strategy.uses_request_branches:
             default_ref = self.registry.current_ref(external_id)
             try:
-                metadata, temporary = self._lineages.resolve(
+                metadata, temporary = self._request_branches.resolve(
                     metadata, default_busy=bool(self._program_requests.get(default_ref))
                 )
             except ValueError as exc:
                 raise RequestAdmissionError(str(exc)) from exc
         current_ref = self.registry.current_ref(metadata.program_id)
-        deferred = self.strategy.uses_serial_lineages and bool(self._program_requests.get(current_ref))
         if (
             current_ref is not None
             and not self.strategy.allows_overlapping_program_requests
@@ -201,22 +197,21 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
         self._cycle_dirty = True
         self._replace_backend_info(backend_pool_info)
         program, created = self.registry.materialize(metadata)
-        if self.strategy.uses_serial_lineages:
-            self._lineages.bind(external_id, program.ref, temporary=temporary)
+        if self.strategy.uses_request_branches:
+            self._request_branches.bind(external_id, program.ref, temporary=temporary)
         previous_context_tokens = program.tokens.estimated_context_tokens
         track_segment_share = created or program.state is ProgramState.PAUSED
         previous_status = program.status
-        if not deferred:
-            program.tokens = replace(
-                program.tokens,
-                estimated_context_tokens=(
-                    max(0, prompt_tokens)
-                    if self.strategy.uses_serial_lineages
-                    else max(program.tokens.estimated_context_tokens, max(0, prompt_tokens))
-                ),
-            )
-            self.strategy.on_context_replaced(program.ref)
-            previous_status = self.registry.mark_request_started(program.ref)
+        program.tokens = replace(
+            program.tokens,
+            estimated_context_tokens=(
+                max(0, prompt_tokens)
+                if self.strategy.uses_request_branches
+                else max(program.tokens.estimated_context_tokens, max(0, prompt_tokens))
+            ),
+        )
+        self.strategy.on_context_replaced(program.ref)
+        previous_status = self.registry.mark_request_started(program.ref)
         now = time.monotonic()
         if program.state is ProgramState.PAUSED and program.wait_started_at_monotonic_s is None:
             program.wait_started_at_monotonic_s = now
@@ -230,8 +225,6 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
             now,
             max(0.0, now - last_finished_at) if last_finished_at is not None else 0.0,
             track_segment_share,
-            deferred=deferred,
-            lifecycle_token=metadata.lifecycle_token,
         )
         self._program_requests.setdefault(program.ref, set()).add(request_id)
         self.request_pool.add(
@@ -242,8 +235,6 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
                 retained_request=retained_request,
             )
         )
-        if deferred:
-            return False
         self._set_lifecycle_token(program.ref, metadata.lifecycle_token)
         if previous_status is not ProgramStatus.REASONING:
             self._dispatch_event(
@@ -365,7 +356,7 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
 
     def on_native_execution(self, request_id: str, *, running: bool) -> None:
         binding = self._request_bindings.get(request_id)
-        if binding is not None and not binding.deferred:
+        if binding is not None:
             self.strategy.on_execution_changed(
                 self.strategy_factors, binding.program, time.monotonic(), running=running
             )
@@ -516,11 +507,11 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
                 TransitionController(self._apply_transition),
                 program.ref,
             )
-        self._finish_lineage_step(program.ref)
+        self._finish_request_branch(program.ref)
 
     def _has_current_request(self, program: ProgramRef) -> bool:
-        """Distinguish the current request from serial followers waiting for its lease."""
-        return any(not self._request_bindings[key].deferred for key in self._program_requests.get(program, ()))
+        """Return whether this exact owner still has unfinished accepted work."""
+        return bool(self._program_requests.get(program))
 
     def _has_authorized_request(self, program: ProgramRef) -> bool:
         """Retain the lease through dispatch until completion or confirmed cancellation."""
@@ -533,51 +524,21 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
                 return True
         return False
 
-    def _finish_lineage_step(self, ref: ProgramRef) -> None:
-        """End one finite execution lease before exposing the next serial request."""
-        if not self.strategy.uses_serial_lineages or self._has_current_request(ref):
+    def _finish_request_branch(self, ref: ProgramRef) -> None:
+        """Complete a pending drain and release a finished temporary overlap owner."""
+        if not self.strategy.uses_request_branches or self._has_current_request(ref):
             return
         program = self.registry.get(ref)
         if program is None:
             return
         if program.marked_for_pause:
             self._apply_transition(TransitionRequest(TransitionKind.PAUSE, ref, "drain_completed"))
-        queued = self.request_pool.for_program(ref)
-        if not queued:
-            if self._lineages.temporary(ref):
-                self._apply_transition(TransitionRequest(TransitionKind.RELEASE, ref, "temporary_lineage_completed"))
-            return
-        entry = queued[0]
-        binding = self._request_bindings[entry.request_id]
-        binding.deferred = False
-        self._set_lifecycle_token(ref, binding.lifecycle_token)
-        binding.previous_context_tokens = program.tokens.estimated_context_tokens
-        program.tokens = replace(program.tokens, estimated_context_tokens=binding.prompt_tokens)
-        self.strategy.on_context_replaced(ref)
-        previous = self.registry.mark_request_started(ref)
-        if program.state is ProgramState.PAUSED:
-            program.wait_started_at_monotonic_s = entry.arrived_at_monotonic_s
-        self._dispatch_event(
-            self._event(
-                SchedulingEventKind.PROGRAM_STATUS_CHANGED,
-                ref,
-                "serial_request_ready",
-                program.state,
-                program.state,
-                previous,
-                ProgramStatus.REASONING,
-            )
-        )
-        outcome = self.strategy.handle_admission(
-            self._snapshot(), self.strategy_factors, TransitionController(self._apply_transition), ref
-        )
-        if outcome.disposition is not AdmissionDisposition.QUEUED:
-            self._admit_program_requests(ref)
-        self._next_check_at_monotonic_s = self._strategy_next_check_at()
+        if self._request_branches.temporary(ref):
+            self._apply_transition(TransitionRequest(TransitionKind.RELEASE, ref, "temporary_branch_completed"))
 
     def _set_lifecycle_token(self, program: ProgramRef, token: str | None) -> None:
         """Replace the latest attempt receipt; older receipts cannot release this owner."""
-        if not self.strategy.uses_serial_lineages:
+        if not self.strategy.uses_request_branches:
             return
         previous = self._latest_lifecycle_tokens.pop(program, None)
         if previous is not None:
@@ -587,12 +548,12 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
             self._lifecycle_owners[token] = program
 
     def on_scoped_response_completion(self, program_id: str, lifecycle: ProgramLifecycle, token: str | None) -> bool:
-        """A wire response may release only the exact latest attempt's idle lineage."""
+        """A wire response may release only the exact latest attempt's idle request branch."""
         ref = self._lifecycle_owners.get(token) if token is not None else None
         if (
             lifecycle is not ProgramLifecycle.TERMINAL
             or ref is None
-            or ref not in self._lineages.family(program_id)
+            or ref not in self._request_branches.family(program_id)
             or self._program_requests.get(ref)
         ):
             return False
@@ -614,8 +575,8 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
         """
         if lifecycle is not ProgramLifecycle.TERMINAL:
             return False
-        if self.strategy.uses_serial_lineages:
-            family = self._lineages.family(program_id)
+        if self.strategy.uses_request_branches:
+            family = self._request_branches.family(program_id)
             # A response cannot terminate a family that still has accepted work.
             if any(self._program_requests.get(ref) for ref in family):
                 return False
@@ -640,7 +601,7 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
         """Cancel retained work, or end a lease only after the adapter confirms native termination.
 
         This method does not cancel native inference. Adapters must keep running
-        bindings until native completion; queued serial followers remain independent.
+        bindings until native completion; overlapping owners remain independent.
         """
         entry = self.request_pool.cancel(request_id)
         binding = self._pop_binding(request_id)
@@ -675,8 +636,7 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
                     self._apply_transition(
                         TransitionRequest(TransitionKind.RELEASE, program.ref, "cancelled_before_admission")
                     )
-                if not binding.deferred:
-                    self._finish_lineage_step(binding.program)
+                self._finish_request_branch(binding.program)
         return entry
 
     def _apply_transition(self, request: TransitionRequest) -> TransitionResult:
@@ -697,9 +657,9 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
             if program.state is not ProgramState.PAUSED:
                 return TransitionResult(request.kind, request.program, False, "queue_requires_paused")
         elif request.kind is TransitionKind.PAUSE:
-            if self.strategy.uses_serial_lineages and self._has_authorized_request(program.ref):
+            if self.strategy.uses_request_branches and self._has_authorized_request(program.ref):
                 return TransitionResult(request.kind, request.program, False, "pause_requires_finished_lease")
-            unstarted = self.strategy.uses_serial_lineages and not self._has_authorized_request(program.ref)
+            unstarted = self.strategy.uses_request_branches and not self._has_authorized_request(program.ref)
             if program.state is not ProgramState.ACTIVE or (
                 program.status is not ProgramStatus.ACTING and not unstarted
             ):
@@ -723,7 +683,7 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
                 return TransitionResult(request.kind, request.program, False, "release_requires_idle")
             self.registry.release(program.ref)
             self._set_lifecycle_token(program.ref, None)
-            self._lineages.release(program.ref)
+            self._request_branches.release(program.ref)
             self._last_request_finished_at.pop(program.ref, None)
             self._shared_prefix_freshness_anchor_at.pop(program.ref, None)
         else:
@@ -744,9 +704,9 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
 
     def _admit_program_requests(self, program: ProgramRef) -> None:
         for entry in self.request_pool.for_program(program):
-            if entry.status is RequestPoolStatus.WAITING and not self._request_bindings[entry.request_id].deferred:
+            if entry.status is RequestPoolStatus.WAITING:
                 self.request_pool.admit(entry.request_id, self._dispatch_target)
-                if self.strategy.uses_serial_lineages:
+                if self.strategy.uses_request_branches:
                     break
 
     @staticmethod

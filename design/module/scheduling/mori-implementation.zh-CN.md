@@ -697,3 +697,13 @@ SimpleCPU 升为 API 2，BUSY 备份不能驱逐 IDLE CPU 缓存，拒绝写入�
 完整语义、论文解释边界、部署要求及验证索引见
 [MORI 论文机制收敛与 CPU 写入保护](mori-paper-alignment-20261028.zh-CN.md)。
 证据：`agentinfer/scheduling/mori/strategy.py:141-284`、`agentinfer/agentcache/mori/simple_cpu_policy.py:82-94`。
+
+## 2026-10-28 后续修订：删除客户端 lineage 协议
+
+`lineage_id` 字段和命名分支后继队列已移除；重叠请求由服务端分配临时独立 owner，完成或确认取消后释放保护。
+无需客户端声明分支；后续真实 prompt 决定上下文，服务端不推断重叠结果的采用关系。
+保留服务端生成的 `lifecycle_token`，用于拒绝迟到 terminal，不用于分支续接。
+证据：`agentinfer/scheduling/request_branches.py:14-58`、`agentinfer/scheduling/runtime.py:178-214,527-560`。
+
+尚需重构的 native 事实目录、增量账本、迁移确认与异步规划见
+[状态与执行边界重构方案](mori-state-refactor-20261028.zh-CN.md)；该文明确区分已实现与后续设计。

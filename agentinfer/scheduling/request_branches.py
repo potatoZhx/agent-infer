@@ -11,36 +11,25 @@ from agentinfer.scheduling.domain import ProgramRef
 from agentinfer.scheduling.identity import AgentIdentity
 
 
-class LineageRegistry:
+class RequestBranchRegistry:
     """Map external families to independent cache owners without inventing blocking edges."""
 
     def __init__(self) -> None:
-        self._named: dict[tuple[str, str], str] = {}
         self._families: dict[str, set[ProgramRef]] = {}
         self._external: dict[ProgramRef, str] = {}
         self._temporary: set[ProgramRef] = set()
         self._internal_ids: set[str] = set()
-        self._named_by_family: dict[str, set[tuple[str, str]]] = {}
         self._free_temporary: list[str] = []
-        self._free_named: list[str] = []
 
     def resolve(self, metadata: AgentIdentity, *, default_busy: bool) -> tuple[AgentIdentity, bool]:
-        """Resolve a serial owner or allocate a temporary slot; reject external collisions."""
+        """Reuse an idle default owner; isolate each overlapping accepted request."""
         if metadata.program_id in self._internal_ids:
-            raise ValueError("external Program identity collides with an internal lineage")
-        temporary = metadata.lineage_id is None and default_busy
-        if metadata.lineage_id is None and not temporary:
+            raise ValueError("external Program identity collides with an internal request branch")
+        if not default_busy:
             return metadata, False
-        key = (metadata.program_id, metadata.lineage_id or "")
-        internal = None if temporary else self._named.get(key)
-        if internal is None:
-            free_slots = self._free_temporary if temporary else self._free_named
-            internal = free_slots.pop() if free_slots else f"mori-lineage:{uuid.uuid4().hex}"
-            self._internal_ids.add(internal)
-            if not temporary:
-                self._named[key] = internal
-                self._named_by_family.setdefault(metadata.program_id, set()).add(key)
-        return replace(metadata, program_id=internal, parent_program_id=None, blocks_parent=False), temporary
+        internal = self._free_temporary.pop() if self._free_temporary else f"mori-overlap:{uuid.uuid4().hex}"
+        self._internal_ids.add(internal)
+        return replace(metadata, program_id=internal, parent_program_id=None, blocks_parent=False), True
 
     def bind(self, external: str, ref: ProgramRef, *, temporary: bool) -> None:
         """Index a materialized exact generation under its external family."""
@@ -68,5 +57,3 @@ class LineageRegistry:
             family.discard(ref)
             if not family:
                 del self._families[external]
-                for key in self._named_by_family.pop(external, ()):
-                    self._free_named.append(self._named.pop(key))

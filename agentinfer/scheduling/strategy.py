@@ -60,8 +60,8 @@ class SchedulingStrategy(Generic[StrategyGlobalFactorsT, StrategyProgramFactorsT
         return True
 
     @property
-    def uses_serial_lineages(self) -> bool:
-        """Opt into independent overlap owners and serial requests within a named lineage."""
+    def uses_request_branches(self) -> bool:
+        """Isolate overlapping requests into server-owned scheduling branches."""
         return False
 
     def on_context_replaced(self, program: ProgramRef) -> None:

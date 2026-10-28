@@ -91,3 +91,13 @@ SimpleCPU hook 升为 API 2；BlockPool API 1 新增 `store_admission_api_versio
 测试命令、结果、源码及输入哈希记录于 `artifacts/mori-paper-alignment-20261028/validation.json`。
 覆盖调度、lineage、取消、容量共享、CPU 类型与三条 native 写入路径；native 测试使用真实打补丁 BlockPool，
 不分配 GPU tensor、不执行 DMA。完整 32/16 GPU 性能实验本次未运行，不能从这些检查推断吞吐改善或全系统无死锁。
+
+## 2026-10-28 后续修订：删除客户端 lineage 协议
+
+`lineage_id` 字段和命名分支后继队列已移除；重叠请求由服务端分配临时独立 owner，完成或确认取消后释放保护。
+无需客户端声明分支；后续真实 prompt 决定上下文，服务端不推断重叠结果的采用关系。
+保留服务端生成的 `lifecycle_token`，用于拒绝迟到 terminal，不用于分支续接。
+证据：`agentinfer/scheduling/request_branches.py:14-58`、`agentinfer/scheduling/runtime.py:178-214,527-560`。
+
+尚需重构的 native 事实目录、增量账本、迁移确认与异步规划见
+[状态与执行边界重构方案](mori-state-refactor-20261028.zh-CN.md)；该文明确区分已实现与后续设计。

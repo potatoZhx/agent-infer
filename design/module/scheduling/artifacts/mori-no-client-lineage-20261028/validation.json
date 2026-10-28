@@ -1,0 +1,45 @@
+{
+  "observed_at_utc": "2026-10-28T13:07:00.831226+00:00",
+  "base_commit": "f96a84fe76c56ddbe8e6e916ba405278af227138",
+  "implemented": [
+    "remove lineage_id identity field/parser/serializer",
+    "remove named branch and deferred follower handling",
+    "server-owned independent temporary overlap owners; keep lifecycle receipts and generation safety"
+  ],
+  "design_only": [
+    "native content/instance directory and persistent incremental capacity ledger",
+    "confirmed native demotion transfer lifecycle",
+    "asynchronous planning and local version-checked commit; measured typed-LRU compaction work"
+  ],
+  "test_command": "MORI_VLLM_SOURCE=/tmp/mori-review-fixes-20261027/upstream PYTHONPATH=. /data/zx-envs/agentinfer-vllm-0.31.0/bin/python -m pytest tests/scheduling/ tests/agentcache/ -m cpu_test -q",
+  "test_result": {
+    "passed": 418,
+    "deselected": 26,
+    "warnings": 14,
+    "log": "pytest.txt"
+  },
+  "pre_commit": {
+    "command": "pre-commit run --files <changed and new files>",
+    "passed": true,
+    "log": "pre-commit.txt"
+  },
+  "current_source_scan": {
+    "command": "rg -n \"lineage_id|uses_serial_lineages|LineageRegistry|binding\\.deferred\" agentinfer",
+    "matches": 0,
+    "exit_code": 1
+  },
+  "full_gpu_benchmark_run": false,
+  "not_run_reason": "This change removes an unused identity protocol and named-branch state. CPU scheduler/native-adapter regressions were run; no performance claim or GPU benchmark is part of this validation.",
+  "source_sha256": {
+    "agentinfer/scheduling/identity.py": "157b4d36018121f76e136e9b6449f86917009fcadbe565d3741482eb6f6c78d3",
+    "agentinfer/scheduling/mori/strategy.py": "91fa0baca4bee6a9e8cfd55dd2d21e32581e354f77d16f6e2bd710d118122d83",
+    "agentinfer/scheduling/runtime.py": "f8d03f1e00cfd3a59a62e0dd1ffac1aeb7e84e914e24feb07977dc0f7495dda4",
+    "agentinfer/scheduling/strategy.py": "89f3eed822fc2761ecead251216343da506438a8c7fad2c1a4258bf2ff725c0c",
+    "agentinfer/scheduling/request_branches.py": "13b69bf36732305c3c901405e0fecebbd35bcc1f6b6e543a330a06c34e5690c3",
+    "tests/scheduling/test_mori_branches.py": "3a7d3790ee75127453931bd6e64173618dbcb1a36ab6a40a77d7e4df655662bd"
+  },
+  "deleted_sources": [
+    "agentinfer/scheduling/lineage.py",
+    "tests/scheduling/test_mori_lineages.py"
+  ]
+}

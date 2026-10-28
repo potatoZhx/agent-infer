@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AgentInfer project
-"""State-machine regressions for serial leases and independently scheduled overlaps."""
+"""State-machine regressions for server-owned scheduling branches and overlaps."""
 
 from dataclasses import replace
 from unittest.mock import patch
@@ -24,8 +24,8 @@ def runtime(capacity=1008, **config):
     return ProgramScheduler(components.strategy, components.initial_factors, pool), pool
 
 
-def test_lineage_and_lifecycle_token_round_trip():
-    identity = AgentIdentity("agent", lineage_id="research", lifecycle_token="attempt")
+def test_server_lifecycle_token_round_trip_without_lineage_protocol():
+    identity = AgentIdentity("agent", lifecycle_token="attempt")
     assert parse_agent_identity(vllm_xargs={"agentic_context": encode_agent_identity(identity)}, headers={}) == identity
 
 
@@ -45,18 +45,45 @@ def test_short_overlap_never_replaces_long_working_set_or_status():
     assert r.registry.require(long_ref).tokens.estimated_context_tokens == 830
 
 
-def test_named_lineage_serializes_and_uses_the_next_real_prompt():
+def test_non_overlapping_requests_reuse_default_owner_and_replace_prompt():
     r, pool = runtime(2016)
-    identity = AgentIdentity("agent", lineage_id="main")
+    identity = AgentIdentity("agent")
     assert r.on_request_arrival("first", identity, 800, pool, "one")
-    assert not r.on_request_arrival("next", identity, 100, pool, "two")
     ref = r.program_ref_for_request("first")
-    assert r.program_ref_for_request("next") == ref
-    assert r.registry.require(ref).tokens.estimated_context_tokens == 800
     r.on_request_completion("first", 900)
+    assert r.on_request_arrival("next", identity, 100, pool, "two")
+    assert r.program_ref_for_request("next") == ref
     assert r.registry.require(ref).tokens.estimated_context_tokens == 100
-    assert [entry.request_id for entry, _ in r.consume_admitted_requests()] == ["next"]
     assert r.registry.require(ref).status is ProgramStatus.REASONING
+
+
+def test_removed_lineage_metadata_cannot_serialize_overlapping_requests():
+    identity = parse_agent_identity(
+        vllm_xargs={"agentic_context": {"program_id": "agent", "lineage_id": "old-client-value"}}, headers={}
+    )
+    assert identity == AgentIdentity("agent")
+    assert "lineage_id" not in identity.as_context()
+    assert "lineage_id" not in encode_agent_identity(identity)
+    r, pool = runtime(2016)
+    assert r.on_request_arrival("first", identity, 100, pool, "one")
+    assert r.on_request_arrival("overlap", identity, 100, pool, "two")
+    assert r.program_ref_for_request("first") != r.program_ref_for_request("overlap")
+
+
+def test_overlaps_are_isolated_even_when_default_request_is_waiting():
+    r, pool = runtime(512)
+    assert r.on_request_arrival("resident", AgentIdentity("resident"), 400, pool, "resident")
+    identity = AgentIdentity("agent")
+    assert not r.on_request_arrival("first", identity, 100, pool, "one")
+    assert not r.on_request_arrival("overlap", identity, 200, pool, "two")
+    first, overlap = (r.program_ref_for_request(key) for key in ("first", "overlap"))
+    assert first != overlap
+    assert r.registry.require(first).tokens.estimated_context_tokens == 100
+    assert r.registry.require(overlap).tokens.estimated_context_tokens == 200
+    r.cancel_request("overlap")
+    assert r.registry.get(overlap) is None
+    assert r.registry.require(first).status is ProgramStatus.REASONING
+    assert r.request_pool.waiting_request_ids == ("first",)
 
 
 def test_temporary_slot_reuse_advances_generation_and_rejects_old_events():
@@ -115,13 +142,13 @@ def test_growth_wakes_on_reservation_boundary_including_decode_headroom():
         assert r.needs_schedule_cycle(0.1)
 
 
-def test_drain_excludes_queued_requests_and_new_overlaps_cannot_extend_it():
+def test_overlapping_requests_cannot_extend_another_branches_drain():
     r, pool = runtime(1024)
-    identity = AgentIdentity("agent", lineage_id="main")
+    identity = AgentIdentity("agent")
     with patch("agentinfer.scheduling.runtime.time.monotonic", return_value=0.0) as clock:
         assert r.on_request_arrival("running", identity, 400, pool, "one")
         assert r.on_request_arrival("peer", AgentIdentity("peer"), 400, pool, "peer")
-        assert not r.on_request_arrival("serial", identity, 100, pool, "two")
+        assert not r.on_request_arrival("overlap", identity, 100, pool, "two")
         clock.return_value = 1.0
         assert not r.on_request_arrival("waiter", AgentIdentity("waiter"), 400, pool, "waiter")
         clock.return_value = 3.0
@@ -132,18 +159,21 @@ def test_drain_excludes_queued_requests_and_new_overlaps_cannot_extend_it():
         assert r.strategy_factors.for_program(ref).tier is MORITier.GPU
         assert not r._apply_transition(TransitionRequest(TransitionKind.PAUSE, ref, "unsafe")).applied
         assert not r.on_request_arrival("later", identity, 150, pool, "three")
+        overlap = r.program_ref_for_request("overlap")
+        later = r.program_ref_for_request("later")
+        assert len({ref, overlap, later}) == 3
         r.on_request_completion("running", 400)
         assert r.registry.require(ref).state is ProgramState.PAUSED
-        assert r.registry.require(ref).status is ProgramStatus.REASONING  # serial is waiting, not executing
+        assert r.registry.require(ref).status is ProgramStatus.ACTING
         assert r.strategy_factors.for_program(ref).tier is MORITier.CPU
         r.schedule_cycle(pool)
-        assert [entry.request_id for entry, _ in r.consume_admitted_requests()] == ["serial"]
-        assert r.request_pool.waiting_request_ids == ("waiter", "later")
+        assert [entry.request_id for entry, _ in r.consume_admitted_requests()] == ["overlap", "later"]
+        assert r.request_pool.waiting_request_ids == ("waiter",)
 
 
-def test_cancel_deferred_request_does_not_end_running_lease():
-    r, pool = runtime()
-    identity = AgentIdentity("agent", lineage_id="main")
+def test_cancel_queued_overlap_does_not_end_running_owner():
+    r, pool = runtime(512)
+    identity = AgentIdentity("agent")
     assert r.on_request_arrival("one", identity, 400, pool, "one")
     assert not r.on_request_arrival("two", identity, 100, pool, "two")
     ref = r.program_ref_for_request("one")
@@ -199,9 +229,9 @@ def test_cancelled_waiter_cannot_leave_a_soft_drain_behind():
     assert r.strategy_factors.for_program(ref).pending_tier is None
 
 
-def test_late_terminal_receipt_does_not_release_newer_context_or_other_lineage():
+def test_late_terminal_receipt_does_not_release_newer_context_or_other_branch():
     r, pool = runtime(2016)
-    first = AgentIdentity("agent", lineage_id="main", lifecycle_token="first")
+    first = AgentIdentity("agent", lifecycle_token="first")
     assert r.on_request_arrival("one", first, 100, pool, "one")
     ref = r.program_ref_for_request("one")
     r.on_request_completion("one", 120)
@@ -213,10 +243,10 @@ def test_late_terminal_receipt_does_not_release_newer_context_or_other_lineage()
     assert r.registry.get(ref) is None
 
 
-def test_family_terminal_waits_for_all_accepted_lineage_work():
+def test_family_terminal_waits_for_all_accepted_overlap_work():
     r, pool = runtime(2016)
-    assert r.on_request_arrival("one", AgentIdentity("agent", lineage_id="a"), 100, pool, "one")
-    assert r.on_request_arrival("two", AgentIdentity("agent", lineage_id="b"), 100, pool, "two")
+    assert r.on_request_arrival("one", AgentIdentity("agent"), 100, pool, "one")
+    assert r.on_request_arrival("two", AgentIdentity("agent"), 100, pool, "two")
     one = r.program_ref_for_request("one")
     two = r.program_ref_for_request("two")
     r.on_request_completion("one", 120)
@@ -242,22 +272,26 @@ def test_native_queue_and_preemption_wait_are_excluded_from_reasoning():
         assert r.strategy_factors.for_program(ref).pending_reasoning_seconds == 5.0
 
 
-def test_finished_named_families_reuse_slots_without_unbounded_generation_keys():
-    """Normal terminal lifecycles must not add one permanent UUID tombstone per request."""
-    r, pool = runtime()
+def test_completed_overlaps_reuse_slots_without_unbounded_internal_generation_keys():
+    """Repeated overlapping calls must not leave one internal UUID per completion."""
+    r, pool = runtime(2016)
+    identity = AgentIdentity("agent")
+    assert r.on_request_arrival("main", identity, 100, pool, "main")
     previous = None
     for number in range(100):
         request_id = f"request-{number}"
-        family = f"family-{number}"
-        identity = AgentIdentity(family, lineage_id="main", lifecycle_token=request_id)
-        assert r.on_request_arrival(request_id, identity, 100, pool, request_id)
+        assert r.on_request_arrival(request_id, replace(identity, lifecycle_token=request_id), 100, pool, request_id)
         ref = r.program_ref_for_request(request_id)
         if previous is not None:
             assert ref.program_id == previous.program_id and ref.generation > previous.generation
             assert not r._apply_transition(TransitionRequest(TransitionKind.RELEASE, previous, "late")).applied
         r.on_request_completion(request_id, 120)
-        assert r.on_scoped_response_completion(family, ProgramLifecycle.TERMINAL, request_id)
+        assert r.registry.get(ref) is None
+        assert not r.on_scoped_response_completion("agent", ProgramLifecycle.TERMINAL, request_id)
         previous = ref
-    assert len(r.registry._last_generations) == 1
-    assert len(r._lineages._internal_ids) == 1
-    assert not r._lineages._named
+    assert len(r.registry._last_generations) == 2  # one default owner, one reusable overlap slot
+    assert len(r._request_branches._internal_ids) == 1
+    assert len(r._request_branches.family("agent")) == 1
+    r.on_request_completion("main", 120)
+    assert r.on_response_completion("agent", ProgramLifecycle.TERMINAL)
+    assert not r._request_branches.family("agent")

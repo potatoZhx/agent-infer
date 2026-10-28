@@ -44,8 +44,8 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         self._footprints: FootprintProvider | None = None
 
     @property
-    def uses_serial_lineages(self) -> bool:
-        """Require independent branch owners and one authorized request per owner."""
+    def uses_request_branches(self) -> bool:
+        """Use an independent server-owned branch for each overlapping request."""
         return True
 
     def bind_footprints(self, provider: FootprintProvider | None) -> None:

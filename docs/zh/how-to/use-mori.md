@@ -127,18 +127,17 @@ SimpleCPU hook 升级至 API 2，必须同时更新两个 native patch 后重新
 完成即释放保护，native 缓存仍可机会性复用。服务端不推断应用最终采用哪个输出，后续真实 prompt 决定
 新的 context，允许裁剪和切换上下文。
 
-需要跨轮次保留分支保护时，在 canonical identity 中传递稳定 `lineage_id`：
+不提供 `lineage_id` 协议，也不要求客户端声明分支。旧请求中出现该键时，与其他未识别扩展一样忽略，
+不会影响调度；服务端不会再序列化它。同一 Program 的请求只要重叠（包括前一请求仍在等待准入），
+就使用独立临时 owner；不存在命名分支的串行后继队列。
 
-```json
-{"vllm_xargs":{"agentic_context":"{\"program_id\":\"session:lead\",\"lineage_id\":\"research\"}"}}
-```
+临时 owner 不构造应用层的父级阻塞关系，真实 subagent 继续使用独立 agent identity。
+API middleware 为每次请求生成内部 `lifecycle_token`，客户端无需设置；迟到的 terminal 信号只能释放
+对应最新请求的空闲分支。临时分支完成或取消后释放逻辑保护，物理缓存按 native 规则机会性保留。
+证据：`agentinfer/scheduling/request_branches.py:14-58`、`agentinfer/scheduling/runtime.py:527-561`。
 
-同一显式 lineage 的请求串行执行；不同 lineage 的 context、计时、tier、生命周期相互独立。内部 owner
-不构造应用层的父级阻塞关系，真实 subagent 继续使用独立 agent identity。API middleware 为每次请求生成
-内部 `lifecycle_token`，客户端无需设置；迟到的 terminal 信号只能释放对应最新请求的空闲 lineage。
-
-完整设计、论文对照和验证边界见
-[2026-10-28 重构方案](../../../design/module/scheduling/mori-redesign-20261028.zh-CN.md)。
+协议删除与后续设计边界见
+[状态与执行边界重构方案](../../../design/module/scheduling/mori-state-refactor-20261028.zh-CN.md)。
 
 ## 启动检查和排障
 
