@@ -1,0 +1,58 @@
+{
+  "observed_at_utc": "2026-10-28T12:49:51.860042+00:00",
+  "base_commit": "36e3dabff930a3d8a3276b3359191e686564fdb6",
+  "branch": "codex/mori-formal",
+  "preexisting_worktree_diff": "before.patch",
+  "preexisting_worktree_diff_sha256": "1e9089880ae1fe2f03f3ccd2dae4a7bcc8e3b15c100788b00d235f7df074bd5b",
+  "test_command": "MORI_VLLM_SOURCE=/tmp/mori-review-fixes-20261027/upstream PYTHONPATH=. /data/zx-envs/agentinfer-vllm-0.31.0/bin/python -m pytest tests/scheduling/ tests/agentcache/ -m cpu_test -q",
+  "test_result": {
+    "passed": 416,
+    "deselected": 26,
+    "warnings": 14,
+    "exit_code": 0,
+    "log": "pytest.log"
+  },
+  "checks": {
+    "command": "pre-commit run --files <all changed and newly added files>",
+    "result": "passed",
+    "log": "pre-commit.log",
+    "git_diff_check": "passed"
+  },
+  "replay_command": "PYTHONPATH=. /data/zx-envs/agentinfer-vllm-0.31.0/bin/python design/module/scheduling/artifacts/mori-paper-alignment-20261028/replay.py /data/zx/agent-kvc/research/studies/kvc_theory/mori-formal-simplecpu-20261027/experiment/runtime/mori-redesign32-03/stall-state-with-footprints.json",
+  "replay_input": "/data/zx/agent-kvc/research/studies/kvc_theory/mori-formal-simplecpu-20261027/experiment/runtime/mori-redesign32-03/stall-state-with-footprints.json",
+  "replay_input_sha256": "34e73ccafd17350ce8a537f20b602c000d8411df417b7b16ffd56eebfc74f439",
+  "replay_result": {
+    "native_requests_before": 0,
+    "retained_bindings_before": 17,
+    "pause_transitions": 3,
+    "admission_transitions": 4,
+    "log": "replay-after.json"
+  },
+  "native_patch_validation": "Both shipped patches applied to clean source fixtures; exercised real BlockPool and SimpleCPU scheduler Python methods without tensors or DMA.",
+  "full_gpu_or_e2e_benchmark_run": false,
+  "not_run_reason": "This turn validated policy and native allocation logic on CPU. The installed vLLM and active experiment environment were not modified; no new full 32/16 run was requested or started.",
+  "deployment_requires": "Rebuild native vLLM with both current patches; SimpleCPU API 2 and BlockPool store_admission_api_version 1.",
+  "source_sha256": {
+    "agentinfer/agentcache/core/controller.py": "99f8bda156acdb3c13ce7fde8b2c04ebd5bae8b5e4689ab93c7752251e23188b",
+    "agentinfer/agentcache/mori/simple_cpu_policy.py": "d940aa143ee57df138871eea6d0a0ea28ec91f1e7885e99786f3da4b6a27ea63",
+    "agentinfer/agentcache/mori/typed_lru.py": "56fb5f315a4e3f475caedc301d05d3c03e2c985a19056f8246e33e3e753376be",
+    "agentinfer/agentcache/patches/vllm-0.31-mori-hbm-provider.patch": "b93f1f0a454066be818f32f724bd09bb09e3e14ab48e4fd553bfaa0b0b134287",
+    "agentinfer/agentcache/patches/vllm-0.31-mori-simple-cpu-provider.patch": "28dd9d6c9734508af64737610893285f4a6da9995003adbb8870c68448fc0ed4",
+    "agentinfer/scheduling/mori/config.py": "dadb793a15fcaea6ea7f82968929aed6dc7dc84e043f15844103d3c4ac53256d",
+    "agentinfer/scheduling/mori/factors.py": "8cb502c642af1fd0cea70d7d16e0f44e4de9ff4f1f0d58663e2ae24ab33e2a3d",
+    "agentinfer/scheduling/mori/strategy.py": "80fa98211059cf3e6e3129f73d033003930460c083f6c89149a3e49a1a285420",
+    "tests/agentcache/core/test_mori_controller.py": "ae39efb5bb7f864762a464b6286ea429af5a03f3a31b4d7abfddcf042cae95d8",
+    "tests/agentcache/core/test_mori_vllm_adapter.py": "9b57910aa2cd8ee81b766fc91b429bbe2ba79b4ca3f3fa4dc76a3c0ef75060ac",
+    "tests/agentcache/test_mori_native_patch.py": "049aa62930ec433d8de7272a25a2fe6ccf408aefc500c0b3d116191dfad4c6f6",
+    "tests/agentcache/test_mori_simple_cpu_policy.py": "748e4458c79bdeec63949fbd49a38fd084a3e89dacf05ba2f5094b0d10f35f6e",
+    "tests/scheduling/test_mori_capacity.py": "fb45d298d75e367853ac7769733ea38f579f7a617326e443b0b92132d9d7e211",
+    "tests/scheduling/test_mori_lineages.py": "e7d99685f8ddbecb2a448d6b96b5344d5506fdd2a1b39cf45c93a5330c108c4b",
+    "tests/scheduling/test_mori_runtime.py": "def1a3947bd2f53984aa63370d21b3ed0cf21de2f26a509d4c81e5b83fbc9f01",
+    "tests/scheduling/test_mori_strategy.py": "af9765e6e77ebce70d83da6d8ee71525114991ed44a82f981d882a22f63f49e7"
+  },
+  "native_upstream_sha256": {
+    "vllm/v1/core/block_pool.py": "05c73052934a9d4664ccd5df562ce71011278d9a511932da102ef2efff00e934",
+    "vllm/v1/core/kv_cache_manager.py": "bd9bf46a2101f9368d4941867415a239d18d95e0b956f82f885ce25e10e69f3b",
+    "vllm/v1/simple_kv_offload/manager.py": "37f9b154293922790bd1e8692f16663a4ff819e86a6042bf2e87b903c8dc63f6"
+  }
+}

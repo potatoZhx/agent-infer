@@ -216,9 +216,15 @@ class TypedLRUIndex(Generic[EntryT]):
         self.stats["program_releases"] += 1
         return changed
 
-    def propose_exact(self, count: int, protected: Iterable[EntryT] = ()) -> tuple[EntryT, ...] | None:
+    def ready_count(self, classes: Iterable[CacheClass]) -> int:
+        """Return maintained evictable counts without scanning cache entries."""
+        return sum(self._ready_counts[cache_class] for cache_class in classes)
+
+    def propose_exact(
+        self, count: int, protected: Iterable[EntryT] = (), *, allowed_classes: Iterable[CacheClass] | None = None
+    ) -> tuple[EntryT, ...] | None:
         """Return exactly ``count`` ordered victims without mutating live entries."""
-        with self.reserve_exact(count, protected) as proposed:
+        with self.reserve_exact(count, protected, allowed_classes=allowed_classes) as proposed:
             return proposed
 
     @contextmanager
@@ -226,6 +232,8 @@ class TypedLRUIndex(Generic[EntryT]):
         self,
         count: int,
         protected: Iterable[EntryT] = (),
+        *,
+        allowed_classes: Iterable[CacheClass] | None = None,
     ) -> Iterator[tuple[EntryT, ...] | None]:
         """Reserve victims until the caller removes them or leaves the scope.
 
@@ -238,6 +246,7 @@ class TypedLRUIndex(Generic[EntryT]):
         if count == 0:
             yield ()
             return
+        allowed = set(self.eviction_order if allowed_classes is None else allowed_classes)
         protected_set = set(protected)
         selected: list[tuple[int, int, int, EntryT]] = []
         selected_keys: set[EntryT] = set()
@@ -246,6 +255,8 @@ class TypedLRUIndex(Generic[EntryT]):
         proposed: tuple[EntryT, ...] | None = None
         try:
             for cache_class in self.eviction_order:
+                if cache_class not in allowed:
+                    continue
                 heap = self._heaps[cache_class]
                 while heap and len(selected) < count:
                     item = heapq.heappop(heap)

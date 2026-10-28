@@ -8,8 +8,6 @@ import math
 from dataclasses import dataclass
 from enum import Enum
 
-from agentinfer.scheduling.domain import ProgramRef
-
 
 class MORITier(str, Enum):
     """Logical cache protection tier, independent of Program execution state."""
@@ -25,7 +23,6 @@ class MORIGlobalFactors:
 
     schedule_cycles: int = 0
     schedule_requested_at: float | None = None
-    relief_candidate: ProgramRef | None = None
 
     def __post_init__(self) -> None:
         if self.schedule_cycles < 0:
@@ -47,8 +44,6 @@ class MORIProgramFactors:
     reasoning_started_at_monotonic_s: float | None = None
     pending_tier: MORITier | None = None
     last_idleness: float = 0.0
-    resident_since: float | None = None
-    relief_for: ProgramRef | None = None
     execution_observed: bool = False
 
     def __post_init__(self) -> None:
@@ -62,6 +57,6 @@ class MORIProgramFactors:
             raise ValueError("MORI timing and idleness values must be finite and non-negative")
         if self.last_idleness > 1:
             raise ValueError("MORI last_idleness must be at most one")
-        timestamps = (self.acting_started_at_monotonic_s, self.reasoning_started_at_monotonic_s, self.resident_since)
+        timestamps = (self.acting_started_at_monotonic_s, self.reasoning_started_at_monotonic_s)
         if any(value is not None and (not math.isfinite(value) or value < 0) for value in timestamps):
             raise ValueError("MORI timestamps must be finite and non-negative")

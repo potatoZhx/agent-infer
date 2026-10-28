@@ -1,0 +1,87 @@
+{
+  "native_requests": 0,
+  "retained_bindings": 17,
+  "gpu_commitment_tokens": 111024,
+  "quota_tokens": 122192,
+  "beneficiary": {
+    "program_id": "ce6222e7-94e4-5a40-aac0-b82330a57152:lead",
+    "generation": 0
+  },
+  "beneficiary_claim_tokens": 34544,
+  "incremental_beneficiary_tokens": 34544,
+  "deficit_tokens": 23376,
+  "pending_gpu_victims": 0,
+  "transitions": [
+    {
+      "kind": "pause",
+      "program": {
+        "program_id": "cd64a9a2-e3a4-5519-970c-70aa3f6b1f2e:a39de71d811fce2b7",
+        "generation": 0
+      },
+      "reason": "mori_waiting_inference",
+      "backend_id": null
+    },
+    {
+      "kind": "resume",
+      "program": {
+        "program_id": "d1e196ce-4309-5690-8027-a1bc4f469172:a368918d8dccfefbc",
+        "generation": 0
+      },
+      "reason": "mori_cycle_promote",
+      "backend_id": "vllm-local"
+    },
+    {
+      "kind": "resume",
+      "program": {
+        "program_id": "6e34e894-03be-5fdc-8951-e29b0c7470a5:a6ac41d1980f01d50",
+        "generation": 0
+      },
+      "reason": "mori_cycle_promote",
+      "backend_id": "vllm-local"
+    },
+    {
+      "kind": "pause",
+      "program": {
+        "program_id": "c4387da1-7650-5d92-8445-addf4a8d7d1e:lead",
+        "generation": 0
+      },
+      "reason": "mori_waiting_inference",
+      "backend_id": null
+    },
+    {
+      "kind": "pause",
+      "program": {
+        "program_id": "66f68d4f-73c1-5048-ab8c-f317eb273f7a:a98b7a105f461d912",
+        "generation": 0
+      },
+      "reason": "mori_waiting_inference",
+      "backend_id": null
+    },
+    {
+      "kind": "resume",
+      "program": {
+        "program_id": "cc31c2e5-ebda-5e0a-8e25-ee618be67709:lead",
+        "generation": 0
+      },
+      "reason": "mori_cycle_promote",
+      "backend_id": "vllm-local"
+    },
+    {
+      "kind": "resume",
+      "program": {
+        "program_id": "2aeb7c38-ef23-57dd-88a3-5e03643f0b6d:lead",
+        "generation": 0
+      },
+      "reason": "mori_cycle_promote",
+      "backend_id": "vllm-local"
+    }
+  ],
+  "counters": {
+    "planning_program_reads": 216,
+    "planning_candidates": 17,
+    "planning_victims": 3,
+    "demotion_to_waiting": 3,
+    "promotion_applied": 4,
+    "promotion_no_fit": 13
+  }
+}

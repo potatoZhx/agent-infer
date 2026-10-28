@@ -79,9 +79,7 @@ _REMOVED_PROGRESS_TTL_SETTINGS = frozenset(
     }
 )
 
-_CONFIGURABLE_MORI_SETTINGS = frozenset(
-    {"mode", "window_size", "min_residency_seconds", "idleness_margin", "max_wait_seconds"}
-)
+_CONFIGURABLE_MORI_SETTINGS = frozenset({"mode", "window_size"})
 _FIXED_MORI_SETTINGS = frozenset({"decode_buffer_tokens"})
 
 
@@ -115,9 +113,6 @@ def build_mori_controller(
     if unknown:
         raise ValueError(f"mori settings are not supported: {', '.join(unknown)}")
     config = MORIConfig(
-        min_residency_seconds=_float_setting(raw, "min_residency_seconds", 1.0, scope="mori"),
-        idleness_margin=_float_setting(raw, "idleness_margin", 0.05, scope="mori"),
-        max_wait_seconds=_float_setting(raw, "max_wait_seconds", 30.0, scope="mori"),
         mode=_mori_mode_setting(raw, "mode", MORIMode.FULL),
         window_size=_int_setting(raw, "window_size", 5, scope="mori"),
     )

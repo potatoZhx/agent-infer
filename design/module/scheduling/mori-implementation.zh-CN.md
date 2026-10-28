@@ -687,3 +687,13 @@ native 取消确认及上界见 [tests/agentcache/core/test_mori_vllm_adapter.py
 - 性能报告同时记录源码版本、输入、容量、命中分母、传输和调度成本，不能用局部 CPU 探针替代 E2E。
 
 对应验收与实现索引：[tests/scheduling/test_mori_lineages.py:78-219](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/tests/scheduling/test_mori_lineages.py#L78-L219)、[tests/scheduling/test_mori_capacity.py:23-134](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/tests/scheduling/test_mori_capacity.py#L23-L134)、[tests/agentcache/core/test_mori_vllm_adapter.py:467-521](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/tests/agentcache/core/test_mori_vllm_adapter.py#L467-L521)、[agentinfer/agentcache/patches/vllm-0.31-mori-hbm-provider.patch:58-108](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/patches/vllm-0.31-mori-hbm-provider.patch#L58-L108)、[design/module/scheduling/artifacts/mori-redesign-20261028/validation.json:82-121](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/design/module/scheduling/artifacts/mori-redesign-20261028/validation.json#L82-L121)。
+
+## 2026-10-28 后续修订：收敛论文机制与 CPU 写入保护
+
+本页前文固定到早先实现的提交，作为历史记录保留。后续工作树已删除 escrow、最短驻留、idleness margin
+和等待超时提权；GPU tier 请求直接准入，容量超额由统一循环按 Acting 优先及 Reasoning 完成后降层处理。
+SimpleCPU 升为 API 2，BUSY 备份不能驱逐 IDLE CPU 缓存，拒绝写入不会回退 LRU。
+
+完整语义、论文解释边界、部署要求及验证索引见
+[MORI 论文机制收敛与 CPU 写入保护](mori-paper-alignment-20261028.zh-CN.md)。
+证据：`agentinfer/scheduling/mori/strategy.py:141-284`、`agentinfer/agentcache/mori/simple_cpu_policy.py:82-94`。

@@ -106,10 +106,10 @@ def test_planner_does_not_claim_shared_blocks_as_full_victim_relief():
     components.strategy.schedule_resume(
         fixed, components.initial_factors, accepting_controller(components.strategy, components.initial_factors, calls)
     )
-    # Removing A frees only its private decode reserve; B must drain too.
-    assert [call.program for call in calls] == [a.ref, b.ref]
+    # Removing A frees only its private decode reserve. B is still executing;
+    # do not displace A pointlessly or promise capacity released by running B.
+    assert calls == []
     assert components.initial_factors.for_program(b.ref).tier is MORITier.GPU
-    assert components.initial_factors.global_factors.relief_candidate == waiting.ref
 
 
 def test_non_fitting_waiter_scan_grows_linearly_in_program_reads():

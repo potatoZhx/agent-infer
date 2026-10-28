@@ -1,0 +1,95 @@
+diff --git a/agentinfer/scheduling/mori/strategy.py b/agentinfer/scheduling/mori/strategy.py
+index 690987f..823c6e6 100644
+--- a/agentinfer/scheduling/mori/strategy.py
++++ b/agentinfer/scheduling/mori/strategy.py
+@@ -276,8 +276,19 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
+         if next_waiting is None:
+             return
+         if escrow is not None:
+-            self.counters["promotion_waiting_lazy_relief"] += 1
+-            return
++            pending_relief = any(
++                sidecar.tier is MORITier.GPU and sidecar.pending_tier is not None and sidecar.relief_for == escrow
++                for _, sidecar in strategy_factors.program_factors
++            )
++            if pending_relief:
++                self.counters["promotion_waiting_lazy_relief"] += 1
++                return
++            # The old victims have drained, but intervening decode growth or
++            # invalidated shared-block proof can make their relief insufficient.
++            # Keep the beneficiary first and plan additional relief from fresh
++            # claims instead of waiting for a completion that can never arrive.
++            self._set_relief(strategy_factors, None)
++            self.counters["relief_replan_required"] += 1
+         candidate = next_waiting
+         aged = self._wait_seconds(candidate, now) >= self.config.max_wait_seconds
+         candidate_idle = self._idleness(self._factor(strategy_factors, candidate.ref), now)
+diff --git a/tests/scheduling/test_mori_strategy.py b/tests/scheduling/test_mori_strategy.py
+index 4f01778..62cbe8e 100644
+--- a/tests/scheduling/test_mori_strategy.py
++++ b/tests/scheduling/test_mori_strategy.py
+@@ -267,6 +267,64 @@ def test_pending_cpu_destinations_prevent_lazy_demotion_overcommit() -> None:
+     assert components.initial_factors.for_program(second.ref).pending_tier is MORITier.WAITING
+ 
+ 
++@pytest.mark.parametrize("status", [ProgramStatus.ACTING, ProgramStatus.REASONING])
++def test_drained_relief_replans_when_surviving_claim_has_grown(status: ProgramStatus) -> None:
++    """A completed lazy plan cannot wait forever for victims that already drained."""
++    components = build_mori_strategy(MORIConfig(mode=MORIMode.FULL))
++    survivor = view("survivor", state=ProgramState.ACTIVE, status=status, tokens=700)
++    drained = view("drained", state=ProgramState.PAUSED, status=ProgramStatus.ACTING, tokens=400)
++    waiting = replace(
++        view("waiting", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400, step_count=1),
++        wait_started_at_monotonic_s=0.0,
++    )
++    set_tier(components, survivor, MORITier.GPU)
++    set_tier(components, drained, MORITier.CPU)
++    components.strategy._set_factor(
++        components.initial_factors,
++        drained.ref,
++        replace(components.initial_factors.for_program(drained.ref), relief_for=waiting.ref),
++    )
++    components.strategy._set_relief(components.initial_factors, waiting.ref)
++    calls: list[TransitionRequest] = []
++    components.strategy.schedule_resume(
++        snapshot(survivor, drained, waiting, hbm=1000, dram=2000),
++        components.initial_factors,
++        accepting_controller(components.strategy, components.initial_factors, calls),
++    )
++    if status is ProgramStatus.ACTING:
++        assert [call.kind for call in calls] == [TransitionKind.PAUSE, TransitionKind.RESUME]
++        assert components.initial_factors.global_factors.relief_candidate is None
++    else:
++        assert [call.kind for call in calls] == [TransitionKind.MARK_FOR_PAUSE]
++        assert components.initial_factors.global_factors.relief_candidate == waiting.ref
++        assert components.initial_factors.for_program(survivor.ref).tier is MORITier.GPU
++    assert calls[0].program == survivor.ref
++
++
++def test_live_lazy_relief_keeps_escrow_and_does_not_spend_pending_capacity() -> None:
++    components = build_mori_strategy(MORIConfig(mode=MORIMode.FULL))
++    victim = view(
++        "victim", state=ProgramState.ACTIVE, status=ProgramStatus.REASONING, tokens=700, marked_for_pause=True
++    )
++    waiting = view("waiting", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400)
++    backfill = view("backfill", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=50)
++    set_tier(components, victim, MORITier.GPU)
++    components.strategy._set_factor(
++        components.initial_factors,
++        victim.ref,
++        replace(components.initial_factors.for_program(victim.ref), pending_tier=MORITier.CPU, relief_for=waiting.ref),
++    )
++    components.strategy._set_relief(components.initial_factors, waiting.ref)
++    calls: list[TransitionRequest] = []
++    components.strategy.schedule_resume(
++        snapshot(victim, waiting, backfill),
++        components.initial_factors,
++        accepting_controller(components.strategy, components.initial_factors, calls),
++    )
++    assert not calls
++    assert components.initial_factors.global_factors.relief_candidate == waiting.ref
++
++
+ def test_idleness_uses_only_committed_reasoning_and_elapsed_acting() -> None:
+     components = build_mori_strategy(MORIConfig(window_size=5, mode=MORIMode.PLACEMENT_ONLY))
+     program = ProgramRef("program", 0)

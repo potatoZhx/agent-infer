@@ -80,3 +80,31 @@ def test_simple_cpu_provider_tracks_shared_owners_touch_and_abandon() -> None:
     assert policy.propose(1) is None
     policy.close()
     state.unbind_provider(components.strategy)
+
+
+@pytest.mark.parametrize(
+    "incoming,allowed", [(MORITier.GPU, (1, 2)), (MORITier.CPU, (1, 2, 3)), (MORITier.WAITING, (1,))]
+)
+def test_store_admission_cannot_replace_higher_cpu_protection(incoming, allowed):
+    components = build_mori_strategy()
+    state = MORIRuntimeState()
+    state.bind_provider(components.strategy)
+    policy = MORISimpleCPUOffloadPolicy(state)
+    for block_id, tier in enumerate((MORITier.WAITING, MORITier.GPU, MORITier.CPU), 1):
+        owner = ProgramRef(tier.value, 0)
+        state.bind_request(tier.value, owner)
+        components.strategy._set_factor(components.initial_factors, owner, MORIProgramFactors(tier=tier))
+        policy.on_block_owner_added(block_id, tier.value)
+        policy.on_block_ready(block_id, block_id)
+    assert policy.store_capacity(incoming.value) == len(allowed)
+    assert policy.propose_for_store(len(allowed), incoming.value) == allowed
+    assert policy.propose_for_store(len(allowed) + 1, incoming.value) is None
+    assert policy.propose(3) == (1, 2, 3)  # rejection did not remove entries
+    assert policy.store_capacity("unknown-request") == 1
+    # The shared block must retain the stronger CPU protection.
+    policy.on_block_owner_added(2, "cpu")
+    assert policy.store_capacity("gpu") == 1
+    policy.on_block_evictability_changed(1, False)
+    assert policy.store_capacity("gpu") == 0
+    policy.close()
+    state.unbind_provider(components.strategy)

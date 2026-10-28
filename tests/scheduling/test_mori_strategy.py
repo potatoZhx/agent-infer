@@ -228,7 +228,7 @@ def test_existing_waiter_reclaims_an_acting_gpu_reservation_without_timeout() ->
     assert components.initial_factors.for_program(waiting.ref).tier is MORITier.GPU
 
 
-def test_aged_waiter_reserves_lazy_reasoning_relief() -> None:
+def test_wait_age_does_not_preempt_reasoning_without_capacity_debt() -> None:
     components = build_mori_strategy(MORIConfig(mode=MORIMode.FULL))
     resident = view("resident", state=ProgramState.ACTIVE, status=ProgramStatus.REASONING, tokens=700)
     waiting = view("waiting", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400, step_count=1)
@@ -243,10 +243,10 @@ def test_aged_waiter_reserves_lazy_reasoning_relief() -> None:
         accepting_controller(components.strategy, components.initial_factors, calls),
     )
 
-    assert [call.kind for call in calls] == [TransitionKind.MARK_FOR_PAUSE]
+    assert calls == []
     resident_factors = components.initial_factors.for_program(resident.ref)
     assert resident_factors.tier is MORITier.GPU
-    assert resident_factors.pending_tier is MORITier.CPU
+    assert resident_factors.pending_tier is None
 
 
 def test_pending_cpu_destinations_prevent_lazy_demotion_overcommit() -> None:
@@ -265,6 +265,59 @@ def test_pending_cpu_destinations_prevent_lazy_demotion_overcommit() -> None:
 
     assert components.initial_factors.for_program(first.ref).pending_tier is MORITier.CPU
     assert components.initial_factors.for_program(second.ref).pending_tier is MORITier.WAITING
+
+
+@pytest.mark.parametrize("status", [ProgramStatus.ACTING, ProgramStatus.REASONING])
+def test_completed_demotion_is_not_a_persistent_plan(status: ProgramStatus) -> None:
+    """The original drained-plan state cannot lock later planning cycles."""
+    components = build_mori_strategy()
+    survivor = view("survivor", state=ProgramState.ACTIVE, status=status, tokens=700)
+    drained = view("drained", state=ProgramState.PAUSED, status=ProgramStatus.ACTING, tokens=400)
+    waiting = view("waiting", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400, step_count=1)
+    set_tier(components, survivor, MORITier.GPU)
+    set_tier(components, drained, MORITier.CPU)
+    calls = []
+    components.strategy.schedule_resume(
+        snapshot(survivor, drained, waiting, hbm=1000, dram=2000),
+        components.initial_factors,
+        accepting_controller(components.strategy, components.initial_factors, calls),
+    )
+    if status is ProgramStatus.ACTING:
+        assert [call.kind for call in calls] == [TransitionKind.PAUSE, TransitionKind.RESUME]
+    else:
+        assert calls == []  # The authorized inference can finish normally.
+        assert components.initial_factors.for_program(survivor.ref).pending_tier is None
+
+
+def test_unfittable_high_priority_waiter_does_not_block_smaller_request() -> None:
+    components = build_mori_strategy()
+    victim = view("victim", state=ProgramState.ACTIVE, status=ProgramStatus.REASONING, tokens=700)
+    waiting = view("waiting", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400, step_count=1)
+    backfill = view("backfill", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=50)
+    set_tier(components, victim, MORITier.GPU)
+    set_tier(components, waiting, MORITier.CPU)
+    calls = []
+    components.strategy.schedule_resume(
+        snapshot(victim, waiting, backfill),
+        components.initial_factors,
+        accepting_controller(components.strategy, components.initial_factors, calls),
+    )
+    assert [(call.kind, call.program) for call in calls] == [(TransitionKind.ADMIT, backfill.ref)]
+
+
+def test_waiting_reasoning_reclaims_acting_even_with_equal_idleness() -> None:
+    components = build_mori_strategy()
+    resident = view("resident", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=700)
+    waiting = view("waiting", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400)
+    for program, tier in [(resident, MORITier.GPU), (waiting, MORITier.CPU)]:
+        set_tier(components, program, tier, idleness=1.0)
+    calls = []
+    components.strategy.schedule_resume(
+        snapshot(resident, waiting),
+        components.initial_factors,
+        accepting_controller(components.strategy, components.initial_factors, calls),
+    )
+    assert [call.kind for call in calls] == [TransitionKind.PAUSE, TransitionKind.ADMIT]
 
 
 def test_idleness_uses_only_committed_reasoning_and_elapsed_acting() -> None:
@@ -408,7 +461,7 @@ def test_overlapping_completions_end_reasoning_only_after_the_last_request() -> 
 
 
 @pytest.mark.parametrize("tier,steps", [(MORITier.CPU, 1), (MORITier.WAITING, 1), (MORITier.WAITING, 0)])
-def test_aged_wait_has_an_explicit_progress_exception(tier, steps) -> None:
+def test_wait_age_does_not_override_paper_promotion_priority(tier, steps) -> None:
     components = build_mori_strategy()
     old = replace(
         view("old", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=700),
@@ -425,7 +478,7 @@ def test_aged_wait_has_an_explicit_progress_exception(tier, steps) -> None:
     components.strategy.schedule_resume(
         fixed, components.initial_factors, accepting_controller(components.strategy, components.initial_factors, calls)
     )
-    assert [call.program for call in calls] == [old.ref]
+    assert [call.program for call in calls] == [young.ref]
     assert dict(components.strategy.diagnostics(fixed, components.initial_factors)[0].fields)["max_wait_seconds"] == 100
 
 

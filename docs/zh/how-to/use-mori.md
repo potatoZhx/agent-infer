@@ -100,17 +100,20 @@ SimpleCPU adapter 在启动和运行期间完成以下闭环：
 MORI 当前不主动 prefetch。CPU tier 表示保护优先级；需要再次推理时仍由 SimpleCPU 的 native on-demand load
 触发 H2D。
 
-MORI 在容量合法且没有满足置换条件的等待者时保持驻留。事件唤醒统一规划；到达路径仅使用已有余量，
-不逐请求扫描 victim。普通队列按 CPU returning、其他 returning、新 Program 的 context/idleness 排序。
-置换前必须证明整个 victim 集合能让候选进展。Acting victim 需要满足最小驻留时间，并具有相对 idleness
-优势，或 GPU 上都处于 Acting 且工具阶段已稳定。老等待者可以触发 Reasoning lazy demotion；承诺的空间
-保留给受益者，直到它获准或取消。Reasoning 完成或 native 确认取消后才释放 GPU 预留；串行排队的后续请求
-不会延长当前 drain。
+GPU tier 已经是准入决策：当前分支的请求直接提交引擎，后续串行请求仍等待当前请求完成。
+上下文增长导致总量超额时，统一循环先降 Acting，再按 idleness 从高到低选择 Reasoning 做 lazy demotion。
+Reasoning 完成或 native 确认取消后才释放 GPU 预留；排队的串行后继不会延长 drain。
+等待者按 CPU returning、其他 returning、新 Program 的 context/idleness 排序；不能放入的候选不会阻塞
+后续候选。推理需求可以回收 Acting 的承诺，同状态按 idleness 排序；没有压力时保留 placement。
+不再保留候选独占的未来回收额度，也没有额外等待超时、最短驻留或 idleness 差值门槛。
 
-`agentcache.mori` 的工程默认值为 `min_residency_seconds=1.0`、`idleness_margin=0.05`、
-`max_wait_seconds=30.0`。这些不是论文参数。`max_wait_seconds` 触发公平性选择，不保证延迟上界，
-因为已有推理仍须结束。旧 `mori.starvation_timeout_seconds` 配置继续不受支持。diagnostics 中
-`max_wait_seconds` 是观测值，`configured_max_wait_seconds` 是配置值。
+`agentcache.mori` 只接受 `mode` 和 `window_size`。已删除 `min_residency_seconds`、`idleness_margin`、
+`max_wait_seconds` 配置；旧 `starvation_timeout_seconds` 仍不支持。diagnostics 的 `max_wait_seconds`
+仅表示观测到的最长等待时间，不是配置或延迟保证。
+
+SimpleCPU hook 升级至 API 2，必须同时更新两个 native patch 后重新构建。GPU/BUSY 备份只能使用
+空闲、INACTIVE 或 BUSY CPU 块，不得挤掉 IDLE 缓存；写入拒绝不会退回普通 LRU。
+依据：`agentinfer/scheduling/mori/strategy.py:141-284`、`agentinfer/agentcache/mori/simple_cpu_policy.py:82-94`。
 
 当前 MORI 要求一个 native KV cache group。有效 HBM 容量扣除永久 null block；prompt 加最大输出超过
 有效容量的请求在准入前拒绝。逻辑 GPU 预算是 context 加 100 decode token 后按 block 取整，推测余量

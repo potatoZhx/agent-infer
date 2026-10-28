@@ -86,9 +86,10 @@ def test_same_external_program_overlaps_have_independent_owners() -> None:
 
 def test_lazy_demotion_completion_wakes_waiter_before_the_next_periodic_tick() -> None:
     runtime = scheduler()
-    capacity = backend(208)
+    capacity = backend(416)
     with patch("agentinfer.scheduling.runtime.time.monotonic", return_value=0.0) as clock:
         assert runtime.on_request_arrival("resident", AgentIdentity("resident"), 100, capacity, "resident")
+        assert runtime.on_request_arrival("peer", AgentIdentity("z-peer"), 100, capacity, "peer")
         runtime.schedule_cycle(capacity)
         clock.return_value = 1.0
         assert not runtime.on_request_arrival("old", AgentIdentity("old"), 100, capacity, "old")
@@ -100,6 +101,7 @@ def test_lazy_demotion_completion_wakes_waiter_before_the_next_periodic_tick() -
         resident = runtime.program_ref_for_request("resident")
         assert not runtime.registry.require(resident).marked_for_pause
         clock.return_value = 31.0
+        runtime.on_stream_output("resident", 20)
         runtime.schedule_cycle(capacity)
         assert runtime.registry.require(resident).marked_for_pause
         assert not runtime.needs_schedule_cycle(31.01)
@@ -127,7 +129,7 @@ def test_arrival_can_use_free_capacity_behind_a_non_fitting_waiter() -> None:
         assert runtime.request_pool.waiting_request_ids == ("large",)
 
 
-def test_completion_wakes_selection_without_forcing_a_short_gap_demotion() -> None:
+def test_completion_wakes_selection_and_reclaims_acting_for_waiting_inference() -> None:
     runtime = scheduler()
     capacity = backend(1008)
     with patch("agentinfer.scheduling.runtime.time.monotonic", return_value=0.0) as clock:
@@ -140,5 +142,5 @@ def test_completion_wakes_selection_without_forcing_a_short_gap_demotion() -> No
         assert not runtime.on_request_arrival("small", AgentIdentity("small"), 50, capacity, "small")
         assert runtime.needs_schedule_cycle(1.1)
         runtime.schedule_cycle(capacity)
-        assert [entry.request_id for entry, _ in runtime.consume_admitted_requests()] == ["small"]
-        assert runtime.request_pool.waiting_request_ids == ("large",)
+        assert [entry.request_id for entry, _ in runtime.consume_admitted_requests()] == ["small", "large"]
+        assert runtime.request_pool.waiting_request_ids == ()

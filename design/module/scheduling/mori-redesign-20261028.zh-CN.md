@@ -374,3 +374,13 @@ CPU 探针在 64/128/256/512 等待者下读取 389/773/1541/3077 次 factors，
 `placement_only` 可隔离 typed eviction 的影响，但没有 full CPU 保护语义，不能当作同一算法的透明故障回退。
 如果回退旧版源码，还应同步恢复其匹配配置与 lifecycle 协议，不能把新 lineage 客户端依赖无条件套到旧实现上。
 依据：[agentinfer/agentcache/mori/vllm_adapter.py:105-200](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/mori/vllm_adapter.py#L105-L200)、[agentinfer/agentcache/core/controller.py:103-142](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/agentcache/core/controller.py#L103-L142)、[agentinfer/scheduling/identity.py:28-95](https://github.com/potatoZhx/agent-infer/blob/d4af0d1e25ec4e94d13816a536b07b9fcb24c0fc/agentinfer/scheduling/identity.py#L28-L95)。
+
+## 2026-10-28 后续修订：收敛论文机制与 CPU 写入保护
+
+本页前文固定到早先实现的提交，作为历史记录保留。后续工作树已删除 escrow、最短驻留、idleness margin
+和等待超时提权；GPU tier 请求直接准入，容量超额由统一循环按 Acting 优先及 Reasoning 完成后降层处理。
+SimpleCPU 升为 API 2，BUSY 备份不能驱逐 IDLE CPU 缓存，拒绝写入不会回退 LRU。
+
+完整语义、论文解释边界、部署要求及验证索引见
+[MORI 论文机制收敛与 CPU 写入保护](mori-paper-alignment-20261028.zh-CN.md)。
+证据：`agentinfer/scheduling/mori/strategy.py:141-284`、`agentinfer/agentcache/mori/simple_cpu_policy.py:82-94`。

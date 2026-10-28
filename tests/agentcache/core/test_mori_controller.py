@@ -64,6 +64,9 @@ def test_decode_buffer_cannot_be_overridden() -> None:
         build_mori_controller(backend(), {"mori": {"decode_buffer_tokens": 999}})
 
 
-def test_controller_rejects_removed_starvation_timeout() -> None:
-    with pytest.raises(ValueError, match="not supported: starvation_timeout_seconds"):
-        build_mori_controller(backend(), {"mori": {"starvation_timeout_seconds": 60.0}})
+@pytest.mark.parametrize(
+    "setting", ["starvation_timeout_seconds", "min_residency_seconds", "idleness_margin", "max_wait_seconds"]
+)
+def test_controller_rejects_removed_policy_extensions(setting) -> None:
+    with pytest.raises(ValueError, match=f"not supported: {setting}"):
+        build_mori_controller(backend(), {"mori": {setting: 60.0}})

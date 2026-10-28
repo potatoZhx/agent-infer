@@ -1,4 +1,3 @@
-diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/manager.py
 --- a/vllm/v1/simple_kv_offload/manager.py
 +++ b/vllm/v1/simple_kv_offload/manager.py
 @@ -6,7 +6,7 @@
@@ -10,7 +9,7 @@ diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/ma
  
  from vllm.config import VllmConfig
  from vllm.distributed.kv_events import (
-@@ -87,6 +87,73 @@
+@@ -87,6 +87,85 @@
      block_meta: list[dict[BlockHashWithGroupId, BlockStoreMeta]] | None = None
  
  
@@ -42,6 +41,13 @@ diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/ma
 +
 +    def propose(
 +        self, count: int, protected_block_ids: Iterable[int] = ()
++    ) -> tuple[int, ...] | None: ...
++
++
++    def store_capacity(self, request_id: str) -> int: ...
++
++    def propose_for_store(
++        self, count: int, request_id: str
 +    ) -> tuple[int, ...] | None: ...
 +
 +
@@ -80,11 +86,16 @@ diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/ma
 +    ) -> tuple[int, ...] | None:
 +        return self.delegate.propose(count, protected_block_ids)
 +
++    def propose_for_store(
++        self, count: int, request_id: str
++    ) -> tuple[int, ...] | None:
++        return self.delegate.propose_for_store(count, request_id)
++
 +
  @dataclass
  class LoadRequestState:
      request: "Request"
-@@ -223,6 +290,11 @@
+@@ -223,6 +302,11 @@
          self.fa_block_size: int = self.group_block_sizes[self.fa_gidx]
          assert self.block_size % self.fa_block_size == 0
          self.cpu_block_pool: BlockPool = self.cpu_coordinator.block_pool
@@ -96,7 +107,7 @@ diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/ma
          # GPU block pool reference - bound after scheduler builds kv_cache_manager
          self._gpu_block_pool: BlockPool | None = None
  
-@@ -334,6 +406,127 @@
+@@ -334,6 +418,148 @@
          Called by Scheduler after kv_cache_manager is ready."""
          self._gpu_block_pool = gpu_block_pool
  
@@ -143,7 +154,7 @@ diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/ma
 +        provider: MoriSimpleCPUVictimProvider,
 +    ) -> dict[str, int]:
 +        """Install typed victim advice on this scheduler's CPU block pool."""
-+        if api_version != 1 or provider.HOOK_API_VERSION != 1:
++        if api_version != 2 or provider.HOOK_API_VERSION != 2:
 +            raise ValueError("unsupported MORI SimpleCPU offload-tier hook API")
 +        if not self._mori_cpu_backend:
 +            raise RuntimeError("MORI SimpleCPU support requires kv_offload_backend=cpu")
@@ -152,7 +163,7 @@ diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/ma
 +        if self._mori_offload_tier_provider not in (None, provider):
 +            raise RuntimeError("a MORI SimpleCPU provider is already registered")
 +        if self._mori_offload_tier_provider is provider:
-+            return {"hook_api_version": 1}
++            return {"hook_api_version": 2}
 +        register = getattr(
 +            self.cpu_block_pool, "register_mori_block_selection_provider", None
 +        )
@@ -171,7 +182,7 @@ diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/ma
 +            if isinstance(capabilities, dict)
 +            else None
 +        )
-+        if version != 1:
++        if version != 1 or capabilities.get("store_admission_api_version") != 1:
 +            unregister = getattr(
 +                self.cpu_block_pool,
 +                "unregister_mori_block_selection_provider",
@@ -190,7 +201,7 @@ diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/ma
 +        )
 +        self._mori_offload_tier_provider = provider
 +        self._mori_offload_tier_bridge = bridge
-+        return {"hook_api_version": 1}
++        return {"hook_api_version": 2}
 +
 +    def unregister_mori_offload_tier_provider(
 +        self, provider: MoriSimpleCPUVictimProvider
@@ -206,6 +217,27 @@ diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/ma
 +        self._mori_offload_tier_provider = None
 +        self._mori_offload_tier_bridge = None
 +        self._mori_resident_block_ids.clear()
++
++    def _mori_store_capacity(self, request_id: str) -> int:
++        free = self.cpu_block_pool.get_num_free_blocks()
++        provider = self._mori_offload_tier_provider
++        if provider is None:
++            return free
++        return min(free, max(0, provider.store_capacity(request_id)))
++
++    def _allocate_store_blocks(
++        self, count: int, request_id: str
++    ) -> list["KVCacheBlock"]:
++        if self._mori_offload_tier_provider is None:
++            return self.cpu_block_pool.get_new_blocks(count)
++        try:
++            return self.cpu_block_pool.get_new_blocks(
++                count, mori_store_request_id=request_id
++            )
++        except ValueError:
++            # Optional backup: keep current CPU contents and retry positional
++            # blocks on a later step. Never fall back to unrestricted eviction.
++            return []
 +
 +    def _observe_mori_owner(
 +        self, request_id: str, blocks: Iterable["KVCacheBlock"]
@@ -224,7 +256,7 @@ diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/ma
      def get_num_new_matched_tokens(
          self, request: "Request", num_computed_tokens: int
      ) -> tuple[int | None, bool]:
-@@ -381,6 +574,7 @@
+@@ -381,6 +607,7 @@
                  blk for grp in cpu_hit_blocks for blk in grp if not blk.is_null
              ]
              self.cpu_block_pool.touch(pin_blocks)
@@ -232,7 +264,7 @@ diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/ma
              self._pending_cpu_hits[request.request_id] = (
                  cpu_hit_blocks,
                  hit_length,
-@@ -701,7 +895,7 @@
+@@ -701,7 +928,7 @@
              for _, gpu_block_id, _ in entries:
                  stats.published += 1
                  gpu_block = gpu_block_pool.blocks[gpu_block_id]
@@ -241,23 +273,50 @@ diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/ma
                  if admission is _StoreAdmission.NULL_BLOCK:
                      stats.dropped_null_block += 1
                      continue
-@@ -722,6 +916,7 @@
+@@ -714,14 +941,19 @@
+                 if admission is _StoreAdmission.ALREADY_CACHED:
+                     stats.skipped_already_cached += 1
+                     continue
+-                if num_free <= 0:
++                if num_free <= 0 or self._mori_store_capacity(req_id) <= 0:
+                     stats.dropped_cpu_full += 1
+                     logger.warning_once(
+                         "SimpleCPU dropped a boundary-state handoff because "
+                         "the CPU block pool is full; this boundary will not be retried."
                      )
                      continue
-                 cpu_block = cpu_block_pool.get_new_blocks(1)[0]
+-                cpu_block = cpu_block_pool.get_new_blocks(1)[0]
++                destinations = self._allocate_store_blocks(1, req_id)
++                if not destinations:
++                    stats.dropped_cpu_full += 1
++                    continue
++                cpu_block = destinations[0]
 +                self._observe_mori_owner(req_id, (cpu_block,))
                  merged_gpu_block_ids.append(gpu_block_id)
                  merged_cpu_block_ids.append(cpu_block.block_id)
                  if merged_block_meta is not None:
-@@ -768,6 +963,7 @@
+@@ -767,7 +999,10 @@
+             # Batch allocate the CPU destinations.
              n_to_alloc = len(gpu_block_ids)
              if n_to_alloc > 0:
-                 cpu_blocks_alloc = cpu_block_pool.get_new_blocks(n_to_alloc)
+-                cpu_blocks_alloc = cpu_block_pool.get_new_blocks(n_to_alloc)
++                cpu_blocks_alloc = self._allocate_store_blocks(n_to_alloc, req_id)
++                if not cpu_blocks_alloc:
++                    continue  # Do not advance cursors for a rejected store.
 +                self._observe_mori_owner(req_id, cpu_blocks_alloc)
                  cpu_block_ids = [blk.block_id for blk in cpu_blocks_alloc]
              else:
                  cpu_block_ids = []
-@@ -880,7 +1076,7 @@
+@@ -845,7 +1080,7 @@
+             else self.block_size
+         )
+         aligned_tokens = confirmed_tokens // store_alignment * store_alignment
+-        num_free = self.cpu_block_pool.get_num_free_blocks()
++        num_free = self._mori_store_capacity(request.request_id)
+ 
+         for g, group_gpu_ids in enumerate(block_ids_by_group):
+             if g not in self.prefix_cacheable_group_ids:
+@@ -880,7 +1115,7 @@
                      gpu_block = recovered
                      gpu_block_id = gpu_block.block_id
                  if (
@@ -266,7 +325,7 @@ diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/ma
                      is not _StoreAdmission.READY
                  ):
                      advanced_per_group[g] += 1
-@@ -950,19 +1146,23 @@
+@@ -950,19 +1185,23 @@
  
          return gpu_block_ids, advanced_per_group, block_meta
  
@@ -297,7 +356,7 @@ diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/ma
              return _StoreAdmission.ALREADY_CACHED
          return _StoreAdmission.READY
  
-@@ -1087,6 +1287,8 @@
+@@ -1087,6 +1326,8 @@
                  cpu_block,
                  num_tokens=gpu_block.block_hash_num_tokens,
              )
@@ -306,7 +365,7 @@ diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/ma
              secondary_hashes = self._gpu_block_pool.cached_block_hashes_by_block.get(
                  gpu_block_id, ()
              )
-@@ -1166,6 +1368,7 @@
+@@ -1166,6 +1407,7 @@
  
      def _release_transfer_refs(self, transfer: TransferMeta) -> None:
          """Release transfer refs without making copied data cacheable."""
@@ -314,15 +373,28 @@ diff --git a/vllm/v1/simple_kv_offload/manager.py b/vllm/v1/simple_kv_offload/ma
          cpu_blocks = [self.cpu_block_pool.blocks[bid] for bid in transfer.cpu_block_ids]
          self.cpu_block_pool.free_blocks(cpu_blocks)
          assert self._gpu_block_pool is not None
-@@ -1250,6 +1453,7 @@
+@@ -1239,7 +1481,7 @@
+             # positional scan above already selected it. Appending again would
+             # allocate two CPU blocks for one GPU block.
+             and partial_tail not in gpu_ids
+-            and len(gpu_ids) < self.cpu_block_pool.get_num_free_blocks()
++            and len(gpu_ids) < self._mori_store_capacity(request.request_id)
+         ):
+             gpu_ids.append(partial_tail)
+             if block_meta is not None:
+@@ -1249,7 +1491,10 @@
+                 block_meta.append({})
          if not gpu_ids:
              return
-         cpu_blocks = self.cpu_block_pool.get_new_blocks(len(gpu_ids))
+-        cpu_blocks = self.cpu_block_pool.get_new_blocks(len(gpu_ids))
++        cpu_blocks = self._allocate_store_blocks(len(gpu_ids), request.request_id)
++        if not cpu_blocks:
++            return
 +        self._observe_mori_owner(request.request_id, cpu_blocks)
          self._pending_finished_stores.append(
              TransferMeta(gpu_ids, [b.block_id for b in cpu_blocks], block_meta)
          )
-@@ -1305,7 +1509,11 @@
+@@ -1305,7 +1550,11 @@
              )
          ):
              return None

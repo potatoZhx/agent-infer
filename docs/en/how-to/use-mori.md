@@ -102,19 +102,21 @@ The SimpleCPU adapter closes the following loop at startup and runtime:
 MORI does not actively prefetch. CPU tier is a protection priority; a later inference still triggers SimpleCPU's native
 on-demand H2D load.
 
-MORI keeps a placement while it fits and there is no eligible replacement. Events wake a shared planning cycle;
-arrivals use existing slack without scanning for victims. Normal queue order is CPU returns, other returns, then new
-Programs by context size and relative idleness. A replacement must have a complete feasible victim plan. Acting
-victims require stable residence and either an idleness advantage or an otherwise idle GPU. An aged waiter may request
-lazy relief from Reasoning victims. The beneficiary owns the promised space until its admission or cancellation.
-Reasoning victims retain their GPU reservation until completion or confirmed native cancellation. Queued serial
-followers cannot prolong that drain.
+GPU membership is the admission decision: the current request goes directly to the engine, while serial followers
+wait for its completion. Growth beyond the aggregate GPU budget triggers Acting-first, highest-idleness demotion.
+Reasoning victims retain their GPU commitment until completion or confirmed native cancellation; serial followers
+cannot prolong that drain. Pending inference is ordered by CPU returns, other returns, then new Programs by context
+size and idleness. Candidates that cannot fit do not block later candidates. Waiting inference may reclaim Acting
+commitments in idleness order. Without pressure, placement stays unchanged.
 
-The engineering defaults in `agentcache.mori` are `min_residency_seconds=1.0`, `idleness_margin=0.05`, and
-`max_wait_seconds=30.0`. These extensions are not paper parameters. `max_wait_seconds` triggers fairness selection;
-it is not a maximum latency guarantee because running inference must finish. The old
-`mori.starvation_timeout_seconds` setting remains unsupported. Diagnostics distinguish observed `max_wait_seconds`
-from `configured_max_wait_seconds`.
+There is no beneficiary-owned future capacity, wait timeout, minimum residence or extra idleness margin.
+`agentcache.mori` accepts only `mode` and `window_size`; remove the former `min_residency_seconds`, `idleness_margin`,
+and `max_wait_seconds` settings. The old `starvation_timeout_seconds` remains unsupported. The diagnostic
+`max_wait_seconds` is an observed wait, not a configuration or latency guarantee.
+
+SimpleCPU now requires hook API 2: rebuild with both current native patches. GPU/BUSY backups can use empty,
+INACTIVE or BUSY CPU blocks, but cannot evict IDLE working sets. Rejected stores never fall back to ordinary LRU.
+Evidence: `agentinfer/scheduling/mori/strategy.py:141-284`, `agentinfer/agentcache/mori/simple_cpu_policy.py:82-94`.
 
 MORI requires one native KV cache group. Effective HBM capacity excludes the permanent null block. A request whose
 prompt plus maximum output exceeds that capacity is rejected before admission. The normal logical claim rounds

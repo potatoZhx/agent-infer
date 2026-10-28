@@ -19,7 +19,7 @@ class MORISimpleCPUOffloadPolicy:
     owner/class/readiness deltas and proposes an exact ordered victim set.
     """
 
-    HOOK_API_VERSION = 1
+    HOOK_API_VERSION = 2
 
     def __init__(self, runtime_state: MORIRuntimeState) -> None:
         self.runtime_state = runtime_state
@@ -78,6 +78,20 @@ class MORISimpleCPUOffloadPolicy:
     ) -> tuple[int, ...] | None:
         """Return advice only; SimpleCPU validates and performs allocation."""
         return self.index.propose_exact(count, protected_block_ids)
+
+    def _store_classes(self, request_id: str) -> tuple[CacheClass, ...]:
+        owner = self.runtime_state.program_for_request(request_id)
+        incoming = self.runtime_state.cache_class_for_program(owner) if owner is not None else CacheClass.INACTIVE
+        order = self.index.eviction_order
+        return order[: order.index(incoming) + 1]
+
+    def store_capacity(self, request_id: str) -> int:
+        """Count free/lower-or-equal protection destinations for this incoming store."""
+        return self.index.ready_count(self._store_classes(request_id))
+
+    def propose_for_store(self, count: int, request_id: str) -> tuple[int, ...] | None:
+        """Reject a backup that would evict a more protected CPU working set."""
+        return self.index.propose_exact(count, allowed_classes=self._store_classes(request_id))
 
     def close(self) -> None:
         """Detach the SimpleCPU index from Program class notifications."""

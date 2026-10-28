@@ -83,17 +83,22 @@ def test_executing_lease_cannot_pause_even_if_phase_observation_is_wrong():
     assert not r._apply_transition(TransitionRequest(TransitionKind.PAUSE, ref, "unsafe")).applied
 
 
-def test_returning_larger_prompt_must_obtain_new_capacity_before_dispatch():
+def test_gpu_tier_request_is_dispatched_and_growth_is_repaired_lazily():
     r, pool = runtime(1008)
     assert r.on_request_arrival("one", AgentIdentity("agent"), 400, pool, "one")
     assert r.on_request_arrival("peer", AgentIdentity("peer"), 300, pool, "peer")
     ref = r.program_ref_for_request("one")
     r.on_request_completion("one", 420)
-    assert not r.on_request_arrival("next", AgentIdentity("agent"), 800, pool, "next")
-    assert r.registry.require(ref).state is ProgramState.PAUSED
+    assert r.on_request_arrival("next", AgentIdentity("agent"), 800, pool, "next")
+    assert r.registry.require(ref).state is ProgramState.ACTIVE
     assert r.registry.require(ref).tokens.estimated_context_tokens == 800
     assert r.consume_admitted_requests() == ()
     assert r.registry.require(r.program_ref_for_request("peer")).status is ProgramStatus.REASONING
+    r.schedule_cycle(pool)
+    assert (
+        r.registry.require(ref).marked_for_pause
+        or r.registry.require(r.program_ref_for_request("peer")).marked_for_pause
+    )
 
 
 def test_growth_wakes_on_reservation_boundary_including_decode_headroom():
@@ -111,14 +116,16 @@ def test_growth_wakes_on_reservation_boundary_including_decode_headroom():
 
 
 def test_drain_excludes_queued_requests_and_new_overlaps_cannot_extend_it():
-    r, pool = runtime(512, max_wait_seconds=2)
+    r, pool = runtime(1024)
     identity = AgentIdentity("agent", lineage_id="main")
     with patch("agentinfer.scheduling.runtime.time.monotonic", return_value=0.0) as clock:
         assert r.on_request_arrival("running", identity, 400, pool, "one")
+        assert r.on_request_arrival("peer", AgentIdentity("peer"), 400, pool, "peer")
         assert not r.on_request_arrival("serial", identity, 100, pool, "two")
         clock.return_value = 1.0
         assert not r.on_request_arrival("waiter", AgentIdentity("waiter"), 400, pool, "waiter")
         clock.return_value = 3.0
+        r.on_stream_output("running", 50)
         r.schedule_cycle(pool)
         ref = r.program_ref_for_request("running")
         assert r.registry.require(ref).marked_for_pause
@@ -130,8 +137,8 @@ def test_drain_excludes_queued_requests_and_new_overlaps_cannot_extend_it():
         assert r.registry.require(ref).status is ProgramStatus.REASONING  # serial is waiting, not executing
         assert r.strategy_factors.for_program(ref).tier is MORITier.CPU
         r.schedule_cycle(pool)
-        assert [entry.request_id for entry, _ in r.consume_admitted_requests()] == ["waiter"]
-        assert r.request_pool.waiting_request_ids == ("serial", "later")
+        assert [entry.request_id for entry, _ in r.consume_admitted_requests()] == ["serial"]
+        assert r.request_pool.waiting_request_ids == ("waiter", "later")
 
 
 def test_cancel_deferred_request_does_not_end_running_lease():
@@ -147,11 +154,13 @@ def test_cancel_deferred_request_does_not_end_running_lease():
 
 
 def test_cancel_confirmed_running_request_completes_pending_drain():
-    r, pool = runtime(512, max_wait_seconds=1)
+    r, pool = runtime(1024)
     with patch("agentinfer.scheduling.runtime.time.monotonic", return_value=0.0) as clock:
         assert r.on_request_arrival("running", AgentIdentity("resident"), 400, pool, "one")
+        assert r.on_request_arrival("peer", AgentIdentity("z-peer"), 400, pool, "peer")
         assert not r.on_request_arrival("waiting", AgentIdentity("waiting"), 400, pool, "two")
         clock.return_value = 2.0
+        r.on_stream_output("running", 50)
         r.schedule_cycle(pool)
         ref = r.program_ref_for_request("running")
         assert r.registry.require(ref).marked_for_pause
@@ -161,35 +170,33 @@ def test_cancel_confirmed_running_request_completes_pending_drain():
         assert [entry.request_id for entry, _ in r.consume_admitted_requests()] == ["waiting"]
 
 
-def test_short_acting_gap_stays_sticky_then_makes_progress():
-    r, pool = runtime(512, min_residency_seconds=1)
+def test_acting_placement_sticks_without_pressure_and_yields_to_waiting_inference():
+    r, pool = runtime(512)
     with patch("agentinfer.scheduling.runtime.time.monotonic", return_value=0.0) as clock:
         assert r.on_request_arrival("one", AgentIdentity("resident"), 400, pool, "one")
         ref = r.program_ref_for_request("one")
         clock.return_value = 0.1
         r.on_request_completion("one", 400)
-        assert not r.on_request_arrival("two", AgentIdentity("waiting"), 400, pool, "two")
         r.schedule_cycle(pool)
         assert r.strategy_factors.for_program(ref).tier is MORITier.GPU
-        assert r.consume_admitted_requests() == ()
-        clock.return_value = 1.2
+        clock.return_value = 1000.0
+        r.schedule_cycle(pool)
+        assert r.strategy_factors.for_program(ref).tier is MORITier.GPU  # age alone does not demote
+        assert not r.on_request_arrival("two", AgentIdentity("waiting"), 400, pool, "two")
         r.schedule_cycle(pool)
         assert [entry.request_id for entry, _ in r.consume_admitted_requests()] == ["two"]
 
 
-def test_cancelled_beneficiary_withdraws_uncommitted_lazy_demotion():
-    r, pool = runtime(512, max_wait_seconds=1)
-    with patch("agentinfer.scheduling.runtime.time.monotonic", return_value=0.0) as clock:
-        assert r.on_request_arrival("one", AgentIdentity("resident"), 400, pool, "one")
-        assert not r.on_request_arrival("two", AgentIdentity("waiting"), 400, pool, "two")
-        clock.return_value = 2.0
-        r.schedule_cycle(pool)
-        ref = r.program_ref_for_request("one")
-        assert r.registry.require(ref).marked_for_pause
-        r.cancel_request("two")
-        r.schedule_cycle(pool)
-        assert not r.registry.require(ref).marked_for_pause
-        assert r.strategy_factors.for_program(ref).pending_tier is None
+def test_cancelled_waiter_cannot_leave_a_soft_drain_behind():
+    r, pool = runtime(512)
+    assert r.on_request_arrival("one", AgentIdentity("resident"), 400, pool, "one")
+    assert not r.on_request_arrival("two", AgentIdentity("waiting"), 400, pool, "two")
+    r.schedule_cycle(pool)
+    ref = r.program_ref_for_request("one")
+    assert not r.registry.require(ref).marked_for_pause
+    r.cancel_request("two")
+    r.schedule_cycle(pool)
+    assert r.strategy_factors.for_program(ref).pending_tier is None
 
 
 def test_late_terminal_receipt_does_not_release_newer_context_or_other_lineage():
