@@ -149,10 +149,11 @@ SimpleCPU hook 升级至 API 3，必须同时更新两个 native patch 后重新
 
 ### 缓存归属与保守的层级反馈
 
-新 prompt 被保留时会立即失效该 Program 的旧容量 footprint 证明，但请求还在 native 调度之外等待时，
-不会提前撤销旧 typed cache owner。MORI 在真正 dispatch 到 native 前替换旧 ownership 和上下文凭证，
-随后只由 native 命中重新挂接新 prompt 实际使用的内容。共享 owner、物理缓存、native pin 和 LRU 年龄
-继续保留；下一次 dispatch、Program 退出或调度器关闭会使该上下文凭证失效。
+新 prompt 被保留时会立即失效该 Program 的旧容量 footprint 证明，但请求在 native 调度之外或 native
+waiting queue 中等待时，都不会提前撤销旧 typed cache owner。真实 native prefix lookup 仍以该 owner
+受保护的内容执行；lookup 返回后、任何 allocation 复用 block 前，MORI 才替换旧 ownership 和上下文凭证，
+并立即把精确命中的 blocks 重新挂接到新请求。共享 owner、物理缓存、native pin 和 LRU 年龄继续保留；
+下一次 lookup handoff、Program 退出或调度器关闭会使该上下文凭证失效。
 
 实际 HBM 分配中的完整 MORI 建议包含 BUSY 块时，只请求提前运行一次常规调度周期；同一调度边界前的
 通知合并。native 分配及 fallback 立即继续，下一周期仍按已有容量和相对 idleness 规则决策，允许不调整

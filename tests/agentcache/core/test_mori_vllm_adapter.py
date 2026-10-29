@@ -571,3 +571,57 @@ def test_retained_prefix_observation_continues_after_incomplete_cache_hit(cache_
 
     controller.on_prefix_cache_observation.assert_called_once_with("valid", 96)
     warning.assert_called_once_with("AgentInfer prefix-cache observation failed request=%s", "invalid", exc_info=True)
+
+
+def test_context_handoff_preserves_old_owner_until_exact_native_lookup() -> None:
+    """The lookup must see the old prompt, while only exact hits survive replacement."""
+    program = ProgramRef("program", 0)
+    MORI_RUNTIME_STATE.bind_request("request", program)
+    old_context = MORI_RUNTIME_STATE.capture_context("request")
+    events: list[object] = []
+    blocks = SimpleNamespace(
+        blocks=([SimpleNamespace(block_id=11, ref_cnt=0), SimpleNamespace(block_id=12, ref_cnt=1)],)
+    )
+
+    def native_lookup(request):
+        if not events:
+            assert MORI_RUNTIME_STATE.program_for_context(old_context) == program
+        events.append("lookup")
+        return blocks, 32
+
+    def handoff(request_id):
+        events.append("handoff")
+        assert request_id == "request"
+        MORI_RUNTIME_STATE.replace_context(program)
+
+    policy = SimpleNamespace(
+        on_block_owner_added=Mock(side_effect=lambda block_id, request_id: events.append((block_id, request_id)))
+    )
+    hooks = object.__new__(_VllmAdmissionHooks)
+    hooks.controller = SimpleNamespace(
+        strategy=build_mori_strategy(MORIConfig(mode=MORIMode.PLACEMENT_ONLY)).strategy,
+        program_ref_for_request=lambda request_id: program,
+        on_request_dispatch=Mock(side_effect=handoff),
+    )
+    hooks._mori_adapter = SimpleNamespace(hbm_policy=policy)
+    hooks.tracked_native = {"request"}
+    hooks._local_prefix_observations = {}
+    hooks._mori_context_handed_off = set()
+    hooks._context_handoff_at_lookup = False
+    owner = SimpleNamespace(kv_cache_manager=SimpleNamespace(get_computed_blocks=native_lookup))
+    request = SimpleNamespace(request_id="request")
+
+    hooks._install_prefix_lookup_observer(owner)
+    assert hooks._context_handoff_at_lookup is True
+    assert owner.kv_cache_manager.get_computed_blocks(request) == (blocks, 32)
+
+    assert events == ["lookup", "handoff", (11, "request"), (12, "request")]
+    assert MORI_RUNTIME_STATE.program_for_context(old_context) is None
+    assert MORI_RUNTIME_STATE.program_for_request("request") == program
+    assert hooks._local_prefix_observations["request"] == (32, 16)
+    assert hooks._mori_context_handed_off == {"request"}
+
+    # A preempted request may query again, but prompt ownership changes once.
+    owner.kv_cache_manager.get_computed_blocks(request)
+    hooks.controller.on_request_dispatch.assert_called_once_with("request")
+    assert policy.on_block_owner_added.call_count == 2

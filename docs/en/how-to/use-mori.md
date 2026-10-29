@@ -160,10 +160,11 @@ is ready. Native refcounts, transfer fences, allocation and recomputation remain
 ### Cache ownership and conservative placement feedback
 
 A retained new prompt immediately invalidates the Program's old capacity-proof footprint, but does not expose the
-previous typed cache owner while the request is still waiting outside native scheduling. Immediately before native
-dispatch, MORI replaces the old ownership and context receipt, then native hits reattach only content used by the new
-prompt. Shared owners, physical cache contents, native pins, and LRU ages remain intact. The new opaque context
-receipt becomes invalid on the next dispatch, retirement, or scheduler shutdown.
+previous typed cache owner while the request is waiting outside native scheduling or in the native waiting queue.
+The real native prefix lookup runs against that protected owner. After the lookup returns and before allocation can
+reuse a block, MORI replaces the old ownership and context receipt and immediately reattaches the exact hit blocks to
+the new request. Shared owners, physical cache contents, native pins, and LRU ages remain intact. The new opaque
+context receipt becomes invalid on the next lookup handoff, retirement, or scheduler shutdown.
 
 A complete MORI HBM allocation proposal containing BUSY blocks requests an earlier normal scheduling cycle.
 Notifications before one boundary coalesce. Native allocation and fallback continue immediately; the next cycle

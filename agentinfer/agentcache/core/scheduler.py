@@ -151,6 +151,8 @@ class _VllmAdmissionHooks:
         self.tracked_native: set[str] = set()
         self._rejected_requests: list[Request] = []
         self._local_prefix_observations: dict[str, tuple[int, int]] = {}
+        self._mori_context_handed_off: set[str] = set()
+        self._context_handoff_at_lookup = False
         self._prefix_refresh_pending = False
         self.controller = (
             build_progress_ttl_controller(self.backend_pool_info(owner), settings)
@@ -272,12 +274,32 @@ class _VllmAdmissionHooks:
             self._add_to_native_waiting(entry.retained_request, entry.arrived_at_monotonic_s, native_add)
 
     def _prepare_mori_dispatch(self, request_id: str) -> None:
-        """Replace the prior typed owner only once the retained request can run."""
-        self.controller.on_request_dispatch(request_id)
+        """Bind native identity while preserving the prior prompt through cache lookup."""
         program = self.controller.program_ref_for_request(request_id)
         if program is None:
             raise RuntimeError("AgentInfer controller lost a request selected for native dispatch")
+        if not self._context_handoff_at_lookup:
+            self.controller.on_request_dispatch(request_id)
+            self._mori_context_handed_off.add(request_id)
         MORI_RUNTIME_STATE.bind_request(request_id, program)
+
+    def _commit_mori_context_handoff(self, request_id: str, computed_blocks: object) -> None:
+        """Replace old ownership after lookup, then immediately reclaim exact HBM hits."""
+        if request_id in self._mori_context_handed_off:
+            return
+        program = self.controller.program_ref_for_request(request_id)
+        if program is None:
+            raise RuntimeError("AgentInfer lost a request during native prefix lookup")
+        self.controller.on_request_dispatch(request_id)
+        MORI_RUNTIME_STATE.bind_request(request_id, program)
+        hbm_policy = self._mori_adapter.hbm_policy if self._mori_adapter is not None else None
+        if hbm_policy is not None:
+            for group in getattr(computed_blocks, "blocks", ()):
+                for block in group:
+                    block_id = getattr(block, "block_id", None)
+                    if isinstance(block_id, int):
+                        hbm_policy.on_block_owner_added(block_id, request_id)
+        self._mori_context_handed_off.add(request_id)
 
     @staticmethod
     def _add_to_native_waiting(
@@ -359,6 +381,7 @@ class _VllmAdmissionHooks:
                     self.controller.on_request_completion(request_id, total_tokens)
                     self.tracked_native.discard(request_id)
                     self._local_prefix_observations.pop(request_id, None)
+                    self._mori_context_handed_off.discard(request_id)
                     MORI_RUNTIME_STATE.unbind_request(request_id)
                     completed_request = True
         if completed_request:
@@ -438,6 +461,7 @@ class _VllmAdmissionHooks:
                 self.controller.on_request_completion(request_id, token_counts.get(request_id, 0))
                 self.tracked_native.discard(request_id)
                 self._local_prefix_observations.pop(request_id, None)
+                self._mori_context_handed_off.discard(request_id)
                 MORI_RUNTIME_STATE.unbind_request(request_id)
         return retained + native
 
@@ -455,6 +479,9 @@ class _VllmAdmissionHooks:
             computed = native_get_computed_blocks(request)
             computed_blocks, cached_tokens = computed[0], computed[1]
             if request.request_id in self.tracked_native:
+                controller = getattr(self, "controller", None)
+                if isinstance(getattr(controller, "strategy", None), MORIStrategy):
+                    self._commit_mori_context_handoff(request.request_id, computed_blocks)
                 cached = max(0, int(cached_tokens))
                 self._local_prefix_observations[request.request_id] = (
                     cached,
@@ -464,6 +491,7 @@ class _VllmAdmissionHooks:
 
         observed_get_computed_blocks._agentinfer_prefix_lookup_observer = True
         kv_cache_manager.get_computed_blocks = observed_get_computed_blocks
+        self._context_handoff_at_lookup = True
 
     @staticmethod
     def _ref_count_shared_tokens(computed_blocks: object, cached_tokens: int) -> int:
