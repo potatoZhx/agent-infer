@@ -13,7 +13,7 @@ from agentinfer.agentcache.mori.runtime_state import MORIRuntimeState
 from agentinfer.agentcache.mori.simple_cpu_policy import MORISimpleCPUOffloadPolicy
 from agentinfer.scheduling.domain import ProgramRef, ProgramState, ProgramStatus
 from agentinfer.scheduling.mori import MORITier, build_mori_strategy
-from agentinfer.scheduling.mori.capacity import CapacityClaim, CapacityLedger
+from agentinfer.scheduling.mori.capacity import CapacityClaim, CapacityLedger, ReliefProjection
 from agentinfer.scheduling.transitions import TransitionKind
 from tests.scheduling.test_mori_strategy import accepting_controller, set_tier, snapshot, view
 
@@ -48,6 +48,31 @@ def test_union_ledger_matches_brute_force_with_private_growth_promises():
         union = set().union(*(claim.blocks for claim in active.values()))
         expected = len(union) * 16 + sum(claim.tokens - len(claim.blocks) * 16 for claim in active.values())
         assert ledger.used == expected
+
+
+def test_relief_projection_matches_independent_union_after_admissions_at_every_boundary():
+    random = Random(539)
+    initial = CapacityLedger(16)
+    victims = tuple(ProgramRef(str(i), 0) for i in range(20))
+
+    def claim():
+        blocks = frozenset(random.sample(range(40), random.randrange(15)))
+        return CapacityClaim(16 * (len(blocks) + random.randrange(6)), blocks)
+
+    for ref in (*victims, ProgramRef("running", 0)):
+        initial.add(ref, claim())
+    projection = ReliefProjection(initial, victims)
+    admitted = []
+    for _ in range(30):
+        candidate = claim()
+        for boundary in range(len(victims) + 1):
+            remaining = [c for ref, c in initial.claims.items() if ref not in victims[:boundary]]
+            claims = [*remaining, *admitted, candidate]
+            union = set().union(*(item.blocks for item in claims))
+            expected = 16 * len(union) + sum(item.tokens - 16 * len(item.blocks) for item in claims)
+            assert projection.required(boundary, candidate) == expected
+        admitted.append(candidate)
+        projection.admit(candidate)
 
 
 def test_recycled_block_and_new_prompt_invalidate_only_relevant_proof():
@@ -117,7 +142,7 @@ def test_capacity_repair_uses_marginal_shared_relief_and_keeps_lazy_debt():
 
 
 @pytest.mark.parametrize("quota", [1200, 1600])
-def test_shared_candidate_uses_only_existing_slack_without_replacing_owners(quota):
+def test_shared_candidate_rebalances_only_necessary_owners_when_slack_is_insufficient(quota):
     components = build_mori_strategy()
     a = view("a", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=400)
     b = view("b", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=400)
@@ -138,12 +163,14 @@ def test_shared_candidate_uses_only_existing_slack_without_replacing_owners(quot
     components.strategy.schedule_resume(
         fixed, components.initial_factors, accepting_controller(components.strategy, components.initial_factors, calls)
     )
-    expected = [] if quota == 1200 else [(TransitionKind.RESUME, waiting.ref)]
+    expected = [(TransitionKind.PAUSE, a.ref), (TransitionKind.PAUSE, b.ref)] if quota == 1200 else []
+    expected.append((TransitionKind.RESUME, waiting.ref))
     assert [(call.kind, call.program) for call in calls] == expected
     for program in (a, b, spare, running):
-        assert components.initial_factors.for_program(program.ref).tier is MORITier.GPU
+        tier = MORITier.CPU if quota == 1200 and program in (a, b) else MORITier.GPU
+        assert components.initial_factors.for_program(program.ref).tier is tier
         assert components.initial_factors.for_program(program.ref).pending_tier is None
-    assert components.strategy._ledgers(fixed, components.initial_factors)[0].used == (1100 if quota == 1200 else 1600)
+    assert components.strategy._ledgers(fixed, components.initial_factors)[0].used == quota
 
 
 def test_non_fitting_candidates_do_not_rescan_or_demote_acting_residents():
@@ -169,12 +196,13 @@ def test_non_fitting_candidates_do_not_rescan_or_demote_acting_residents():
             )
         counts.append(factor_reads.call_count)
         assert components.strategy.counters["planning_candidates"] == size
-        assert not calls  # No candidate fits the existing slack.
+        assert not calls  # Even removing all Acting owners cannot fit a candidate.
     assert all(after < before * 2.1 for before, after in zip(counts, counts[1:], strict=False))
 
 
 @pytest.mark.parametrize("seed", range(50))
-def test_slack_promotions_match_brute_force_union_planner(seed):
+@pytest.mark.parametrize("has_running", [False, True])
+def test_rebalance_matches_brute_force_union_planner(seed, has_running):
     random = Random(912 + seed)
     components = build_mori_strategy()
     programs, claims, scores, tiers = {}, {}, {}, {}
@@ -183,7 +211,7 @@ def test_slack_promotions_match_brute_force_union_planner(seed):
         program = view(
             str(index),
             state=ProgramState.ACTIVE if gpu else ProgramState.PAUSED,
-            status=ProgramStatus.ACTING if index < 8 else ProgramStatus.REASONING,
+            status=ProgramStatus.ACTING if gpu and (index < 8 or not has_running) else ProgramStatus.REASONING,
             tokens=200 + random.randrange(400),
             step_count=random.randrange(2),
         )
@@ -213,13 +241,25 @@ def test_slack_promotions_match_brute_force_union_planner(seed):
         return group, claims[ref].tokens if group == 2 else 0, scores[ref], ref
 
     candidates = sorted(set(programs) - active, key=promotion_key)
+    victims = sorted(
+        (ref for ref in active if programs[ref].status is ProgramStatus.ACTING), key=lambda ref: (-scores[ref], ref)
+    )
     expected = []
     for candidate in candidates:
-        projected = active | {candidate}
-        if union_tokens(projected) <= quota:
-            kind = TransitionKind.RESUME if programs[candidate].step_count else TransitionKind.ADMIT
-            expected.append((kind, candidate))
-            active = projected
+        eligible = [ref for ref in victims if ref in active and scores[ref] > scores[candidate]]
+        if (
+            not any(programs[ref].status is ProgramStatus.REASONING for ref in active)
+            and union_tokens((active - set(eligible)) | {candidate}) > quota
+        ):
+            eligible = [ref for ref in victims if ref in active]
+        for count in range(len(eligible) + 1):
+            projected = (active - set(eligible[:count])) | {candidate}
+            if union_tokens(projected) <= quota:
+                expected.extend((TransitionKind.PAUSE, ref) for ref in eligible[:count])
+                kind = TransitionKind.RESUME if programs[candidate].step_count else TransitionKind.ADMIT
+                expected.append((kind, candidate))
+                active = projected
+                break
     calls = []
     fixed = snapshot(*programs.values(), hbm=quota, dram=100_000)
     components.strategy.schedule_resume(

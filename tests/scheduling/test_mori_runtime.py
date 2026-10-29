@@ -129,7 +129,7 @@ def test_arrival_can_use_free_capacity_behind_a_non_fitting_waiter() -> None:
         assert runtime.request_pool.waiting_request_ids == ("large",)
 
 
-def test_elapsed_acting_keeps_sticky_placement_until_capacity_is_released() -> None:
+def test_elapsed_acting_rebalances_without_explicit_terminal_or_capacity_debt() -> None:
     runtime = scheduler()
     capacity = backend(1008)
     with patch("agentinfer.scheduling.runtime.time.monotonic", return_value=0.0) as clock:
@@ -144,15 +144,10 @@ def test_elapsed_acting_keeps_sticky_placement_until_capacity_is_released() -> N
         runtime.schedule_cycle(capacity)
         assert [entry.request_id for entry, _ in runtime.consume_admitted_requests()] == ["small"]
         assert runtime.request_pool.waiting_request_ids == ("large",)
-        # Tool elapsed time changes the score but creates neither capacity
-        # debt nor free capacity. A periodic tick must preserve placement.
+        # A normal periodic tick must turn elapsed tool time into placement
+        # changes even though the existing GPU commitments remain under quota.
         clock.return_value = 6.2
         assert runtime.needs_schedule_cycle(6.2)
-        runtime.schedule_cycle(capacity)
-        assert runtime.consume_admitted_requests() == ()
-        assert runtime.request_pool.waiting_request_ids == ("large",)
-        clock.return_value = 6.3
-        assert runtime.on_response_completion("resident", ProgramLifecycle.TERMINAL)
         runtime.schedule_cycle(capacity)
         assert [entry.request_id for entry, _ in runtime.consume_admitted_requests()] == ["large"]
         assert runtime.request_pool.waiting_request_ids == ()

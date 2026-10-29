@@ -200,7 +200,7 @@ def test_cancel_confirmed_running_request_completes_pending_drain():
         assert [entry.request_id for entry, _ in r.consume_admitted_requests()] == ["waiting"]
 
 
-def test_acting_placement_sticks_until_capacity_is_released():
+def test_acting_placement_sticks_without_demand_and_rebalances_when_waiter_arrives():
     r, pool = runtime(512)
     with patch("agentinfer.scheduling.runtime.time.monotonic", return_value=0.0) as clock:
         assert r.on_request_arrival("one", AgentIdentity("resident"), 400, pool, "one")
@@ -214,11 +214,8 @@ def test_acting_placement_sticks_until_capacity_is_released():
         assert r.strategy_factors.for_program(ref).tier is MORITier.GPU  # age alone does not demote
         assert not r.on_request_arrival("two", AgentIdentity("waiting"), 400, pool, "two")
         r.schedule_cycle(pool)
-        assert r.consume_admitted_requests() == ()
-        assert r.strategy_factors.for_program(ref).tier is MORITier.GPU
-        assert r.on_response_completion("resident", ProgramLifecycle.TERMINAL)
-        r.schedule_cycle(pool)
         assert [entry.request_id for entry, _ in r.consume_admitted_requests()] == ["two"]
+        assert r.strategy_factors.for_program(ref).tier is MORITier.CPU
 
 
 def test_cancelled_waiter_cannot_leave_a_soft_drain_behind():

@@ -106,16 +106,24 @@ Reasoning 完成或 native 确认取消后才释放 GPU 预留。
 等待者按 CPU returning、其他 returning、新 Program 的 context/idleness 排序；不能放入的候选不会阻塞
 后续候选。
 
-提升只使用已有余量，不能放入的候选不会置换驻留者。降级只修复真实容量超额，遵循
-[MORI 论文 §4.3.1](https://arxiv.org/html/2606.00866v1#S4.SS3.SSS1)。容量检查按实际共享块计算，不能提前兑现
-Reasoning 的 pending 释放；CPU 也不会仅因新候选分数更好而主动置换驻留者。默认 100-token decode 预留继续保留。
+每轮调度重新计算相对 idleness，落实 [MORI 论文 §4.3](https://arxiv.org/html/2606.00866v1#S4.SS3)
+描述的层级边界调整。提升先使用已有余量；候选无法放入时，可以降级 idleness 严格更高的 GPU Acting，
+即使 GPU 当前尚未超额。执行降级前，先按实际共享块验证整组候选 victim 移除后能否容纳请求；只有已接受
+的降级才能释放容量，不能提前兑现 Reasoning 的 pending 释放。真实容量超额仍由独立路径修复，
+Reasoning 继续采用 lazy demotion。CPU 不会仅因新候选分数更好而主动置换驻留者，默认 100-token decode
+预留继续保留。
+
+另有明确的进展保护：当 GPU 没有 Reasoning owner 时，可放入的等待请求允许回收 Acting 占位，
+不再要求其评分严格更优，避免平分或历史分数导致空闲引擎被缓存占位阻塞，包括父 Program 等待子请求
+的情况。此规则不增加超时或调参项，首个请求成功准入后即停止生效，也不会抢占 Reasoning；
+本轮新准入的请求同样受到保护。
 
 本地实现增加两项优化。首先，CPU 或 WAITING 中暂停的 Reasoning 请求，将本次请求的等待时间临时计入
 调度 idleness 分母中的 Reasoning 时间。它仍属于当前周期的原有窗口槽位，准入 GPU 时冻结，Reasoning
 结束时清除；完成历史只保存真实 Reasoning 和 Acting 时间。工具执行与 native GPU 抢占不增加此补偿。
 层级决策和 diagnostics 使用同一评分函数，原有层级优先顺序与 Typed-LRU 保持不变，不引入历史衰减参数。
 
-其次，Acting owner 已提交到 WAITING 时，退出 MORI 记账并释放 native ownership。后续请求获得新 generation、
+其次，Acting owner 已提交到 WAITING 时，当轮退出 MORI 记账并释放 native ownership。后续请求获得新 generation、
 空历史及新 Program 的排序优先级。业务 task/parent 关系继续保留；物理共享 KV 与未完成的 native 传输仍由
 引擎管理。匹配的 terminal 凭证可以结束旧业务记录，但不能影响后来的 generation。Acting 很久本身不会
 触发退出，必须已经离开 GPU 与 CPU 两个逻辑缓存层；等待补偿也不能创造空闲容量或保证等待时间有界。
@@ -128,7 +136,8 @@ Reasoning 的 pending 释放；CPU 也不会仅因新候选分数更好而主动
 
 SimpleCPU hook 升级至 API 2，必须同时更新两个 native patch 后重新构建。GPU/BUSY 备份只能使用
 空闲、INACTIVE 或 BUSY CPU 块，不得挤掉 IDLE 缓存；写入拒绝不会退回普通 LRU。
-依据：`agentinfer/scheduling/mori/strategy.py:141-284`、`agentinfer/agentcache/mori/simple_cpu_policy.py:82-94`。
+依据：`agentinfer/scheduling/mori/strategy.py:209-326`、`agentinfer/scheduling/mori/capacity.py:83-137`、
+`agentinfer/agentcache/mori/simple_cpu_policy.py:82-94`。
 
 当前 MORI 要求一个 native KV cache group。有效 HBM 容量扣除永久 null block；prompt 加最大输出超过
 有效容量的请求在准入前拒绝。逻辑 GPU 预算是 context 加 100 decode token 后按 block 取整，推测余量

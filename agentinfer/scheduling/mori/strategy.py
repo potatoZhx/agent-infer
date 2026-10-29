@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import math
 import time
+from bisect import bisect_left
 from collections import Counter
 from dataclasses import replace
 
@@ -14,7 +15,7 @@ from agentinfer.scheduling.cache_placement import CacheClass, ProgramCacheClassO
 from agentinfer.scheduling.domain import ProgramRef, ProgramState, ProgramStatus, ProgramView
 from agentinfer.scheduling.events import SchedulingEvent, StrategyDiagnostic
 from agentinfer.scheduling.factors import StrategyFactors
-from agentinfer.scheduling.mori.capacity import CapacityClaim, CapacityLedger, FootprintProvider
+from agentinfer.scheduling.mori.capacity import CapacityClaim, CapacityLedger, FootprintProvider, ReliefProjection
 from agentinfer.scheduling.mori.config import MORIConfig, MORIMode
 from agentinfer.scheduling.mori.factors import MORIGlobalFactors, MORIProgramFactors, MORITier
 from agentinfer.scheduling.snapshot import SchedulingSnapshot
@@ -25,7 +26,7 @@ MORIFactors = StrategyFactors[MORIGlobalFactors, MORIProgramFactors]
 
 
 class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
-    """Capacity-driven sticky placement with current-cycle waiting compensation.
+    """Periodic relative-idleness placement with current-cycle waiting compensation.
 
     The strategy does not predict a future return, prefetch KV, or perform a
     transfer. It commits logical protection classes; native vLLM remains the
@@ -212,8 +213,12 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
     ) -> None:
         started = time.thread_time()
         try:
-            self._select_pending(snapshot, strategy_factors, transitions)
+            demoted = self._select_pending(snapshot, strategy_factors, transitions)
             self._retire_inactive(snapshot, strategy_factors, transitions)
+            # The input snapshot predates these accepted pauses. Retire only
+            # after all planning scans, using their committed post-pause state.
+            for program in demoted:
+                self._retire_program(program, strategy_factors, transitions)
         finally:
             self.decision_cpu_seconds += time.thread_time() - started
 
@@ -222,22 +227,44 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         snapshot: SchedulingSnapshot,
         strategy_factors: MORIFactors,
         transitions: TransitionController,
-    ) -> None:
-        """Promote into existing slack; non-fitting candidates never evict owners."""
+    ) -> tuple[ProgramView, ...]:
+        """Rebalance ready inference against idle GPU occupancy each round.
+
+        Prefer slack, then reclaim strictly more idle Acting owners. If no GPU
+        Reasoning can make progress, permit a feasible request to reclaim Acting
+        space even at a score tie or disadvantage. This prevents an idle engine
+        from waiting on its own cached parents. Never preempt Reasoning here.
+        """
         candidates = [
             p
             for p in snapshot.programs
             if p.state is ProgramState.PAUSED and p.status is ProgramStatus.REASONING and not p.marked_for_pause
         ]
         if not candidates:
-            return
+            return ()
         gpu, cpu = self._ledgers(snapshot, strategy_factors)
         quota = self._gpu_quota(snapshot)
         if gpu.used > quota:
             self.counters["promotion_blocked_capacity_debt"] += 1
-            return
+            return ()
         now = snapshot.observed_at_monotonic_s
         candidates.sort(key=lambda p: self._promotion_key(p, strategy_factors, snapshot, now))
+        victims = [
+            p
+            for p in snapshot.programs
+            if p.ref in gpu.claims
+            and p.state is ProgramState.ACTIVE
+            and p.status is ProgramStatus.ACTING
+            and not p.marked_for_pause
+            and self._factor(strategy_factors, p.ref).pending_tier is None
+        ]
+        victims.sort(key=lambda p: self._demotion_key(p, strategy_factors, now))
+        idle_keys = [-self._idleness(self._factor(strategy_factors, p.ref), now) for p in victims]
+        projection = ReliefProjection(gpu, tuple(p.ref for p in victims))
+        has_reasoning = any(p.ref in gpu.claims and p.status is ProgramStatus.REASONING for p in snapshot.programs)
+        removed = 0
+        exchange_valid = True
+        demoted = []
         for candidate in candidates:
             self.counters["planning_candidates"] += 1
             claim = self._claim(candidate, snapshot, gpu=True)
@@ -245,15 +272,51 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                 self.counters["promotion_exceeds_total_quota"] += 1
                 continue
             if gpu.used + gpu.incremental(claim) > quota:
-                self.counters["promotion_no_fit"] += 1
-                continue
+                candidate_idle = self._idleness(self._factor(strategy_factors, candidate.ref), now)
+                eligible = max(removed, bisect_left(idle_keys, -candidate_idle))
+                reason = "mori_relative_rebalance"
+                if not has_reasoning and projection.required(eligible, claim) > quota:
+                    eligible = len(victims)
+                    reason = "mori_idle_gpu_progress"
+                if not exchange_valid or projection.required(eligible, claim) > quota:
+                    self.counters["promotion_no_fit"] += 1
+                    continue
+                # Establish a feasible whole plan before evicting anything.
+                # Candidate/victim sharing makes individual claim sizes unsafe
+                # as an estimate of how much admission space a victim releases.
+                low, high = removed + 1, eligible
+                while low < high:
+                    middle = (low + high) // 2
+                    if projection.required(middle, claim) <= quota:
+                        high = middle
+                    else:
+                        low = middle + 1
+                while removed < low:
+                    victim = victims[removed]
+                    self.counters["planning_victims"] += 1
+                    if not self._demote(victim, snapshot, strategy_factors, transitions, gpu, cpu, reason=reason):
+                        # Accepted earlier pauses remain real; a rejected one
+                        # invalidates speculative exchanges for the rest of the
+                        # round. Subsequent admissions may still use real slack.
+                        exchange_valid = False
+                        break
+                    demoted.append(replace(victim, state=ProgramState.PAUSED, backend_id=None, marked_for_pause=False))
+                    removed += 1
+                    self.counters["rebalance_demotions"] += 1
+                    if reason == "mori_idle_gpu_progress":
+                        self.counters["idle_gpu_progress_demotions"] += 1
+                if gpu.used + gpu.incremental(claim) > quota:
+                    continue
             result = (transitions.resume if candidate.step_count else transitions.admit)(
                 candidate.ref, reason="mori_cycle_promote", backend_id=snapshot.backend_id
             )
             if result.applied:
                 gpu.add(candidate.ref, claim)
+                projection.admit(claim)
                 cpu.remove(candidate.ref)
+                has_reasoning = True
                 self.counters["promotion_applied"] += 1
+        return tuple(demoted)
 
     def repair_capacity(
         self,
@@ -389,6 +452,8 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                             "demotion_to_cpu",
                             "demotion_to_waiting",
                             "owners_retired",
+                            "rebalance_demotions",
+                            "idle_gpu_progress_demotions",
                         )
                     ),
                 ),

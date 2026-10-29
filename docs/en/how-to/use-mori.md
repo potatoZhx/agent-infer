@@ -108,10 +108,20 @@ Acting-first, highest-idleness demotion. Reasoning victims retain their GPU comm
 native cancellation. Pending inference is ordered by CPU returns, other returns, then new Programs by context size
 and idleness. Candidates that cannot fit do not block later candidates.
 
-Promotion uses existing slack; a candidate that cannot fit does not displace residents. Demotion repairs actual
-capacity debt, following [MORI section 4.3.1](https://arxiv.org/html/2606.00866v1#S4.SS3.SSS1).
-The check accounts for shared physical blocks and does not spend pending Reasoning releases. CPU placement likewise
-does not proactively replace a resident for a better-scoring newcomer. The default 100-token decode buffer remains.
+Each scheduling cycle reevaluates relative idleness, following the partition adjustment described in
+[MORI section 4.3](https://arxiv.org/html/2606.00866v1#S4.SS3). Promotion uses existing slack first. If a candidate
+does not fit, the scheduler can demote strictly more idle GPU Acting owners, even when GPU usage is below quota.
+It checks that the complete proposed removal prefix makes the candidate fit before applying any demotion,
+accounting for shared physical blocks. Only accepted demotions release capacity; pending Reasoning releases
+cannot fund an admission. Capacity debt repair remains a separate path and retains lazy demotion for Reasoning.
+CPU placement does not proactively replace a resident for a better-scoring newcomer. The default 100-token
+decode buffer remains.
+
+An explicit progress safeguard handles score ties or unfavorable historical scores: if GPU has no Reasoning
+owner, a feasible pending request may reclaim Acting space without requiring a better score. This safeguard
+adds no timeout or tuning parameter, stops after the first successful admission, and never preempts Reasoning.
+It prevents retained Acting caches, including parents waiting for children, from keeping an otherwise idle
+engine blocked. Newly admitted requests remain protected throughout the same scheduling cycle.
 
 Two local extensions apply. First, paused Reasoning in CPU or WAITING receives its elapsed request wait as temporary
 Reasoning time in the scheduling idleness denominator. This remains part of the current window slot, freezes on GPU
@@ -119,7 +129,8 @@ admission, and disappears when Reasoning ends. Completed history contains only a
 tool time and native GPU preemption do not increase this credit. One score calculation serves placement and diagnostics.
 The original tier priorities and Typed-LRU remain unchanged, and there is no historical decay parameter.
 
-Second, Acting owners committed to WAITING retire their MORI accounting and native ownership. A subsequent request
+Second, Acting owners committed to WAITING retire their MORI accounting and native ownership in the same cycle.
+A subsequent request
 gets a new generation, empty history, and new-Program priority. Business task/parent relationships survive retirement;
 physical shared KV and pending native transfers remain engine-managed. A matching terminal receipt can finish the
 retired business record, but cannot affect a later generation. Retirement does not happen merely because Acting lasts
@@ -133,7 +144,8 @@ and `max_wait_seconds` settings. The old `starvation_timeout_seconds` remains un
 
 SimpleCPU now requires hook API 2: rebuild with both current native patches. GPU/BUSY backups can use empty,
 INACTIVE or BUSY CPU blocks, but cannot evict IDLE working sets. Rejected stores never fall back to ordinary LRU.
-Evidence: `agentinfer/scheduling/mori/strategy.py:141-284`, `agentinfer/agentcache/mori/simple_cpu_policy.py:82-94`.
+Evidence: `agentinfer/scheduling/mori/strategy.py:209-326`, `agentinfer/scheduling/mori/capacity.py:83-137`,
+`agentinfer/agentcache/mori/simple_cpu_policy.py:82-94`.
 
 MORI requires one native KV cache group. Effective HBM capacity excludes the permanent null block. A request whose
 prompt plus maximum output exceeds that capacity is rejected before admission. The normal logical claim rounds

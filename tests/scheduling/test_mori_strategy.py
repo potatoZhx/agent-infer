@@ -210,7 +210,7 @@ def test_lazy_demotion_remains_gpu_capacity_debt_until_completion() -> None:
     assert victim_factors.pending_tier is MORITier.CPU
 
 
-def test_existing_waiter_cannot_reclaim_an_acting_reservation_without_capacity_debt() -> None:
+def test_existing_waiter_reclaims_more_idle_acting_without_capacity_debt() -> None:
     components = build_mori_strategy(MORIConfig(mode=MORIMode.FULL))
     resident = view("resident", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=700)
     waiting = view("waiting", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400, step_count=1)
@@ -224,9 +224,12 @@ def test_existing_waiter_cannot_reclaim_an_acting_reservation_without_capacity_d
         accepting_controller(components.strategy, components.initial_factors, calls),
     )
 
-    assert calls == []
-    assert components.initial_factors.for_program(resident.ref).tier is MORITier.GPU
-    assert components.initial_factors.for_program(waiting.ref).tier is MORITier.CPU
+    assert [(call.kind, call.program) for call in calls] == [
+        (TransitionKind.PAUSE, resident.ref),
+        (TransitionKind.RESUME, waiting.ref),
+    ]
+    assert components.initial_factors.for_program(resident.ref).tier is MORITier.CPU
+    assert components.initial_factors.for_program(waiting.ref).tier is MORITier.GPU
 
 
 def test_wait_age_does_not_preempt_reasoning_without_capacity_debt() -> None:
@@ -305,7 +308,7 @@ def test_unfittable_high_priority_waiter_does_not_block_smaller_request() -> Non
 
 
 @pytest.mark.parametrize(("resident_idle", "waiting_idle"), [(1.0, 1.0), (0.01, 0.99), (0.0, 0.0), (1.0, 0.0)])
-def test_score_does_not_displace_acting_without_capacity_debt(resident_idle, waiting_idle) -> None:
+def test_idle_gpu_can_reclaim_acting_regardless_of_relative_score(resident_idle, waiting_idle) -> None:
     components = build_mori_strategy()
     resident = view("resident", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=700)
     waiting = view("waiting", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400)
@@ -313,17 +316,38 @@ def test_score_does_not_displace_acting_without_capacity_debt(resident_idle, wai
     set_tier(components, waiting, MORITier.CPU, idleness=waiting_idle)
     calls = []
     components.strategy.schedule_resume(
-        snapshot(resident, waiting),
+        snapshot(resident, waiting, dram=2000),
+        components.initial_factors,
+        accepting_controller(components.strategy, components.initial_factors, calls),
+    )
+    assert [(call.kind, call.program) for call in calls] == [
+        (TransitionKind.PAUSE, resident.ref),
+        (TransitionKind.ADMIT, waiting.ref),
+    ]
+
+
+@pytest.mark.parametrize(("resident_idle", "waiting_idle"), [(1.0, 1.0), (0.01, 0.99), (0.0, 0.0)])
+def test_active_gpu_reasoning_preserves_equal_or_less_idle_acting(resident_idle, waiting_idle) -> None:
+    components = build_mori_strategy()
+    resident = view("resident", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=700)
+    running = view("running", state=ProgramState.ACTIVE, status=ProgramStatus.REASONING, tokens=100)
+    waiting = view("waiting", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400)
+    set_tier(components, resident, MORITier.GPU, idleness=resident_idle)
+    set_tier(components, running, MORITier.GPU)
+    set_tier(components, waiting, MORITier.CPU, idleness=waiting_idle)
+    calls = []
+    components.strategy.schedule_resume(
+        snapshot(resident, running, waiting),
         components.initial_factors,
         accepting_controller(components.strategy, components.initial_factors, calls),
     )
     assert calls == []
 
 
-def test_acting_reservations_allow_only_fitting_slack_backfill():
+def test_insufficient_eligible_acting_relief_does_not_evict_before_backfill():
     components = build_mori_strategy()
     idle = view("idle", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=100)
-    busy = view("busy", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=600)
+    busy = view("busy", state=ProgramState.ACTIVE, status=ProgramStatus.REASONING, tokens=600)
     large = view("large", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400, step_count=1)
     small = view("small", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=1)
     for program, tier, score in [(idle, MORITier.GPU, 0.9), (busy, MORITier.GPU, 0.1), (large, MORITier.CPU, 0.5)]:
@@ -335,13 +359,14 @@ def test_acting_reservations_allow_only_fitting_slack_backfill():
         accepting_controller(components.strategy, components.initial_factors, calls),
     )
     assert [(call.kind, call.program) for call in calls] == [(TransitionKind.ADMIT, small.ref)]
+    assert components.initial_factors.for_program(idle.ref).tier is MORITier.GPU
 
 
-def test_cpu_and_waiting_candidates_both_preserve_acting_reservations():
+def test_idle_gpu_progress_preserves_cpu_before_waiting_priority():
     components = build_mori_strategy()
     victim = view("victim", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=700)
-    cpu = view("cpu", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400, step_count=1)
-    waiting = view("waiting", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400, step_count=1)
+    cpu = view("cpu", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=500, step_count=1)
+    waiting = view("waiting", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=500, step_count=1)
     set_tier(components, victim, MORITier.GPU, idleness=0.5)
     set_tier(components, cpu, MORITier.CPU, idleness=0.9)
     set_tier(components, waiting, MORITier.WAITING, idleness=0.1)
@@ -351,9 +376,12 @@ def test_cpu_and_waiting_candidates_both_preserve_acting_reservations():
         components.initial_factors,
         accepting_controller(components.strategy, components.initial_factors, calls),
     )
-    assert calls == []
-    assert components.initial_factors.for_program(victim.ref).tier is MORITier.GPU
-    assert components.initial_factors.for_program(cpu.ref).tier is MORITier.CPU
+    assert [(call.kind, call.program) for call in calls] == [
+        (TransitionKind.PAUSE, victim.ref),
+        (TransitionKind.RESUME, cpu.ref),
+    ]
+    assert components.initial_factors.for_program(victim.ref).tier is MORITier.CPU
+    assert components.initial_factors.for_program(cpu.ref).tier is MORITier.GPU
     assert components.initial_factors.for_program(waiting.ref).tier is MORITier.WAITING
 
 
@@ -377,6 +405,34 @@ def test_rejected_capacity_demotion_keeps_debt_and_blocks_admission():
     components.strategy.repair_capacity(fixed, components.initial_factors, controller)
     components.strategy.schedule_resume(fixed, components.initial_factors, controller)
     assert calls == []
+    assert components.initial_factors.for_program(victim.ref).tier is MORITier.GPU
+    assert components.initial_factors.for_program(victim.ref).pending_tier is None
+    assert components.initial_factors.for_program(waiting.ref).tier is MORITier.CPU
+    assert components.strategy.counters["demotion_rejected"] == 1
+
+
+def test_rejected_rebalance_demotion_keeps_reservation_and_allows_only_actual_slack():
+    components = build_mori_strategy()
+    victim = view("victim", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=700)
+    waiting = view("waiting", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400, step_count=1)
+    backfill = view("backfill", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=50)
+    set_tier(components, victim, MORITier.GPU, idleness=0.9)
+    set_tier(components, waiting, MORITier.CPU, idleness=0.1)
+    calls = []
+    accepted = accepting_controller(components.strategy, components.initial_factors, calls)
+
+    def reject_demotion(request):
+        if request.kind is TransitionKind.PAUSE:
+            return TransitionResult(request.kind, request.program, False, "still_authorized")
+        return accepted.apply(request)
+
+    components.strategy.schedule_resume(
+        snapshot(victim, waiting, backfill, hbm=1000),
+        components.initial_factors,
+        TransitionController(reject_demotion),
+    )
+
+    assert [(call.kind, call.program) for call in calls] == [(TransitionKind.ADMIT, backfill.ref)]
     assert components.initial_factors.for_program(victim.ref).tier is MORITier.GPU
     assert components.initial_factors.for_program(victim.ref).pending_tier is None
     assert components.initial_factors.for_program(waiting.ref).tier is MORITier.CPU
