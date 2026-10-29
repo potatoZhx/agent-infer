@@ -15,6 +15,38 @@ from agentinfer.scheduling.mori import MORIProgramFactors, MORITier, build_mori_
 pytestmark = pytest.mark.cpu_test
 
 
+def test_pending_prompt_drops_capacity_proof_but_preserves_typed_owner_until_dispatch():
+    components = build_mori_strategy()
+    state = MORIRuntimeState()
+    state.bind_provider(components.strategy)
+    state.footprints.enabled = True
+    policy = MORISimpleCPUOffloadPolicy(state)
+    program = ProgramRef("agent", 0)
+    components.strategy._set_factor(
+        components.initial_factors,
+        program,
+        MORIProgramFactors(tier=MORITier.CPU),
+    )
+    state.bind_request("old", program)
+    policy.on_block_owner_added(1, "old")
+    policy.on_block_ready(1, 10)
+
+    components.strategy.on_context_pending(program)
+
+    assert not state.footprint(program, "cpu")
+    assert state.program_for_request("old") == program
+    assert policy.index.owners(1) == frozenset({program})
+    assert policy.index.cache_class(1) is CacheClass.IDLE
+
+    components.strategy.on_context_replaced(program)
+
+    assert state.program_for_request("old") is None
+    assert not policy.index.owners(1)
+    assert policy.index.cache_class(1) is CacheClass.INACTIVE
+    policy.close()
+    state.unbind_provider(components.strategy)
+
+
 @pytest.mark.parametrize(("policy_type", "tier"), [(MORIHBMPolicy, "gpu"), (MORISimpleCPUOffloadPolicy, "cpu")])
 def test_prompt_replacement_removes_old_ownership_but_keeps_shared_cache_and_pins(policy_type, tier):
     components = build_mori_strategy()

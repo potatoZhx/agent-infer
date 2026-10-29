@@ -271,6 +271,72 @@ def test_pending_cpu_destinations_prevent_lazy_demotion_overcommit() -> None:
     assert components.initial_factors.for_program(second.ref).pending_tier is MORITier.WAITING
 
 
+def test_more_valuable_demotion_replaces_a_more_idle_cpu_owner() -> None:
+    components = build_mori_strategy(MORIConfig(mode=MORIMode.FULL))
+    valuable = view("valuable", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=400)
+    idle_cpu = view("idle-cpu", state=ProgramState.PAUSED, status=ProgramStatus.ACTING, tokens=400, step_count=1)
+    set_tier(components, valuable, MORITier.GPU, idleness=0.1)
+    set_tier(components, idle_cpu, MORITier.CPU, idleness=0.9)
+    calls: list[TransitionRequest] = []
+
+    components.strategy.repair_capacity(
+        snapshot(valuable, idle_cpu, hbm=100, dram=400),
+        components.initial_factors,
+        accepting_controller(components.strategy, components.initial_factors, calls),
+    )
+
+    assert [call.program for call in calls] == [valuable.ref]
+    assert components.initial_factors.for_program(valuable.ref).tier is MORITier.CPU
+    assert components.initial_factors.for_program(valuable.ref).pending_tier is None
+    assert components.initial_factors.for_program(idle_cpu.ref).tier is MORITier.WAITING
+    assert components.strategy.counters["cpu_relative_replacements"] == 1
+
+
+def test_less_valuable_demotion_cannot_displace_a_busy_cpu_owner() -> None:
+    components = build_mori_strategy(MORIConfig(mode=MORIMode.FULL))
+    idle_gpu = view("idle-gpu", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=400)
+    valuable_cpu = view(
+        "valuable-cpu", state=ProgramState.PAUSED, status=ProgramStatus.ACTING, tokens=400, step_count=1
+    )
+    set_tier(components, idle_gpu, MORITier.GPU, idleness=0.9)
+    set_tier(components, valuable_cpu, MORITier.CPU, idleness=0.1)
+    calls: list[TransitionRequest] = []
+
+    components.strategy.repair_capacity(
+        snapshot(idle_gpu, valuable_cpu, hbm=100, dram=400),
+        components.initial_factors,
+        accepting_controller(components.strategy, components.initial_factors, calls),
+    )
+
+    assert [call.program for call in calls] == [idle_gpu.ref]
+    assert components.initial_factors.for_program(idle_gpu.ref).tier is MORITier.WAITING
+    assert components.initial_factors.for_program(idle_gpu.ref).pending_tier is None
+    assert components.initial_factors.for_program(valuable_cpu.ref).tier is MORITier.CPU
+    assert components.strategy.counters["cpu_relative_replacements"] == 0
+
+
+def test_rejected_demotion_does_not_commit_planned_cpu_replacements() -> None:
+    components = build_mori_strategy(MORIConfig(mode=MORIMode.FULL))
+    valuable = view("valuable", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=400)
+    idle_cpu = view("idle-cpu", state=ProgramState.PAUSED, status=ProgramStatus.ACTING, tokens=400, step_count=1)
+    set_tier(components, valuable, MORITier.GPU, idleness=0.1)
+    set_tier(components, idle_cpu, MORITier.CPU, idleness=0.9)
+
+    def reject(request: TransitionRequest) -> TransitionResult:
+        return TransitionResult(request.kind, request.program, False, "still_authorized")
+
+    components.strategy.repair_capacity(
+        snapshot(valuable, idle_cpu, hbm=100, dram=400),
+        components.initial_factors,
+        TransitionController(reject),
+    )
+
+    assert components.initial_factors.for_program(valuable.ref).tier is MORITier.GPU
+    assert components.initial_factors.for_program(valuable.ref).pending_tier is None
+    assert components.initial_factors.for_program(idle_cpu.ref).tier is MORITier.CPU
+    assert components.strategy.counters["cpu_relative_replacements"] == 0
+
+
 @pytest.mark.parametrize("status", [ProgramStatus.ACTING, ProgramStatus.REASONING])
 def test_completed_demotion_is_not_a_persistent_plan(status: ProgramStatus) -> None:
     """The original drained-plan state cannot lock later planning cycles."""

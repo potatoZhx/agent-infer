@@ -73,10 +73,17 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         """Attach native block evidence, or detach it at adapter shutdown."""
         self._footprints = provider
 
-    def on_context_replaced(self, program: ProgramRef) -> None:
-        """Release previous-context cache ownership and wake placement planning."""
+    def on_context_pending(self, program: ProgramRef) -> None:
+        """Drop stale capacity proof without exposing the prior cache while this request waits."""
         if self._slow_diagnostics is not None:
             self._slow_diagnostics.release(program)
+        if self._footprints is not None:
+            self._footprints.invalidate_footprint(program)
+        if self._factors is not None:
+            self._request_schedule(self._factors, time.monotonic())
+
+    def on_context_replaced(self, program: ProgramRef) -> None:
+        """Atomically hand typed cache ownership to the prompt entering native scheduling."""
         if self._footprints is not None:
             self._footprints.replace_context(program)
         if self._factors is not None:
@@ -533,6 +540,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                             "gpu_debt_waiting_lazy_relief",
                             "demotion_to_cpu",
                             "demotion_to_waiting",
+                            "cpu_relative_replacements",
                             "owners_retired",
                             "rebalance_demotions",
                             "idle_gpu_progress_demotions",
@@ -749,14 +757,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
     ) -> bool:
         """Reserve a destination; only finished Acting leases release GPU commitments now."""
         cpu_claim = self._claim(victim, snapshot, gpu=False)
-        target = (
-            MORITier.CPU
-            if (
-                self.config.mode is MORIMode.FULL
-                and cpu.used + cpu.incremental(cpu_claim) <= self._dram_quota(snapshot)
-            )
-            else MORITier.WAITING
-        )
+        target, cpu_replacements = self._cpu_destination(victim, snapshot, factors, cpu, cpu_claim)
         previous = self._factor(factors, victim.ref)
         self._set_factor(factors, victim.ref, replace(previous, pending_tier=target))
         operation = transitions.pause if victim.status is ProgramStatus.ACTING else transitions.mark_for_pause
@@ -765,12 +766,60 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             self._set_factor(factors, victim.ref, previous)
             self.counters["demotion_rejected"] += 1
             return False
+        for replaced in cpu_replacements:
+            resident = self._factor(factors, replaced.ref)
+            self._set_factor(factors, replaced.ref, replace(resident, tier=MORITier.WAITING))
+            cpu.remove(replaced.ref)
+            self.counters["cpu_relative_replacements"] += 1
         if target is MORITier.CPU:
             cpu.add(victim.ref, cpu_claim)
         if victim.status is ProgramStatus.ACTING:
             gpu.remove(victim.ref)
         self.counters[f"demotion_to_{target.value}"] += 1
         return True
+
+    def _cpu_destination(
+        self,
+        candidate: ProgramView,
+        snapshot: SchedulingSnapshot,
+        factors: MORIFactors,
+        cpu: CapacityLedger,
+        claim: CapacityClaim,
+    ) -> tuple[MORITier, tuple[ProgramView, ...]]:
+        """Place a more valuable demotion across the CPU/Waiting boundary atomically."""
+        if self.config.mode is not MORIMode.FULL or claim.tokens > self._dram_quota(snapshot):
+            return MORITier.WAITING, ()
+        quota = self._dram_quota(snapshot)
+        if cpu.used + cpu.incremental(claim) <= quota:
+            return MORITier.CPU, ()
+
+        now = snapshot.observed_at_monotonic_s
+        candidate_idle = self._idleness(self._factor(factors, candidate.ref), now)
+        residents = [
+            program
+            for program in snapshot.programs
+            if program.ref != candidate.ref
+            and program.ref in cpu.claims
+            and self._factor(factors, program.ref).tier is MORITier.CPU
+            and self._factor(factors, program.ref).pending_tier is None
+        ]
+        residents.sort(
+            key=lambda program: (
+                -self._idleness(self._factor(factors, program.ref), now),
+                program.ref.program_id,
+                program.ref.generation,
+            )
+        )
+        projected = cpu.copy()
+        replacements: list[ProgramView] = []
+        for resident in residents:
+            if self._idleness(self._factor(factors, resident.ref), now) <= candidate_idle:
+                break
+            replacements.append(resident)
+            projected.remove(resident.ref)
+            if projected.used + projected.incremental(claim) <= quota:
+                return MORITier.CPU, tuple(replacements)
+        return MORITier.WAITING, ()
 
     def _repair_gpu_capacity(
         self, snapshot: SchedulingSnapshot, factors: MORIFactors, transitions: TransitionController
@@ -913,22 +962,13 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             has_partial = True
             partial_reasoning = sidecar.pending_reasoning_seconds
             partial_acting = max(0.0, now - sidecar.acting_started_at_monotonic_s)
-        elif sidecar.reasoning_started_at_monotonic_s is not None:
+        elif sidecar.execution_observed and sidecar.reasoning_started_at_monotonic_s is not None:
             has_partial = True
             partial_reasoning = max(0.0, now - sidecar.reasoning_started_at_monotonic_s)
-            if sidecar.execution_observed:
-                partial_reasoning += sidecar.pending_reasoning_seconds
+            partial_reasoning += sidecar.pending_reasoning_seconds
         elif sidecar.execution_observed:
             has_partial = True
             partial_reasoning = sidecar.pending_reasoning_seconds
-        # A queued current Reasoning is already the current window slot, even
-        # before native execution starts. Its credit survives admission but is
-        # discarded on completion; completed (R, A) pairs remain factual.
-        if sidecar.acting_started_at_monotonic_s is None:
-            partial_reasoning += sidecar.reasoning_wait_seconds
-            if sidecar.reasoning_wait_started_at_monotonic_s is not None:
-                has_partial = True
-                partial_reasoning += max(0.0, now - sidecar.reasoning_wait_started_at_monotonic_s)
         keep = max(0, self.config.window_size - int(has_partial))
         cycles = sidecar.cycles[-keep:] if keep else ()
         reasoning = sum(item[0] for item in cycles) + partial_reasoning

@@ -453,7 +453,9 @@ def test_retained_abort_uses_host_contract_and_releases_program_binding(monkeypa
     hooks.add_request(owner, resident, native.append)
     hooks.add_request(owner, request, native.append)
     assert native == [resident]
-    assert MORI_RUNTIME_STATE.program_for_request("retained") is not None
+    # Requests outside native scheduling deliberately have no native cache
+    # binding; the previous Program context stays protected until dispatch.
+    assert MORI_RUNTIME_STATE.program_for_request("retained") is None
     finished = hooks.finish_requests(owner, "retained", RequestStatus.FINISHED_ABORTED, lambda ids, status: [])
     assert finished == ([request] if returns_requests else [("retained", 7)])
     assert request.status is RequestStatus.FINISHED_ABORTED

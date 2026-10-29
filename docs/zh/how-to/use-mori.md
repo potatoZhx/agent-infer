@@ -110,23 +110,23 @@ Reasoning 完成或 native 确认取消后才释放 GPU 预留。
 描述的层级边界调整。提升先使用已有余量；候选无法放入时，可以降级 idleness 严格更高的 GPU Acting，
 即使 GPU 当前尚未超额。执行降级前，先按实际共享块验证整组候选 victim 移除后能否容纳请求；只有已接受
 的降级才能释放容量，不能提前兑现 Reasoning 的 pending 释放。真实容量超额仍由独立路径修复，
-Reasoning 继续采用 lazy demotion。CPU 不会仅因新候选分数更好而主动置换驻留者，默认 100-token decode
-预留继续保留。
+Reasoning 继续采用 lazy demotion。CPU 已满时，只有待降层 Program 的 idleness 严格低于足够数量的现有
+CPU owner，才会在整组方案确认可装入后把这些 owner 移到 Waiting；否则该降层直接进入 Waiting。
+默认 100-token decode 预留继续保留。
 
 另有明确的进展保护：当 GPU 没有 Reasoning owner 时，可放入的等待请求允许回收 Acting 占位，
 不再要求其评分严格更优，避免平分或历史分数导致空闲引擎被缓存占位阻塞，包括父 Program 等待子请求
 的情况。此规则不增加超时或调参项，首个请求成功准入后即停止生效，也不会抢占 Reasoning；
 本轮新准入的请求同样受到保护。
 
-本地实现增加两项优化。首先，CPU 或 WAITING 中暂停的 Reasoning 请求，将本次请求的等待时间临时计入
-调度 idleness 分母中的 Reasoning 时间。它仍属于当前周期的原有窗口槽位，准入 GPU 时冻结，Reasoning
-结束时清除；完成历史只保存真实 Reasoning 和 Acting 时间。工具执行与 native GPU 抢占不增加此补偿。
-层级决策和 diagnostics 使用同一评分函数，原有层级优先顺序与 Typed-LRU 保持不变，不引入历史衰减参数。
+request pool 和 native queue 的等待时间只进入 diagnostics 观测，不进入调度 idleness，也不占历史窗口槽位。
+只有实际观察到的 native 执行才计入当前部分 Reasoning，完成历史只保存真实 Reasoning 和 Acting 时间。
+层级决策和 diagnostics 使用同一评分函数，不增加等待超时、等待提权或历史衰减参数。
 
-其次，Acting owner 已提交到 WAITING 时，当轮退出 MORI 记账并释放 native ownership。后续请求获得新 generation、
+本地仍保留一项扩展：Acting owner 已提交到 WAITING 时，当轮退出 MORI 记账并释放 native ownership。后续请求获得新 generation、
 空历史及新 Program 的排序优先级。业务 task/parent 关系继续保留；物理共享 KV 与未完成的 native 传输仍由
 引擎管理。匹配的 terminal 凭证可以结束旧业务记录，但不能影响后来的 generation。Acting 很久本身不会
-触发退出，必须已经离开 GPU 与 CPU 两个逻辑缓存层；等待补偿也不能创造空闲容量或保证等待时间有界。
+触发退出，必须已经离开 GPU 与 CPU 两个逻辑缓存层；观测到的等待不会改变排序、创造空闲容量或保证等待时间有界。
 
 不再保留候选独占的未来回收额度，也没有额外等待超时、最短驻留或 idleness 差值门槛。
 
@@ -149,9 +149,10 @@ SimpleCPU hook 升级至 API 3，必须同时更新两个 native patch 后重新
 
 ### 缓存归属与保守的层级反馈
 
-每个新 prompt 都会替换该 Program 的旧 native ownership 和 footprint，即使 Program generation 未变。
-共享 owner、物理缓存、native pin 和 LRU 年龄继续保留；native 命中后重新挂接新 prompt 实际使用的内容。
-延迟任务使用独立的上下文凭证，下一 prompt、Program 退出或调度器关闭会使旧凭证失效。
+新 prompt 被保留时会立即失效该 Program 的旧容量 footprint 证明，但请求还在 native 调度之外等待时，
+不会提前撤销旧 typed cache owner。MORI 在真正 dispatch 到 native 前替换旧 ownership 和上下文凭证，
+随后只由 native 命中重新挂接新 prompt 实际使用的内容。共享 owner、物理缓存、native pin 和 LRU 年龄
+继续保留；下一次 dispatch、Program 退出或调度器关闭会使该上下文凭证失效。
 
 实际 HBM 分配中的完整 MORI 建议包含 BUSY 块时，只请求提前运行一次常规调度周期；同一调度边界前的
 通知合并。native 分配及 fallback 立即继续，下一周期仍按已有容量和相对 idleness 规则决策，允许不调整

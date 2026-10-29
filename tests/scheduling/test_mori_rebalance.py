@@ -109,7 +109,7 @@ def test_idle_gpu_reclaims_acting_even_for_tied_or_higher_idleness_waiter(window
         waiter_score = runtime.strategy.idleness_for_program(waiter, 110.0)
         resident_score = runtime.strategy.idleness_for_program(resident, 110.0)
         assert resident_score == 0
-        assert waiter_score == 0 if window_size == 1 else waiter_score > resident_score
+        assert waiter_score > resident_score
 
         runtime.schedule_cycle(pool())
 
@@ -118,7 +118,7 @@ def test_idle_gpu_reclaims_acting_even_for_tied_or_higher_idleness_waiter(window
         assert runtime.strategy_factors.for_program(resident).tier is MORITier.CPU
 
 
-def test_elapsed_acting_crosses_relative_score_while_other_gpu_reasoning_continues():
+def test_elapsed_wait_does_not_change_relative_score_while_other_gpu_reasoning_continues():
     runtime = scheduler()
     with patch("agentinfer.scheduling.runtime.time.monotonic", return_value=0.0) as clock:
         assert runtime.on_request_arrival("waiter-1", AgentIdentity("waiter"), 400, pool(), "first")
@@ -146,13 +146,13 @@ def test_elapsed_acting_crosses_relative_score_while_other_gpu_reasoning_continu
 
         clock.return_value = 1000.0
         assert runtime.needs_schedule_cycle(1000.0)
-        assert runtime.strategy.idleness_for_program(waiter, 1000) < runtime.strategy.idleness_for_program(
+        assert runtime.strategy.idleness_for_program(waiter, 1000) > runtime.strategy.idleness_for_program(
             resident, 1000
         )
         runtime.schedule_cycle(pool())
 
-        assert [entry.request_id for entry, _ in runtime.consume_admitted_requests()] == ["waiter-2"]
-        assert runtime.strategy_factors.for_program(resident).tier is MORITier.CPU
+        assert runtime.consume_admitted_requests() == ()
+        assert runtime.strategy_factors.for_program(resident).tier is MORITier.GPU
         assert runtime.strategy_factors.for_program(running).tier is MORITier.GPU
         assert not runtime.registry.require(running).marked_for_pause
 

@@ -93,6 +93,9 @@ class EmbeddedSchedulerController(Protocol[RetainedRequestT]):
     def program_ref_for_request(self, request_id: str):
         """Return the exact Program generation for one live request."""
 
+    def on_request_dispatch(self, request_id: str) -> None:
+        """Commit prompt cache ownership immediately before native admission."""
+
     def on_prefix_cache_observation(
         self,
         request_id: str,
@@ -207,12 +210,14 @@ class _VllmAdmissionHooks:
         except RequestAdmissionError:
             self._reject_request(request, "invalid_program_admission")
             return
-        if isinstance(getattr(self.controller, "strategy", None), MORIStrategy):
+        is_mori = isinstance(getattr(self.controller, "strategy", None), MORIStrategy)
+        if is_mori:
             program = self.controller.program_ref_for_request(request.request_id)
             if program is None:
                 raise RuntimeError("AgentInfer controller did not retain the request-to-Program binding")
-            MORI_RUNTIME_STATE.bind_request(request.request_id, program)
         if dispatch_now:
+            if is_mori:
+                self._prepare_mori_dispatch(request.request_id)
             self.tracked_native.add(request.request_id)
             self._add_to_native_waiting(request, retained_at_monotonic_s, native_add)
 
@@ -261,8 +266,18 @@ class _VllmAdmissionHooks:
         for entry, target in self.controller.consume_admitted_requests():
             if target != DispatchTarget(self.backend_id, self.dp_rank):
                 raise RuntimeError("embedded vLLM bridge received a target for another backend or DP rank")
+            if isinstance(getattr(self.controller, "strategy", None), MORIStrategy):
+                self._prepare_mori_dispatch(entry.request_id)
             self.tracked_native.add(entry.request_id)
             self._add_to_native_waiting(entry.retained_request, entry.arrived_at_monotonic_s, native_add)
+
+    def _prepare_mori_dispatch(self, request_id: str) -> None:
+        """Replace the prior typed owner only once the retained request can run."""
+        self.controller.on_request_dispatch(request_id)
+        program = self.controller.program_ref_for_request(request_id)
+        if program is None:
+            raise RuntimeError("AgentInfer controller lost a request selected for native dispatch")
+        MORI_RUNTIME_STATE.bind_request(request_id, program)
 
     @staticmethod
     def _add_to_native_waiting(

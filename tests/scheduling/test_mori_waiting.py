@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AgentInfer project
-"""Current-cycle waiting credit through real scheduler and native execution events."""
+"""Waiting remains observable without changing causal MORI idleness."""
 
 from dataclasses import replace
 from unittest.mock import patch
@@ -62,12 +62,12 @@ def test_waiting_survives_cpu_to_waiting_and_gpu_admission_but_never_enters_hist
         clock.return_value = 101.0
         assert not scheduler.on_request_arrival("second", AgentIdentity("p"), 96, pool(hbm=0), "second")
         assert scheduler.strategy_factors.for_program(ref).cycles == ((2.0, 99.0),)
-        assert scheduler.strategy.idleness_for_program(ref, 111.0) == pytest.approx(99 / 111)
+        assert scheduler.strategy.idleness_for_program(ref, 111.0) == pytest.approx(99 / 101)
         # Repeated reads/ticks do not accumulate the same elapsed wait again.
         for _ in range(2):
             clock.return_value = 111.0
             scheduler.schedule_cycle(pool(hbm=0, dram=0))
-            assert scheduler.strategy.idleness_for_program(ref, 111.0) == pytest.approx(99 / 111)
+            assert scheduler.strategy.idleness_for_program(ref, 111.0) == pytest.approx(99 / 101)
         assert scheduler.strategy_factors.for_program(ref).tier is MORITier.WAITING
         assert scheduler.request_pool.waiting_request_ids == ("second",)
 
@@ -78,14 +78,14 @@ def test_waiting_survives_cpu_to_waiting_and_gpu_admission_but_never_enters_hist
         assert admitted.reasoning_wait_seconds == 20.0
         assert admitted.reasoning_wait_started_at_monotonic_s is None
         assert scheduler.registry.require(ref).wait_started_at_monotonic_s is None
-        assert scheduler.strategy.idleness_for_program(ref, 121.0) == pytest.approx(99 / 121)
+        assert scheduler.strategy.idleness_for_program(ref, 121.0) == pytest.approx(99 / 101)
 
         clock.return_value = 124.0
         scheduler.on_native_execution("second", running=True)
         clock.return_value = 126.0
         scheduler.on_native_execution("second", running=False)
         # Native preemption is neither real execution nor CPU/WAITING credit.
-        assert scheduler.strategy.idleness_for_program(ref, 136.0) == pytest.approx(99 / 123)
+        assert scheduler.strategy.idleness_for_program(ref, 136.0) == pytest.approx(99 / 103)
         clock.return_value = 136.0
         scheduler.on_native_execution("second", running=True)
         clock.return_value = 139.0
@@ -101,8 +101,8 @@ def test_waiting_survives_cpu_to_waiting_and_gpu_admission_but_never_enters_hist
         assert scheduler.strategy_factors.for_program(ref).cycles == ((2.0, 99.0), (5.0, 10.0))
 
 
-@pytest.mark.parametrize("window,expected", [(1, 0.0), (2, 9 / 15), (3, 109 / 116)])
-def test_waiting_current_cycle_uses_one_existing_window_slot(window, expected):
+@pytest.mark.parametrize("window,expected", [(1, 9 / 10), (2, 109 / 111), (3, 109 / 111)])
+def test_waiting_does_not_consume_a_history_window_slot(window, expected):
     components = build_mori_strategy(MORIConfig(window_size=window))
     owner = ProgramRef("waiting", 0)
     sidecar = MORIProgramFactors(
@@ -116,7 +116,7 @@ def test_waiting_current_cycle_uses_one_existing_window_slot(window, expected):
 
 
 @pytest.mark.parametrize("tier", [MORITier.CPU, MORITier.WAITING])
-def test_uniform_waiting_score_selects_older_peer_and_matches_diagnostics(tier):
+def test_uniform_waiting_score_uses_stable_identity_and_matches_diagnostics(tier):
     components = build_mori_strategy(MORIConfig(decode_buffer_tokens=0))
     young = replace(
         view("a-young", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=96, step_count=1),
@@ -135,14 +135,14 @@ def test_uniform_waiting_score_selects_older_peer_and_matches_diagnostics(tier):
         )
     fixed = snapshot(young, old, hbm=96)
     scores = [components.strategy.idleness_for_program(p.ref, 100.0) for p in (young, old)]
-    assert scores[1] < scores[0]
+    assert scores[1] == scores[0]
     report = dict(components.strategy.diagnostics(fixed, components.initial_factors)[0].fields)
     assert report["mean_idleness"] == pytest.approx(sum(scores) / 2)
     calls = []
     components.strategy.schedule_resume(
         fixed, components.initial_factors, accepting_controller(components.strategy, components.initial_factors, calls)
     )
-    assert [call.program for call in calls] == [old.ref]
+    assert [call.program for call in calls] == [young.ref]
 
 
 def test_cancelled_cpu_wait_discards_credit_without_counting_wait_as_reasoning():

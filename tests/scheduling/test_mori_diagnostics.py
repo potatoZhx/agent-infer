@@ -130,7 +130,7 @@ def test_new_prompt_does_not_inherit_previous_request_decision():
     plan(components, observed)
     state = components.strategy._slow_diagnostics
     assert candidate.ref in state.decisions
-    components.strategy.on_context_replaced(candidate.ref)
+    components.strategy.on_context_pending(candidate.ref)
     assert candidate.ref not in state.decisions
 
 
@@ -144,17 +144,18 @@ def test_early_capacity_branches_record_distinct_reasons(reason):
     assert components.strategy._slow_diagnostics.decisions[candidate.ref]["reason"] == reason
 
 
-def test_current_pending_slot_drops_old_gap_and_matches_live_score():
+def test_current_pending_wait_is_observed_but_does_not_change_live_score():
     components = build_mori_strategy()
     factor = MORIProgramFactors(
         cycles=((10, 1349), (4, 0.25), (83, 0.15), (45, 0.18), (173, 1.05)),
         reasoning_wait_started_at_monotonic_s=0,
     )
     fields = score_components(factor, 100, 5)
-    assert fields["retained_cycles"] == 4
-    assert fields["dropped_cycles"] == 1
-    assert fields["completed_acting_seconds"] == pytest.approx(1.63)
+    assert fields["retained_cycles"] == 5
+    assert fields["dropped_cycles"] == 0
+    assert fields["completed_acting_seconds"] == pytest.approx(1350.63)
     assert fields["current_wait_credit_seconds"] == 100
+    assert fields["wait_affects_idleness"] is False
     assert fields["idleness"] == components.strategy._idleness(factor, 100)
 
 

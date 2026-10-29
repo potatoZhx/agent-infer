@@ -218,7 +218,7 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
                 else max(program.tokens.estimated_context_tokens, max(0, prompt_tokens))
             ),
         )
-        self.strategy.on_context_replaced(program.ref)
+        self.strategy.on_context_pending(program.ref)
         previous_status = self.registry.mark_request_started(program.ref)
         now = time.monotonic()
         if program.state is ProgramState.PAUSED and program.wait_started_at_monotonic_s is None:
@@ -388,6 +388,13 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
         """Return the exact Program generation bound to one live request attempt."""
         binding = self._request_bindings.get(request_id)
         return binding.program if binding is not None else None
+
+    def on_request_dispatch(self, request_id: str) -> None:
+        """Commit prompt cache-owner replacement at the retained-to-native boundary."""
+        binding = self._request_bindings.get(request_id)
+        if binding is None:
+            raise KeyError(f"request is no longer bound: {request_id}")
+        self.strategy.on_context_replaced(binding.program)
 
     def on_prefix_cache_observation(
         self,

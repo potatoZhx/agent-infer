@@ -114,8 +114,9 @@ does not fit, the scheduler can demote strictly more idle GPU Acting owners, eve
 It checks that the complete proposed removal prefix makes the candidate fit before applying any demotion,
 accounting for shared physical blocks. Only accepted demotions release capacity; pending Reasoning releases
 cannot fund an admission. Capacity debt repair remains a separate path and retains lazy demotion for Reasoning.
-CPU placement does not proactively replace a resident for a better-scoring newcomer. The default 100-token
-decode buffer remains.
+When CPU is full, a demoted Program enters CPU only if its idleness is strictly lower than enough current CPU owners;
+the complete replacement is checked before any owner moves to Waiting. Otherwise it demotes directly to Waiting.
+The default 100-token decode buffer remains.
 
 An explicit progress safeguard handles score ties or unfavorable historical scores: if GPU has no Reasoning
 owner, a feasible pending request may reclaim Acting space without requiring a better score. This safeguard
@@ -123,19 +124,18 @@ adds no timeout or tuning parameter, stops after the first successful admission,
 It prevents retained Acting caches, including parents waiting for children, from keeping an otherwise idle
 engine blocked. Newly admitted requests remain protected throughout the same scheduling cycle.
 
-Two local extensions apply. First, paused Reasoning in CPU or WAITING receives its elapsed request wait as temporary
-Reasoning time in the scheduling idleness denominator. This remains part of the current window slot, freezes on GPU
-admission, and disappears when Reasoning ends. Completed history contains only actual Reasoning and Acting time;
-tool time and native GPU preemption do not increase this credit. One score calculation serves placement and diagnostics.
-The original tier priorities and Typed-LRU remain unchanged, and there is no historical decay parameter.
+Request-pool and native-queue waiting are observable in diagnostics but do not enter the scheduling idleness score or
+consume a history-window slot. Only observed native execution contributes partial Reasoning time; completed history
+contains actual Reasoning and Acting time. Placement and diagnostics use the same score, with no wait timeout, aging
+bonus, or historical decay parameter.
 
-Second, Acting owners committed to WAITING retire their MORI accounting and native ownership in the same cycle.
-A subsequent request
+One local extension remains: Acting owners committed to WAITING retire their MORI accounting and native ownership
+in the same cycle. A subsequent request
 gets a new generation, empty history, and new-Program priority. Business task/parent relationships survive retirement;
 physical shared KV and pending native transfers remain engine-managed. A matching terminal receipt can finish the
 retired business record, but cannot affect a later generation. Retirement does not happen merely because Acting lasts
-a long time: it still requires leaving both logical cache tiers. Waiting credit neither creates free capacity nor
-guarantees bounded waiting.
+a long time: it still requires leaving both logical cache tiers. Observed waiting neither changes ranking nor creates
+free capacity or a bounded-wait guarantee.
 
 There is no beneficiary-owned future capacity, wait timeout, minimum residence or extra idleness margin.
 Placement settings under `agentcache.mori` are `mode` and `window_size`; remove the former `min_residency_seconds`,
@@ -159,10 +159,11 @@ is ready. Native refcounts, transfer fences, allocation and recomputation remain
 
 ### Cache ownership and conservative placement feedback
 
-Each new prompt replaces that Program's old native ownership and footprint evidence, even within the same Program
-generation. Shared owners, physical cache contents, native pins, and LRU ages remain intact. Native hits reattach
-the content actually used by the new prompt. Delayed work carries an opaque context receipt that becomes invalid
-on the next prompt, retirement, or scheduler shutdown.
+A retained new prompt immediately invalidates the Program's old capacity-proof footprint, but does not expose the
+previous typed cache owner while the request is still waiting outside native scheduling. Immediately before native
+dispatch, MORI replaces the old ownership and context receipt, then native hits reattach only content used by the new
+prompt. Shared owners, physical cache contents, native pins, and LRU ages remain intact. The new opaque context
+receipt becomes invalid on the next dispatch, retirement, or scheduler shutdown.
 
 A complete MORI HBM allocation proposal containing BUSY blocks requests an earlier normal scheduling cycle.
 Notifications before one boundary coalesce. Native allocation and fallback continue immediately; the next cycle

@@ -69,8 +69,11 @@ class SchedulingStrategy(Generic[StrategyGlobalFactorsT, StrategyProgramFactorsT
         """Optionally provide bounded slow-request tracking independent of debug logs."""
         return None
 
+    def on_context_pending(self, program: ProgramRef) -> None:
+        """Invalidate prompt-specific proof while a replacement request is still retained."""
+
     def on_context_replaced(self, program: ProgramRef) -> None:
-        """Invalidate optional cache-footprint evidence when a new prompt becomes current."""
+        """Commit cache ownership replacement immediately before native dispatch."""
 
     def on_context_growth(
         self, program: ProgramRef, now: float, *, previous_tokens: int, current_tokens: int, block_size: int
