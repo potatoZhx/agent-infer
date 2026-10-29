@@ -500,14 +500,14 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
         )
         if program.marked_for_pause and current_status is ProgramStatus.ACTING:
             self._apply_transition(TransitionRequest(TransitionKind.PAUSE, program.ref, "marked_pause_completion"))
-        else:
+        self._finish_request_branch(program.ref)
+        if self.registry.get(program.ref) is not None:
             self.strategy.handle_request_completion(
                 self._snapshot(),
                 self.strategy_factors,
                 TransitionController(self._apply_transition),
                 program.ref,
             )
-        self._finish_request_branch(program.ref)
 
     def _has_current_request(self, program: ProgramRef) -> bool:
         """Return whether this exact owner still has unfinished accepted work."""
@@ -548,14 +548,18 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
             self._lifecycle_owners[token] = program
 
     def on_scoped_response_completion(self, program_id: str, lifecycle: ProgramLifecycle, token: str | None) -> bool:
-        """A wire response may release only the exact latest attempt's idle request branch."""
-        ref = self._lifecycle_owners.get(token) if token is not None else None
-        if (
-            lifecycle is not ProgramLifecycle.TERMINAL
-            or ref is None
-            or ref not in self._request_branches.family(program_id)
-            or self._program_requests.get(ref)
-        ):
+        """End the latest idle owner or its retired business metadata using an exact receipt."""
+        if lifecycle is not ProgramLifecycle.TERMINAL or token is None:
+            return False
+        ref = self._lifecycle_owners.get(token)
+        if ref is None:
+            # Retirement already released scheduling/native ownership. The
+            # latest receipt may still end its business edge, but can never
+            # address a live or subsequently retired generation.
+            released = self.registry.release_retired(program_id, lifecycle_token=token)
+            self._cycle_dirty |= released
+            return released
+        if ref not in self._request_branches.family(program_id) or self._program_requests.get(ref):
             return False
         return self._apply_transition(TransitionRequest(TransitionKind.RELEASE, ref, "api_scoped_terminal")).applied
 
@@ -571,7 +575,7 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
             lifecycle: Protocol-neutral result produced after tool parsing.
 
         Returns:
-            Whether this call released a live Program generation.
+            Whether this call released a live Program generation or retired business metadata.
         """
         if lifecycle is not ProgramLifecycle.TERMINAL:
             return False
@@ -580,14 +584,16 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
             # A response cannot terminate a family that still has accepted work.
             if any(self._program_requests.get(ref) for ref in family):
                 return False
-            released = False
+            released = self.registry.release_retired(program_id)
             for ref in family:
                 result = self._apply_transition(TransitionRequest(TransitionKind.RELEASE, ref, "api_terminal_response"))
                 released |= result.applied
             self._cycle_dirty |= released
             return released
         ref = self.registry.current_ref(program_id)
-        if ref is None or self._program_requests.get(ref):
+        if ref is None:
+            return self.registry.release_retired(program_id)
+        if self._program_requests.get(ref):
             return False
         program = self.registry.get(ref)
         if program is None or program.status is not ProgramStatus.ACTING:
@@ -637,6 +643,18 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
                         TransitionRequest(TransitionKind.RELEASE, program.ref, "cancelled_before_admission")
                     )
                 self._finish_request_branch(binding.program)
+                current = self.registry.get(binding.program)
+                if (
+                    current is not None
+                    and current.state is ProgramState.PAUSED
+                    and current.status is ProgramStatus.ACTING
+                ):
+                    self.strategy.handle_request_completion(
+                        self._snapshot(),
+                        self.strategy_factors,
+                        TransitionController(self._apply_transition),
+                        current.ref,
+                    )
         return entry
 
     def _apply_transition(self, request: TransitionRequest) -> TransitionResult:
@@ -645,9 +663,12 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
             return TransitionResult(request.kind, request.program, False, "stale_program")
         previous_state = program.state
         previous_status = program.status
+        scheduler_wait_seconds = 0.0
         if request.kind in (TransitionKind.ADMIT, TransitionKind.RESUME):
             if program.state is not ProgramState.PAUSED:
                 return TransitionResult(request.kind, request.program, False, f"{request.kind.value}_requires_paused")
+            if program.wait_started_at_monotonic_s is not None:
+                scheduler_wait_seconds = max(0.0, time.monotonic() - program.wait_started_at_monotonic_s)
             program.state = ProgramState.ACTIVE
             program.backend_id = request.backend_id
             program.marked_for_pause = False
@@ -678,17 +699,25 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
             if not program.marked_for_pause:
                 return TransitionResult(request.kind, request.program, False, "not_marked")
             program.marked_for_pause = False
-        elif request.kind is TransitionKind.RELEASE:
+        elif request.kind in (TransitionKind.RELEASE, TransitionKind.RETIRE):
             if self._program_requests.get(program.ref):
-                return TransitionResult(request.kind, request.program, False, "release_requires_idle")
-            self.registry.release(program.ref)
+                return TransitionResult(request.kind, request.program, False, f"{request.kind.value}_requires_idle")
+            if request.kind is TransitionKind.RETIRE:
+                if program.state is not ProgramState.PAUSED or program.status is not ProgramStatus.ACTING:
+                    return TransitionResult(request.kind, request.program, False, "retire_requires_paused_acting")
+                self.registry.retire(program.ref, lifecycle_token=self._latest_lifecycle_tokens.get(program.ref))
+            else:
+                self.registry.release(program.ref)
             self._set_lifecycle_token(program.ref, None)
             self._request_branches.release(program.ref)
             self._last_request_finished_at.pop(program.ref, None)
             self._shared_prefix_freshness_anchor_at.pop(program.ref, None)
         else:
             return TransitionResult(request.kind, request.program, False, "unsupported_transition")
-        current_state = ProgramState.TERMINATED if request.kind is TransitionKind.RELEASE else program.state
+        current_state = program.state
+        fields = (("backend_id", request.backend_id), ("marked_for_pause", program.marked_for_pause))
+        if request.kind in (TransitionKind.ADMIT, TransitionKind.RESUME):
+            fields += (("scheduler_wait_seconds", scheduler_wait_seconds),)
         event = self._event(
             TRANSITION_EVENT_KINDS[request.kind],
             request.program,
@@ -697,7 +726,7 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
             current_state,
             previous_status,
             program.status,
-            fields=(("backend_id", request.backend_id), ("marked_for_pause", program.marked_for_pause)),
+            fields=fields,
         )
         self._dispatch_event(event)
         return TransitionResult(request.kind, request.program, True, request.reason, event)
@@ -720,11 +749,15 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
         programs = {program.ref: program for program in snapshot.programs}
         for request in requests:
             program = programs[request.program]
-            if request.kind is TransitionKind.RELEASE:
+            if request.kind in (TransitionKind.RELEASE, TransitionKind.RETIRE):
                 programs.pop(request.program)
             elif request.kind in (TransitionKind.ADMIT, TransitionKind.RESUME):
                 programs[request.program] = replace(
-                    program, state=ProgramState.ACTIVE, backend_id=request.backend_id, marked_for_pause=False
+                    program,
+                    state=ProgramState.ACTIVE,
+                    backend_id=request.backend_id,
+                    marked_for_pause=False,
+                    wait_started_at_monotonic_s=None,
                 )
             elif request.kind is TransitionKind.PAUSE:
                 programs[request.program] = replace(

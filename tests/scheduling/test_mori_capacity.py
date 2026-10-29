@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AgentInfer project
 """Independent union arithmetic and planner scaling checks."""
 
-from dataclasses import replace
 from random import Random
 from unittest.mock import patch
 
@@ -14,7 +13,7 @@ from agentinfer.agentcache.mori.runtime_state import MORIRuntimeState
 from agentinfer.agentcache.mori.simple_cpu_policy import MORISimpleCPUOffloadPolicy
 from agentinfer.scheduling.domain import ProgramRef, ProgramState, ProgramStatus
 from agentinfer.scheduling.mori import MORITier, build_mori_strategy
-from agentinfer.scheduling.mori.capacity import CapacityClaim, CapacityLedger, ReliefProjection
+from agentinfer.scheduling.mori.capacity import CapacityClaim, CapacityLedger
 from agentinfer.scheduling.transitions import TransitionKind
 from tests.scheduling.test_mori_strategy import accepting_controller, set_tier, snapshot, view
 
@@ -49,33 +48,6 @@ def test_union_ledger_matches_brute_force_with_private_growth_promises():
         union = set().union(*(claim.blocks for claim in active.values()))
         expected = len(union) * 16 + sum(claim.tokens - len(claim.blocks) * 16 for claim in active.values())
         assert ledger.used == expected
-
-
-def test_relief_projection_matches_union_after_admissions_at_every_boundary():
-    random = Random(539)
-    initial = CapacityLedger(16)
-    victims = tuple(ProgramRef(str(i), 0) for i in range(20))
-
-    def claim():
-        blocks = frozenset(random.sample(range(40), random.randrange(15)))
-        return CapacityClaim(16 * (len(blocks) + random.randrange(6)), blocks)
-
-    for ref in (*victims, ProgramRef("running", 0)):
-        initial.add(ref, claim())
-    projection = ReliefProjection(initial, victims)
-    admitted = {}
-    for index in range(30):
-        candidate = claim()
-        for boundary in range(len(victims) + 1):
-            oracle = initial.copy()
-            for ref in victims[:boundary]:
-                oracle.remove(ref)
-            for ref, item in admitted.items():
-                oracle.add(ref, item)
-            expected = oracle.used + oracle.incremental(candidate)
-            assert projection.required(boundary, candidate) == expected
-        admitted[ProgramRef(f"new-{index}", 0)] = candidate
-        projection.admit(candidate)
 
 
 def test_recycled_block_and_new_prompt_invalidate_only_relevant_proof():
@@ -115,33 +87,37 @@ def test_native_ownership_reestablishes_proof_after_prompt_change_and_clears_on_
     policy.close()
 
 
-def test_planner_does_not_claim_shared_blocks_as_full_victim_relief():
+def test_capacity_repair_uses_marginal_shared_relief_and_keeps_lazy_debt():
     components = build_mori_strategy()
     a = view("a", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=400)
     b = view("b", state=ProgramState.ACTIVE, status=ProgramStatus.REASONING, tokens=400)
-    waiting = view("wait", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400)
-    waiting = replace(waiting, wait_started_at_monotonic_s=0.0)
+    waiting = view("wait", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=100)
 
     class Shared:
         def footprint(self, ref, tier):
-            return frozenset(range(1, 401)) if tier == "gpu" and ref in (a.ref, b.ref) else frozenset()
+            return frozenset(range(1, 301)) if tier == "gpu" and ref in (a.ref, b.ref) else frozenset()
 
     components.strategy.bind_footprints(Shared())
     set_tier(components, a, MORITier.GPU, idleness=0.9)
     set_tier(components, b, MORITier.GPU, idleness=0.8)
     calls = []
-    fixed = snapshot(a, b, waiting, hbm=700, dram=1000)
-    components.strategy.schedule_resume(
-        fixed, components.initial_factors, accepting_controller(components.strategy, components.initial_factors, calls)
-    )
-    # Removing A frees only its private decode reserve. B is still executing;
-    # do not displace A pointlessly or promise capacity released by running B.
-    assert calls == []
+    fixed = snapshot(a, b, waiting, hbm=350, dram=1000)
+    controller = accepting_controller(components.strategy, components.initial_factors, calls)
+    components.strategy.repair_capacity(fixed, components.initial_factors, controller)
+    components.strategy.schedule_resume(fixed, components.initial_factors, controller)
+    # Actual 400-token contexts cannot be capped below their footprint. A
+    # releases only 100 tokens; the shared 300 remain owned by executing B.
+    assert [(call.kind, call.program) for call in calls] == [
+        (TransitionKind.PAUSE, a.ref),
+        (TransitionKind.MARK_FOR_PAUSE, b.ref),
+    ]
     assert components.initial_factors.for_program(b.ref).tier is MORITier.GPU
+    assert components.initial_factors.for_program(b.ref).pending_tier is MORITier.CPU
+    assert components.strategy._ledgers(fixed, components.initial_factors)[0].used == 400
 
 
-@pytest.mark.parametrize("second_idle", [0.8, 0.1])
-def test_relative_rebalance_counts_sharing_with_victims_and_preserves_unused_owners(second_idle):
+@pytest.mark.parametrize("quota", [1200, 1600])
+def test_shared_candidate_uses_only_existing_slack_without_replacing_owners(quota):
     components = build_mori_strategy()
     a = view("a", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=400)
     b = view("b", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=400)
@@ -154,28 +130,23 @@ def test_relative_rebalance_counts_sharing_with_victims_and_preserves_unused_own
             return frozenset(range(1, 301)) if tier == "gpu" and ref in (a.ref, b.ref, waiting.ref) else frozenset()
 
     components.strategy.bind_footprints(Shared())
-    for program, score in ((a, 0.9), (b, second_idle), (spare, 0.7), (running, 1.0)):
-        set_tier(components, program, MORITier.GPU, idleness=score)
-    set_tier(components, waiting, MORITier.CPU, idleness=0.5)
+    for program in (a, b, spare, running):
+        set_tier(components, program, MORITier.GPU, idleness=0.9)
+    set_tier(components, waiting, MORITier.CPU, idleness=0.1)
     calls = []
-    fixed = snapshot(a, b, spare, running, waiting, hbm=1200, dram=2000)
+    fixed = snapshot(a, b, spare, running, waiting, hbm=quota, dram=2000)
     components.strategy.schedule_resume(
         fixed, components.initial_factors, accepting_controller(components.strategy, components.initial_factors, calls)
     )
-    if second_idle > 0.5:
-        # The candidate retains the shared 300 tokens after A/B leave. Only
-        # their private 400 tokens are relief for this exchange; spare stays.
-        assert [call.program for call in calls] == [a.ref, b.ref, waiting.ref]
-        assert components.strategy._ledgers(fixed, components.initial_factors)[0].used == 1200
-    else:
-        # A and spare free 400 tokens, exactly enough even though B must stay;
-        # B also preserves the candidate's existing shared-block discount.
-        assert [call.program for call in calls] == [a.ref, spare.ref, waiting.ref]
-        assert components.strategy._ledgers(fixed, components.initial_factors)[0].used == 1200
-    assert components.initial_factors.for_program(running.ref).pending_tier is None
+    expected = [] if quota == 1200 else [(TransitionKind.RESUME, waiting.ref)]
+    assert [(call.kind, call.program) for call in calls] == expected
+    for program in (a, b, spare, running):
+        assert components.initial_factors.for_program(program.ref).tier is MORITier.GPU
+        assert components.initial_factors.for_program(program.ref).pending_tier is None
+    assert components.strategy._ledgers(fixed, components.initial_factors)[0].used == (1100 if quota == 1200 else 1600)
 
 
-def test_many_ineligible_exchanges_do_not_rescan_or_partially_demote_victims():
+def test_non_fitting_candidates_do_not_rescan_or_demote_acting_residents():
     counts = []
     for size in (64, 128, 256, 512):
         components = build_mori_strategy()
@@ -198,12 +169,12 @@ def test_many_ineligible_exchanges_do_not_rescan_or_partially_demote_victims():
             )
         counts.append(factor_reads.call_count)
         assert components.strategy.counters["planning_candidates"] == size
-        assert not calls  # Even removing all Acting owners leaves too little room.
+        assert not calls  # No candidate fits the existing slack.
     assert all(after < before * 2.1 for before, after in zip(counts, counts[1:], strict=False))
 
 
 @pytest.mark.parametrize("seed", range(50))
-def test_relative_rebalance_matches_brute_force_union_planner(seed):
+def test_slack_promotions_match_brute_force_union_planner(seed):
     random = Random(912 + seed)
     components = build_mori_strategy()
     programs, claims, scores, tiers = {}, {}, {}, {}
@@ -242,20 +213,13 @@ def test_relative_rebalance_matches_brute_force_union_planner(seed):
         return group, claims[ref].tokens if group == 2 else 0, scores[ref], ref
 
     candidates = sorted(set(programs) - active, key=promotion_key)
-    victims = sorted(
-        (ref for ref in active if programs[ref].status is ProgramStatus.ACTING), key=lambda ref: (-scores[ref], ref)
-    )
     expected = []
     for candidate in candidates:
-        eligible = [ref for ref in victims if ref in active and scores[ref] > scores[candidate]]
-        for count in range(len(eligible) + 1):
-            projected = (active - set(eligible[:count])) | {candidate}
-            if union_tokens(projected) <= quota:
-                expected.extend((TransitionKind.PAUSE, ref) for ref in eligible[:count])
-                kind = TransitionKind.RESUME if programs[candidate].step_count else TransitionKind.ADMIT
-                expected.append((kind, candidate))
-                active = projected
-                break
+        projected = active | {candidate}
+        if union_tokens(projected) <= quota:
+            kind = TransitionKind.RESUME if programs[candidate].step_count else TransitionKind.ADMIT
+            expected.append((kind, candidate))
+            active = projected
     calls = []
     fixed = snapshot(*programs.values(), hbm=quota, dram=100_000)
     components.strategy.schedule_resume(

@@ -129,7 +129,7 @@ def test_arrival_can_use_free_capacity_behind_a_non_fitting_waiter() -> None:
         assert runtime.request_pool.waiting_request_ids == ("large",)
 
 
-def test_completion_keeps_tied_placement_then_elapsed_acting_allows_rebalance() -> None:
+def test_elapsed_acting_keeps_sticky_placement_until_capacity_is_released() -> None:
     runtime = scheduler()
     capacity = backend(1008)
     with patch("agentinfer.scheduling.runtime.time.monotonic", return_value=0.0) as clock:
@@ -144,11 +144,15 @@ def test_completion_keeps_tied_placement_then_elapsed_acting_allows_rebalance() 
         runtime.schedule_cycle(capacity)
         assert [entry.request_id for entry, _ in runtime.consume_admitted_requests()] == ["small"]
         assert runtime.request_pool.waiting_request_ids == ("large",)
-        # Completion alone does not establish a relative idleness advantage.
-        # The next periodic cycle observes actual elapsed tool time; no new
-        # request or exclusive relief plan is needed to make progress.
+        # Tool elapsed time changes the score but creates neither capacity
+        # debt nor free capacity. A periodic tick must preserve placement.
         clock.return_value = 6.2
         assert runtime.needs_schedule_cycle(6.2)
+        runtime.schedule_cycle(capacity)
+        assert runtime.consume_admitted_requests() == ()
+        assert runtime.request_pool.waiting_request_ids == ("large",)
+        clock.return_value = 6.3
+        assert runtime.on_response_completion("resident", ProgramLifecycle.TERMINAL)
         runtime.schedule_cycle(capacity)
         assert [entry.request_id for entry, _ in runtime.consume_admitted_requests()] == ["large"]
         assert runtime.request_pool.waiting_request_ids == ()

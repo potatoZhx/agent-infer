@@ -42,8 +42,10 @@ class MORIProgramFactors:
     pending_reasoning_seconds: float = 0.0
     acting_started_at_monotonic_s: float | None = None
     reasoning_started_at_monotonic_s: float | None = None
+    # Current-cycle scheduling credit only; never included in completed cycles.
+    reasoning_wait_seconds: float = 0.0
+    reasoning_wait_started_at_monotonic_s: float | None = None
     pending_tier: MORITier | None = None
-    last_idleness: float = 0.0
     execution_observed: bool = False
 
     def __post_init__(self) -> None:
@@ -51,12 +53,14 @@ class MORIProgramFactors:
             raise ValueError("MORI tier must be a MORITier")
         if self.pending_tier is not None and not isinstance(self.pending_tier, MORITier):
             raise ValueError("MORI pending_tier must be a MORITier when supplied")
-        values = [self.pending_reasoning_seconds, self.last_idleness]
+        values = [self.pending_reasoning_seconds, self.reasoning_wait_seconds]
         values.extend(value for cycle in self.cycles for value in cycle)
         if any(not math.isfinite(value) or value < 0 for value in values):
             raise ValueError("MORI timing and idleness values must be finite and non-negative")
-        if self.last_idleness > 1:
-            raise ValueError("MORI last_idleness must be at most one")
-        timestamps = (self.acting_started_at_monotonic_s, self.reasoning_started_at_monotonic_s)
+        timestamps = (
+            self.acting_started_at_monotonic_s,
+            self.reasoning_started_at_monotonic_s,
+            self.reasoning_wait_started_at_monotonic_s,
+        )
         if any(value is not None and (not math.isfinite(value) or value < 0) for value in timestamps):
             raise ValueError("MORI timestamps must be finite and non-negative")

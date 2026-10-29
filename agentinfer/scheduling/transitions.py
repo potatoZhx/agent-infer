@@ -29,6 +29,7 @@ class TransitionKind(str, Enum):
     CANCEL_PAUSE = "cancel_pause"
     RESUME = "resume"
     RELEASE = "release"
+    RETIRE = "retire"
 
 
 TRANSITION_EVENT_KINDS = {
@@ -39,6 +40,9 @@ TRANSITION_EVENT_KINDS = {
     TransitionKind.CANCEL_PAUSE: SchedulingEventKind.PROGRAM_PAUSE_CANCELLED,
     TransitionKind.RESUME: SchedulingEventKind.PROGRAM_RESUMED,
     TransitionKind.RELEASE: SchedulingEventKind.PROGRAM_RELEASED,
+    # Both boundaries release the cache/scheduling owner. Only RELEASE ends
+    # the business Program and removes its task/dependency relationships.
+    TransitionKind.RETIRE: SchedulingEventKind.PROGRAM_RELEASED,
 }
 
 
@@ -156,6 +160,10 @@ class TransitionController:
     def release(self, program: ProgramRef, *, reason: str) -> TransitionResult:
         """Request terminal release of a Program."""
         return self._request(TransitionKind.RELEASE, program, reason)
+
+    def retire(self, program: ProgramRef, *, reason: str) -> TransitionResult:
+        """Forget an idle paused scheduling owner while preserving business relationships."""
+        return self._request(TransitionKind.RETIRE, program, reason)
 
     def _request(
         self,

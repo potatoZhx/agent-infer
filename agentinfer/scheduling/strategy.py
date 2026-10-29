@@ -154,9 +154,9 @@ class SchedulingStrategy(Generic[StrategyGlobalFactorsT, StrategyProgramFactorsT
     ) -> None:
         """Optionally yield the Program after its committed request accounting.
 
-        The caller invokes this Hook with fresh facts after dispatching ``REQUEST_FINISHED``. A delayed pause already
-        committed while the request was reasoning takes precedence, so the runtime skips this Hook when it can apply
-        that pause immediately. The default policy does not yield on request completion.
+        The caller invokes this Hook for a surviving owner after dispatching ``REQUEST_FINISHED``, applying any delayed
+        pause, and releasing temporary branches. It also invokes the Hook when cancellation leaves a paused Acting
+        owner. Policies must check current state before yielding or retiring. The default policy takes no action.
 
         Args:
             snapshot: Fresh runtime facts after final token and status accounting.

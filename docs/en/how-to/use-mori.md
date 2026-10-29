@@ -108,11 +108,23 @@ Acting-first, highest-idleness demotion. Reasoning victims retain their GPU comm
 native cancellation. Pending inference is ordered by CPU returns, other returns, then new Programs by context size
 and idleness. Candidates that cannot fit do not block later candidates.
 
-With no capacity debt, promotion first uses existing slack. If more room is needed, a candidate may displace only
-strictly more idle Acting residents, and only when their combined marginal relief is sufficient. Ties preserve
-placement. The check accounts for shared physical blocks and does not spend pending Reasoning releases. This strict
-relative exchange is a concrete interpretation of the paper's partition boundary, not its published pseudocode.
-Without waiting inference or capacity debt, placement stays unchanged. The default 100-token decode buffer remains.
+Promotion uses existing slack; a candidate that cannot fit does not displace residents. Demotion repairs actual
+capacity debt, following [MORI section 4.3.1](https://arxiv.org/html/2606.00866v1#S4.SS3.SSS1).
+The check accounts for shared physical blocks and does not spend pending Reasoning releases. CPU placement likewise
+does not proactively replace a resident for a better-scoring newcomer. The default 100-token decode buffer remains.
+
+Two local extensions apply. First, paused Reasoning in CPU or WAITING receives its elapsed request wait as temporary
+Reasoning time in the scheduling idleness denominator. This remains part of the current window slot, freezes on GPU
+admission, and disappears when Reasoning ends. Completed history contains only actual Reasoning and Acting time;
+tool time and native GPU preemption do not increase this credit. One score calculation serves placement and diagnostics.
+The original tier priorities and Typed-LRU remain unchanged, and there is no historical decay parameter.
+
+Second, Acting owners committed to WAITING retire their MORI accounting and native ownership. A subsequent request
+gets a new generation, empty history, and new-Program priority. Business task/parent relationships survive retirement;
+physical shared KV and pending native transfers remain engine-managed. A matching terminal receipt can finish the
+retired business record, but cannot affect a later generation. Retirement does not happen merely because Acting lasts
+a long time: it still requires leaving both logical cache tiers. Waiting credit neither creates free capacity nor
+guarantees bounded waiting.
 
 There is no beneficiary-owned future capacity, wait timeout, minimum residence or extra idleness margin.
 `agentcache.mori` accepts only `mode` and `window_size`; remove the former `min_residency_seconds`, `idleness_margin`,

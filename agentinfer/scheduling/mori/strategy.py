@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import math
 import time
-from bisect import bisect_left
 from collections import Counter
 from dataclasses import replace
 
@@ -15,7 +14,7 @@ from agentinfer.scheduling.cache_placement import CacheClass, ProgramCacheClassO
 from agentinfer.scheduling.domain import ProgramRef, ProgramState, ProgramStatus, ProgramView
 from agentinfer.scheduling.events import SchedulingEvent, StrategyDiagnostic
 from agentinfer.scheduling.factors import StrategyFactors
-from agentinfer.scheduling.mori.capacity import CapacityClaim, CapacityLedger, FootprintProvider, ReliefProjection
+from agentinfer.scheduling.mori.capacity import CapacityClaim, CapacityLedger, FootprintProvider
 from agentinfer.scheduling.mori.config import MORIConfig, MORIMode
 from agentinfer.scheduling.mori.factors import MORIGlobalFactors, MORIProgramFactors, MORITier
 from agentinfer.scheduling.snapshot import SchedulingSnapshot
@@ -26,7 +25,7 @@ MORIFactors = StrategyFactors[MORIGlobalFactors, MORIProgramFactors]
 
 
 class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
-    """Capacity repair and sticky placement with relative-idleness rebalancing.
+    """Capacity-driven sticky placement with current-cycle waiting compensation.
 
     The strategy does not predict a future return, prefetch KV, or perform a
     transfer. It commits logical protection classes; native vLLM remains the
@@ -72,7 +71,9 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
 
     def on_execution_changed(self, factors: MORIFactors, program: ProgramRef, now: float, *, running: bool) -> None:
         """Accumulate native execution intervals, excluding admission and preemption waits."""
-        sidecar = self._factor(factors, program)
+        sidecar = factors.for_program(program)
+        if sidecar is None:
+            return
         if running:
             if not sidecar.execution_observed:
                 sidecar = replace(
@@ -152,6 +153,18 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             if view is None:
                 raise ValueError("MORI admission candidate is absent from the snapshot")
             sidecar = self._factor(strategy_factors, candidate)
+            # Ingress is the only implicit owner-creation boundary. Reads of an
+            # old snapshot must never recreate a retired owner's accounting.
+            if view.state is ProgramState.PAUSED and view.status is ProgramStatus.REASONING:
+                sidecar = replace(
+                    sidecar,
+                    reasoning_wait_started_at_monotonic_s=(
+                        view.wait_started_at_monotonic_s
+                        if view.wait_started_at_monotonic_s is not None
+                        else snapshot.observed_at_monotonic_s
+                    ),
+                )
+            self._set_factor(strategy_factors, candidate, sidecar)
             required = self._gpu_target(view, snapshot)
 
             if view.state is ProgramState.ACTIVE and sidecar.tier is MORITier.GPU:
@@ -162,7 +175,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                 self.counters["admission_existing_gpu"] += 1
                 return AdmissionOutcome(AdmissionDisposition.ADMITTED, "mori_existing_gpu", required_tokens=required)
 
-            # Ingress uses only existing slack. Victim selection is coalesced
+            # Ingress uses only existing slack. Capacity repair is coalesced
             # into the host's next planning cycle, never repeated per waiter.
             self._request_schedule(strategy_factors, snapshot.observed_at_monotonic_s)
             gpu, _cpu = self._ledgers(snapshot, strategy_factors)
@@ -200,6 +213,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         started = time.thread_time()
         try:
             self._select_pending(snapshot, strategy_factors, transitions)
+            self._retire_inactive(snapshot, strategy_factors, transitions)
         finally:
             self.decision_cpu_seconds += time.thread_time() - started
 
@@ -209,13 +223,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         strategy_factors: MORIFactors,
         transitions: TransitionController,
     ) -> None:
-        """Rank once, share a victim cursor, and skip candidates that cannot fit.
-
-        Slack promotions and relative rebalancing are separate from capacity
-        repair. A waiting request may displace only strictly more idle Acting
-        owners, and only if their marginal relief makes that request feasible.
-        Running inference is drained only for actual GPU capacity debt.
-        """
+        """Promote into existing slack; non-fitting candidates never evict owners."""
         candidates = [
             p
             for p in snapshot.programs
@@ -230,19 +238,6 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             return
         now = snapshot.observed_at_monotonic_s
         candidates.sort(key=lambda p: self._promotion_key(p, strategy_factors, snapshot, now))
-        victims = [
-            p
-            for p in snapshot.programs
-            if p.ref in gpu.claims
-            and p.status is ProgramStatus.ACTING
-            and not p.marked_for_pause
-            and self._factor(strategy_factors, p.ref).pending_tier is None
-        ]
-        victims.sort(key=lambda p: self._demotion_key(p, strategy_factors, now))
-        idle_keys = [-self._idleness(self._factor(strategy_factors, p.ref), now) for p in victims]
-        projection = ReliefProjection(gpu, tuple(p.ref for p in victims))
-        removed = 0
-        exchange_valid = True
         for candidate in candidates:
             self.counters["planning_candidates"] += 1
             claim = self._claim(candidate, snapshot, gpu=True)
@@ -250,41 +245,13 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                 self.counters["promotion_exceeds_total_quota"] += 1
                 continue
             if gpu.used + gpu.incremental(claim) > quota:
-                candidate_idle = self._idleness(self._factor(strategy_factors, candidate.ref), now)
-                eligible = max(removed, bisect_left(idle_keys, -candidate_idle))
-                if not exchange_valid or projection.required(eligible, claim) > quota:
-                    self.counters["promotion_no_fit"] += 1
-                    continue
-                # Find the smallest feasible prefix before changing placement.
-                # Repeatedly checking the candidate's shared blocks after each
-                # victim would multiply candidate-block and victim counts.
-                low, high = removed + 1, eligible
-                while low < high:
-                    middle = (low + high) // 2
-                    if projection.required(middle, claim) <= quota:
-                        high = middle
-                    else:
-                        low = middle + 1
-                while removed < low:
-                    victim = victims[removed]
-                    self.counters["planning_victims"] += 1
-                    if not self._demote(
-                        victim, snapshot, strategy_factors, transitions, gpu, cpu, reason="mori_relative_rebalance"
-                    ):
-                        # Do not reuse a projection after a rejected transition.
-                        # Slack admissions remain possible; retry exchanges on
-                        # the next fresh round without an exclusive beneficiary.
-                        exchange_valid = False
-                        break
-                    removed += 1
-            if gpu.used + gpu.incremental(claim) > quota:
+                self.counters["promotion_no_fit"] += 1
                 continue
             result = (transitions.resume if candidate.step_count else transitions.admit)(
                 candidate.ref, reason="mori_cycle_promote", backend_id=snapshot.backend_id
             )
             if result.applied:
                 gpu.add(candidate.ref, claim)
-                projection.admit(claim)
                 cpu.remove(candidate.ref)
                 self.counters["promotion_applied"] += 1
 
@@ -308,8 +275,30 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         transitions: TransitionController,
         completed: ProgramRef,
     ) -> None:
-        """Keep sticky placement; lazy demotion is applied by ProgramScheduler first."""
-        del snapshot, strategy_factors, transitions, completed
+        """Forget completed owners only after committed placement leaves both tiers."""
+        program = snapshot.program(completed)
+        if program is not None:
+            self._retire_program(program, strategy_factors, transitions)
+
+    def _retire_inactive(
+        self, snapshot: SchedulingSnapshot, factors: MORIFactors, transitions: TransitionController
+    ) -> None:
+        """Retire at the end of a hook, after all capacity scans have finished."""
+        for program in snapshot.programs:
+            self._retire_program(program, factors, transitions)
+
+    def _retire_program(self, program: ProgramView, factors: MORIFactors, transitions: TransitionController) -> None:
+        sidecar = factors.for_program(program.ref)
+        if (
+            program.state is ProgramState.PAUSED
+            and program.status is ProgramStatus.ACTING
+            and sidecar is not None
+            and sidecar.tier is MORITier.WAITING
+            and sidecar.pending_tier is None
+        ):
+            result = transitions.retire(program.ref, reason="mori_inactive_acting")
+            if result.applied:
+                self.counters["owners_retired"] += 1
 
     def on_schedule_cycle_start(self, snapshot: SchedulingSnapshot, strategy_factors: MORIFactors) -> None:
         del snapshot
@@ -399,6 +388,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                             "gpu_debt_waiting_lazy_relief",
                             "demotion_to_cpu",
                             "demotion_to_waiting",
+                            "owners_retired",
                         )
                     ),
                 ),
@@ -407,7 +397,6 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
 
     def on_request_pending(self, strategy_factors: MORIFactors, event: SchedulingEvent) -> None:
         if event.program is not None:
-            self._factor(strategy_factors, event.program)
             self._request_schedule(strategy_factors, event.occurred_at_monotonic_s)
 
     def on_program_status_changed(self, strategy_factors: MORIFactors, event: SchedulingEvent) -> None:
@@ -430,6 +419,8 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                     pending_reasoning_seconds=(sidecar.pending_reasoning_seconds if sidecar.execution_observed else 0.0)
                     + elapsed,
                     reasoning_started_at_monotonic_s=None,
+                    reasoning_wait_seconds=0.0,
+                    reasoning_wait_started_at_monotonic_s=None,
                     acting_started_at_monotonic_s=event.occurred_at_monotonic_s,
                 ),
             )
@@ -447,17 +438,17 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             sidecar,
             cycles=cycles,
             pending_reasoning_seconds=0.0,
+            reasoning_wait_seconds=0.0,
+            reasoning_wait_started_at_monotonic_s=(
+                event.occurred_at_monotonic_s if event.current_state is ProgramState.PAUSED else None
+            ),
             execution_observed=False,
             acting_started_at_monotonic_s=None,
             reasoning_started_at_monotonic_s=(
                 event.occurred_at_monotonic_s if event.current_state is ProgramState.ACTIVE else None
             ),
         )
-        self._set_factor(
-            strategy_factors,
-            event.program,
-            replace(updated, last_idleness=self._idleness(updated, event.occurred_at_monotonic_s)),
-        )
+        self._set_factor(strategy_factors, event.program, updated)
 
     def on_program_admitted(self, strategy_factors: MORIFactors, event: SchedulingEvent) -> None:
         self._on_gpu_transition(strategy_factors, event)
@@ -506,12 +497,12 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             pending_reasoning_seconds=reasoning,
             acting_started_at_monotonic_s=acting_started,
             reasoning_started_at_monotonic_s=(None if reasoning_finished else sidecar.reasoning_started_at_monotonic_s),
+            reasoning_wait_seconds=(0.0 if reasoning_finished else sidecar.reasoning_wait_seconds),
+            reasoning_wait_started_at_monotonic_s=(
+                None if reasoning_finished else sidecar.reasoning_wait_started_at_monotonic_s
+            ),
         )
-        self._set_factor(
-            strategy_factors,
-            event.program,
-            replace(updated, last_idleness=self._idleness(updated, event.occurred_at_monotonic_s)),
-        )
+        self._set_factor(strategy_factors, event.program, updated)
 
     def on_program_paused(self, strategy_factors: MORIFactors, event: SchedulingEvent) -> None:
         if event.program is None:
@@ -522,7 +513,15 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         self._set_factor(
             strategy_factors,
             event.program,
-            replace(sidecar, tier=target, pending_tier=None, reasoning_started_at_monotonic_s=None),
+            replace(
+                sidecar,
+                tier=target,
+                pending_tier=None,
+                reasoning_started_at_monotonic_s=None,
+                reasoning_wait_started_at_monotonic_s=(
+                    event.occurred_at_monotonic_s if event.current_status is ProgramStatus.REASONING else None
+                ),
+            ),
         )
 
     def on_program_released(self, strategy_factors: MORIFactors, event: SchedulingEvent) -> None:
@@ -539,6 +538,14 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         if event.program is None:
             return
         sidecar = self._factor(strategy_factors, event.program)
+        waiting = sidecar.reasoning_wait_seconds
+        if sidecar.reasoning_wait_started_at_monotonic_s is not None:
+            interval = event.field("scheduler_wait_seconds")
+            waiting += (
+                self._event_non_negative_float(interval)
+                if interval is not None
+                else max(0.0, event.occurred_at_monotonic_s - sidecar.reasoning_wait_started_at_monotonic_s)
+            )
         self._set_factor(
             strategy_factors,
             event.program,
@@ -546,6 +553,8 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                 sidecar,
                 tier=MORITier.GPU,
                 pending_tier=None,
+                reasoning_wait_seconds=waiting,
+                reasoning_wait_started_at_monotonic_s=None,
                 reasoning_started_at_monotonic_s=(
                     event.occurred_at_monotonic_s
                     if event.current_status is ProgramStatus.REASONING
@@ -763,6 +772,14 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         elif sidecar.execution_observed:
             has_partial = True
             partial_reasoning = sidecar.pending_reasoning_seconds
+        # A queued current Reasoning is already the current window slot, even
+        # before native execution starts. Its credit survives admission but is
+        # discarded on completion; completed (R, A) pairs remain factual.
+        if sidecar.acting_started_at_monotonic_s is None:
+            partial_reasoning += sidecar.reasoning_wait_seconds
+            if sidecar.reasoning_wait_started_at_monotonic_s is not None:
+                has_partial = True
+                partial_reasoning += max(0.0, now - sidecar.reasoning_wait_started_at_monotonic_s)
         keep = max(0, self.config.window_size - int(has_partial))
         cycles = sidecar.cycles[-keep:] if keep else ()
         reasoning = sum(item[0] for item in cycles) + partial_reasoning
@@ -771,12 +788,8 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         return acting / total if total > 0 else 0.0
 
     def _factor(self, factors: MORIFactors, ref: ProgramRef) -> MORIProgramFactors:
-        sidecar = factors.for_program(ref)
-        if sidecar is None:
-            sidecar = MORIProgramFactors()
-            factors.set_program_factors(ref, sidecar)
-            self._classes.setdefault(ref, CacheClass.INACTIVE)
-        return sidecar
+        """Read without materializing an owner from a stale snapshot or callback."""
+        return factors.for_program(ref) or MORIProgramFactors()
 
     def _set_factor(self, factors: MORIFactors, ref: ProgramRef, sidecar: MORIProgramFactors) -> None:
         previous_class = self._classes.get(ref, CacheClass.INACTIVE)

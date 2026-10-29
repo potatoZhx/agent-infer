@@ -106,10 +106,20 @@ Reasoning 完成或 native 确认取消后才释放 GPU 预留。
 等待者按 CPU returning、其他 returning、新 Program 的 context/idleness 排序；不能放入的候选不会阻塞
 后续候选。
 
-没有容量超额时，先用已有余量提升；余量不足时，候选只能置换严格比自己更 idle 的 Acting 驻留者，且整组
-边际回收必须足够，才会修改 placement。平局保持驻留。检查按实际共享块计算，不能提前兑现 Reasoning 的
-pending 释放。这是对论文相对分界描述的具体实现解释，不是论文公布的伪代码。没有等待推理或容量超额时
-保持 placement。默认 100-token decode 预留继续保留。
+提升只使用已有余量，不能放入的候选不会置换驻留者。降级只修复真实容量超额，遵循
+[MORI 论文 §4.3.1](https://arxiv.org/html/2606.00866v1#S4.SS3.SSS1)。容量检查按实际共享块计算，不能提前兑现
+Reasoning 的 pending 释放；CPU 也不会仅因新候选分数更好而主动置换驻留者。默认 100-token decode 预留继续保留。
+
+本地实现增加两项优化。首先，CPU 或 WAITING 中暂停的 Reasoning 请求，将本次请求的等待时间临时计入
+调度 idleness 分母中的 Reasoning 时间。它仍属于当前周期的原有窗口槽位，准入 GPU 时冻结，Reasoning
+结束时清除；完成历史只保存真实 Reasoning 和 Acting 时间。工具执行与 native GPU 抢占不增加此补偿。
+层级决策和 diagnostics 使用同一评分函数，原有层级优先顺序与 Typed-LRU 保持不变，不引入历史衰减参数。
+
+其次，Acting owner 已提交到 WAITING 时，退出 MORI 记账并释放 native ownership。后续请求获得新 generation、
+空历史及新 Program 的排序优先级。业务 task/parent 关系继续保留；物理共享 KV 与未完成的 native 传输仍由
+引擎管理。匹配的 terminal 凭证可以结束旧业务记录，但不能影响后来的 generation。Acting 很久本身不会
+触发退出，必须已经离开 GPU 与 CPU 两个逻辑缓存层；等待补偿也不能创造空闲容量或保证等待时间有界。
+
 不再保留候选独占的未来回收额度，也没有额外等待超时、最短驻留或 idleness 差值门槛。
 
 `agentcache.mori` 只接受 `mode` 和 `window_size`。已删除 `min_residency_seconds`、`idleness_margin`、
