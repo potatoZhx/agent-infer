@@ -170,6 +170,13 @@ class SchedulingStrategy(Generic[StrategyGlobalFactorsT, StrategyProgramFactorsT
             completed: Exact Program generation whose request just completed.
         """
 
+    def on_cache_pressure(
+        self,
+        strategy_factors: StrategyFactors[StrategyGlobalFactorsT, StrategyProgramFactorsT],
+        now_monotonic_s: float,
+    ) -> None:
+        """Optionally request earlier policy evaluation after a native cache pressure observation."""
+
     def on_schedule_cycle_start(
         self,
         snapshot: SchedulingSnapshot,

@@ -44,9 +44,9 @@ complete launch and request example.
 The patches are required only for `mori.mode=full`. The explicit
 `mori.mode=placement_only` ablation does not install native cache policies.
 
-## CPU store admission (API 2)
+## CPU store admission and demotion retry (API 3)
 
-The SimpleCPU provider now requires API 2 and the BlockPool patch's
+The SimpleCPU provider now requires API 3 and the BlockPool patch's
 `store_admission_api_version=1` capability. Rebuild with both current patches;
 an older installed patch is rejected at startup instead of silently using the
 old eviction behavior.
@@ -64,5 +64,23 @@ advance the cursor or pin GPU sources. Boundary handoffs cannot be retried once
 the source is gone; a skipped final backup likewise does not certify CPU
 residency. Tier labels remain logical protection, not proof of a READY copy.
 
-Evidence: `agentinfer/agentcache/mori/simple_cpu_policy.py:82-94`,
-`tests/agentcache/test_mori_native_patch.py:155-294`.
+API 3 adds one best-effort store attempt when a completed Program actually
+changes from BUSY to IDLE. Native captures stable identities for confirmed full
+positional blocks before request cleanup and rechecks source hashes, existing
+CPU copies, in-flight stores, and the current context receipt before copying.
+The class-change callback queues an unpinned intent; the normal native metadata
+boundary submits it, including steps with only pending transfers. It does not
+allocate CPU blocks or change footprint evidence during MORI capacity planning.
+The attempt uses existing CPU admission and pending-store transfer completion;
+it never waits for CPU space or holds source pins for a rejected attempt.
+Prompt replacement, Program release, and scheduler shutdown invalidate receipts.
+Boundary-state and partial-tail stores keep their existing behavior. Rebuild
+both patches; an API 2 SimpleCPU installation cannot provide this retry hook.
+
+A complete BUSY HBM proposal also coalesces a normal scheduler wakeup. Allocation
+does not wait, and normal policy evaluation may leave tiers unchanged. Native
+fallback alone does not request a wakeup. Neither prefix/suffix LRU order nor
+the existing eager-copy policy changes.
+
+Evidence: `agentinfer/agentcache/mori/simple_cpu_policy.py:41-70,122-136`,
+`tests/agentcache/test_mori_native_patch.py:366-525`.

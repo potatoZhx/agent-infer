@@ -116,7 +116,7 @@ def install_vllm_mori(owner: object, strategy: MORIStrategy) -> VllmMORIAdapter:
     if callable(simple_register):
         if not callable(simple_unregister):
             raise RuntimeError(
-                "full MORI with SimpleCPUOffloadConnector requires unregister_mori_offload_tier_provider(version=1)"
+                "full MORI with SimpleCPUOffloadConnector requires unregister_mori_offload_tier_provider(version=3)"
             )
         cpu_policy = MORISimpleCPUOffloadPolicy(MORI_RUNTIME_STATE)
         try:

@@ -74,11 +74,11 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         self._footprints = provider
 
     def on_context_replaced(self, program: ProgramRef) -> None:
-        """Invalidate previous-prompt block proof and wake placement planning."""
+        """Release previous-context cache ownership and wake placement planning."""
         if self._slow_diagnostics is not None:
             self._slow_diagnostics.release(program)
         if self._footprints is not None:
-            self._footprints.invalidate_footprint(program)
+            self._footprints.replace_context(program)
         if self._factors is not None:
             self._request_schedule(self._factors, time.monotonic())
 
@@ -440,6 +440,10 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             result = transitions.retire(program.ref, reason="mori_inactive_acting")
             if result.applied:
                 self.counters["owners_retired"] += 1
+
+    def on_cache_pressure(self, strategy_factors: MORIFactors, now_monotonic_s: float) -> None:
+        """Wake ordinary placement evaluation; pressure alone does not select a victim."""
+        self._request_schedule(strategy_factors, now_monotonic_s)
 
     def on_schedule_cycle_start(self, snapshot: SchedulingSnapshot, strategy_factors: MORIFactors) -> None:
         del snapshot

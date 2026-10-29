@@ -154,6 +154,13 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
             return False
         return self.retained_request_count > 0 or self._cycle_dirty or self.registry.has_programs
 
+    def on_cache_pressure(self, now_monotonic_s: float) -> None:
+        """Refresh a policy wake request at a safe boundary without entering scheduling."""
+        if not math.isfinite(now_monotonic_s) or now_monotonic_s < 0:
+            raise ValueError("cache-pressure time must be finite and non-negative")
+        self.strategy.on_cache_pressure(self.strategy_factors, now_monotonic_s)
+        self._next_check_at_monotonic_s = self._strategy_next_check_at()
+
     def run_due_lightweight_checks(self, now_monotonic_s: float) -> None:
         """Apply factor-only deadlines without entering resume, repair, or TTL scheduling."""
         if not math.isfinite(now_monotonic_s) or now_monotonic_s < 0:

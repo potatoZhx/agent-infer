@@ -18,6 +18,8 @@ class FootprintProvider(Protocol):
 
     def invalidate_footprint(self, program: ProgramRef) -> None: ...
 
+    def replace_context(self, program: ProgramRef) -> None: ...
+
 
 @dataclass(frozen=True)
 class CapacityClaim:

@@ -138,14 +138,17 @@ a long time: it still requires leaving both logical cache tiers. Waiting credit 
 guarantees bounded waiting.
 
 There is no beneficiary-owned future capacity, wait timeout, minimum residence or extra idleness margin.
-`agentcache.mori` accepts only `mode` and `window_size`; remove the former `min_residency_seconds`, `idleness_margin`,
-and `max_wait_seconds` settings. The old `starvation_timeout_seconds` remains unsupported. The diagnostic
-`max_wait_seconds` is an observed wait, not a configuration or latency guarantee.
+Placement settings under `agentcache.mori` are `mode` and `window_size`; remove the former `min_residency_seconds`,
+`idleness_margin`, and `max_wait_seconds` settings. The old `starvation_timeout_seconds` remains unsupported.
+Slow-request logging also accepts `slow_request_threshold_seconds` (default 30; 0 disables logging) and
+`slow_request_repeat_seconds` (default 60). These do not change placement; see the
+[diagnostics design](../../../design/module/scheduling/mori-slow-request-diagnostics.zh-CN.md).
+The diagnostic `max_wait_seconds` is an observed wait, not a configuration or latency guarantee.
 
-SimpleCPU now requires hook API 2: rebuild with both current native patches. GPU/BUSY backups can use empty,
+SimpleCPU now requires hook API 3: rebuild with both current native patches. GPU/BUSY backups can use empty,
 INACTIVE or BUSY CPU blocks, but cannot evict IDLE working sets. Rejected stores never fall back to ordinary LRU.
 Evidence: `agentinfer/scheduling/mori/strategy.py:209-326`, `agentinfer/scheduling/mori/capacity.py:83-137`,
-`agentinfer/agentcache/mori/simple_cpu_policy.py:82-94`.
+`agentinfer/agentcache/mori/simple_cpu_policy.py:122-136`.
 
 MORI requires one native KV cache group. Effective HBM capacity excludes the permanent null block. A request whose
 prompt plus maximum output exceeds that capacity is rejected before admission. The normal logical claim rounds
@@ -153,6 +156,31 @@ context plus 100 decode tokens to HBM blocks; speculative headroom is capped by 
 context to CPU chunks. Shared capacity is discounted only with current-prompt native block identity evidence;
 unknown or invalidated evidence is charged conservatively. CPU placement does not certify that a complete CPU copy
 is ready. Native refcounts, transfer fences, allocation and recomputation remain authoritative.
+
+### Cache ownership and conservative placement feedback
+
+Each new prompt replaces that Program's old native ownership and footprint evidence, even within the same Program
+generation. Shared owners, physical cache contents, native pins, and LRU ages remain intact. Native hits reattach
+the content actually used by the new prompt. Delayed work carries an opaque context receipt that becomes invalid
+on the next prompt, retirement, or scheduler shutdown.
+
+A complete MORI HBM allocation proposal containing BUSY blocks requests an earlier normal scheduling cycle.
+Notifications before one boundary coalesce. Native allocation and fallback continue immediately; the next cycle
+uses the existing capacity and relative-idleness rules and may make no placement change. This is a policy-pressure
+signal, not a report that KV was lost or that memory has been freed. Native fallback alone does not trigger it.
+
+When a Program actually moves from GPU/BUSY to CPU/IDLE, SimpleCPU queues one unpinned backup intent for its
+confirmed full positional blocks. The normal native scheduling boundary makes the best-effort attempt, including
+transfer-only steps. It rechecks CPU contents and in-flight copies, validates each GPU source against
+its captured content identity, and uses the existing store admission and asynchronous transfer path. The receipt
+survives request cleanup, so a rejected final backup or a subsequently evicted CPU copy can be retried. Unavailable
+sources and rejected destinations are skipped without waiting or indefinitely pinning sources. Boundary-state
+handoffs and partial-tail handling retain their existing behavior; CPU placement still does not certify a complete
+ready copy. The generic OffloadingConnector does not implement this SimpleCPU retry hook.
+
+This feedback adds no pressure threshold or mandatory demotion. Eager offload and existing prefix/suffix LRU order
+are unchanged; GPU/CPU duplicates remain possible. Persistent new BUSY proposals can cause a cycle each native
+step, so notification coalescing is not a rate limit.
 
 ### Concurrent branches and lifecycle
 

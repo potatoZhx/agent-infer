@@ -22,7 +22,7 @@
 +
 +    def on_block_ready(self, block_id: int, native_lru_seq: int) -> None: ...
 +
-+    def on_block_owner_added(self, block_id: int, request_id: str) -> None: ...
++    def on_block_owner_added(self, block_id: int, request_id: object) -> None: ...
 +
 +    def on_block_evictability_changed(self, block_id: int, ready: bool) -> None: ...
 +
@@ -60,7 +60,7 @@
  
 -    def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
 +    def get_new_blocks(
-+        self, num_blocks: int, *, mori_store_request_id: str | None = None
++        self, num_blocks: int, *, mori_store_request_id: object | None = None
 +    ) -> list[KVCacheBlock]:
          """Get new blocks from the free block pool.
  
@@ -176,7 +176,7 @@
              pool.free_blocks(blocks)
 +
 +    def observe_mori_block_owner(
-+        self, request_id: str, blocks: Iterable[KVCacheBlock]
++        self, request_id: object, blocks: Iterable[KVCacheBlock]
 +    ) -> None:
 +        if (provider := self._mori_block_selection_provider) is not None:
 +            for block_id in {block.block_id for block in blocks if not block.is_null}:

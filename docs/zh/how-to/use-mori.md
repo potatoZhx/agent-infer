@@ -130,20 +130,43 @@ Reasoning 继续采用 lazy demotion。CPU 不会仅因新候选分数更好而�
 
 不再保留候选独占的未来回收额度，也没有额外等待超时、最短驻留或 idleness 差值门槛。
 
-`agentcache.mori` 只接受 `mode` 和 `window_size`。已删除 `min_residency_seconds`、`idleness_margin`、
-`max_wait_seconds` 配置；旧 `starvation_timeout_seconds` 仍不支持。diagnostics 的 `max_wait_seconds`
-仅表示观测到的最长等待时间，不是配置或延迟保证。
+`agentcache.mori` 的层级配置为 `mode` 和 `window_size`。已删除 `min_residency_seconds`、`idleness_margin`、
+`max_wait_seconds` 配置；旧 `starvation_timeout_seconds` 仍不支持。慢请求日志另接受
+`slow_request_threshold_seconds`（默认 30，设为 0 关闭）和 `slow_request_repeat_seconds`（默认 60），
+不改变层级决策，详见[诊断设计](../../../design/module/scheduling/mori-slow-request-diagnostics.zh-CN.md)。
+diagnostics 的 `max_wait_seconds` 仅表示观测到的最长等待时间，不是配置或延迟保证。
 
-SimpleCPU hook 升级至 API 2，必须同时更新两个 native patch 后重新构建。GPU/BUSY 备份只能使用
+SimpleCPU hook 升级至 API 3，必须同时更新两个 native patch 后重新构建。GPU/BUSY 备份只能使用
 空闲、INACTIVE 或 BUSY CPU 块，不得挤掉 IDLE 缓存；写入拒绝不会退回普通 LRU。
 依据：`agentinfer/scheduling/mori/strategy.py:209-326`、`agentinfer/scheduling/mori/capacity.py:83-137`、
-`agentinfer/agentcache/mori/simple_cpu_policy.py:82-94`。
+`agentinfer/agentcache/mori/simple_cpu_policy.py:122-136`。
 
 当前 MORI 要求一个 native KV cache group。有效 HBM 容量扣除永久 null block；prompt 加最大输出超过
 有效容量的请求在准入前拒绝。逻辑 GPU 预算是 context 加 100 decode token 后按 block 取整，推测余量
 截到总容量；CPU 按 chunk 取整。只有当前 prompt 的有效 native block ID 证据才能用于共享抵扣，未知或
 失效证据保守计费。CPU placement 不保证完整 CPU 副本已 READY；native 仍负责 refcount、传输 fence、
 实际分配和必要的重算。
+
+### 缓存归属与保守的层级反馈
+
+每个新 prompt 都会替换该 Program 的旧 native ownership 和 footprint，即使 Program generation 未变。
+共享 owner、物理缓存、native pin 和 LRU 年龄继续保留；native 命中后重新挂接新 prompt 实际使用的内容。
+延迟任务使用独立的上下文凭证，下一 prompt、Program 退出或调度器关闭会使旧凭证失效。
+
+实际 HBM 分配中的完整 MORI 建议包含 BUSY 块时，只请求提前运行一次常规调度周期；同一调度边界前的
+通知合并。native 分配及 fallback 立即继续，下一周期仍按已有容量和相对 idleness 规则决策，允许不调整
+层级。该信号表示策略触及 BUSY 保护，不表示 KV 已丢失或容量已经释放；单独的 native fallback 不触发它。
+
+Program 真正从 GPU/BUSY 降到 CPU/IDLE 时，SimpleCPU 为已确认完成的完整 positional 块登记一次补传意图，
+此时不 pin 源块。正常 native 调度边界再尝试执行，也支持仅有传输任务的 step。执行时重新检查 CPU 副本、
+在途复制及 GPU 源块的内容身份，并复用现有写入准入和异步传输路径。
+上下文凭证在请求清理后仍有效，因此可以补试结束时被拒的备份，以及之后被 CPU 淘汰的副本。
+源块不可用或 CPU 准入失败时直接跳过，不等待、不长期 pin 等待获准的源块。boundary-state handoff 和
+partial tail 保持已有处理；CPU placement 仍不保证完整副本已经 ready。通用 OffloadingConnector
+未实现此 SimpleCPU 补传 hook。
+
+这些反馈不增加压力阈值或强制降级规则。eager offload 以及已有前缀／后缀 LRU 顺序保持不变，GPU/CPU
+仍可能保留重复副本。持续的新 BUSY 建议可能每个 native step 都触发一次周期；合并通知不是限频器。
 
 ### 并发分支与生命周期
 

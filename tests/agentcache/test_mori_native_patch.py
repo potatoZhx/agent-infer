@@ -145,7 +145,7 @@ def cpu_store(native_pool_class, native_cpu_module):
     manager._lazy_mode = False
     manager._mori_offload_tier_provider = None
     manager._mori_resident_block_ids = set()
-    assert manager.register_mori_offload_tier_provider(2, policy) == {"hook_api_version": 2}
+    assert manager.register_mori_offload_tier_provider(3, policy) == {"hook_api_version": 3}
     yield manager, policy
     manager.unregister_mori_offload_tier_provider(policy)
     policy.close()
@@ -289,6 +289,233 @@ def test_cpu_registration_rejects_old_blockpool_without_strict_store_support(cpu
 
     monkeypatch.setattr(pool, "register_mori_block_selection_provider", old_register)
     with pytest.raises(RuntimeError, match="unsupported MORI BlockPool"):
-        manager.register_mori_offload_tier_provider(2, policy)
+        manager.register_mori_offload_tier_provider(3, policy)
     assert pool._mori_block_selection_provider is None
     assert manager._mori_offload_tier_provider is None
+
+
+@pytest.fixture
+def finished_retry(cpu_store, native_pool_class, native_cpu_module, monkeypatch):
+    """Real finish/store/pool methods with two confirmed blocks and a full IDLE CPU cache."""
+    from types import SimpleNamespace
+
+    from vllm.v1.core.kv_cache_utils import BlockHash, make_block_hash_with_group_id
+
+    manager, policy = cpu_store
+    gpu = native_pool_class(num_gpu_blocks=5, enable_caching=True, hash_block_size=16)
+    blocks = gpu.get_new_blocks(2)
+    hashes = [BlockHash(bytes([10 + i]) * 32) for i in range(2)]
+    for block, block_hash in zip(blocks, hashes, strict=True):
+        gpu._insert_block_hash(make_block_hash_with_group_id(block_hash, 0), block, num_tokens=16)
+    # GPU backups cannot replace this CPU working set until committed demotion.
+    occupied = manager._allocate_store_blocks(2, "idle")
+    for block, value in zip(occupied, (20, 21), strict=True):
+        manager.cpu_block_pool._insert_block_hash(
+            make_block_hash_with_group_id(BlockHash(bytes([value]) * 32), 0), block, num_tokens=16
+        )
+    manager._observe_mori_owner("idle", occupied)
+    manager.cpu_block_pool.free_blocks(occupied)
+    manager._gpu_block_pool = gpu
+    manager.enable_kv_cache_events = False
+    manager.cpu_kv_cache_config = SimpleNamespace(kv_cache_groups=[object()])
+    manager.cpu_coordinator = SimpleNamespace(
+        enable_partial_hash_hits=False,
+        single_type_managers=[SimpleNamespace(has_positionally_stable_blocks=True)],
+    )
+    manager.prefix_cacheable_group_ids = {0}
+    manager.group_block_sizes = [16]
+    manager.hash_block_size = manager.block_size = 16
+    manager._pending_finished_stores = []
+    manager._in_flight_store_gpu_blocks = set()
+    manager._pending_cpu_hits = {}
+    manager._reqs_to_load = {}
+    manager._store_event_to_blocks = {}
+    manager._abandoned_store_event_to_blocks = {}
+    manager._store_event_to_reqs = {}
+    manager._store_event_pending_counts = {}
+    manager._expected_worker_count = 1
+    manager._store_event_counter = 0
+    manager._load_event_to_reqs = {}
+    request = SimpleNamespace(request_id="busy", num_computed_tokens=32, num_output_placeholders=0, block_hashes=hashes)
+    block_ids = ([b.block_id for b in blocks],)
+    manager._reqs_to_store = {
+        "busy": native_cpu_module.StoreRequestState(request=request, block_ids=block_ids, num_stored_blocks=[0])
+    }
+    monkeypatch.setattr(manager, "_find_fa_partial_tail_source", lambda *args: None)
+    return manager, policy, request, blocks
+
+
+def _finish_retry_request(finished_retry):
+    manager, policy, request, blocks = finished_retry
+    manager.request_finished_all_groups(request, ([b.block_id for b in blocks],))
+    manager._gpu_block_pool.free_blocks(reversed(blocks))
+    policy.runtime_state.unbind_request(request.request_id)
+    assert "busy" not in manager._reqs_to_store
+    return manager, policy, request, blocks
+
+
+def _commit_retry_demotion(policy, manager=None):
+    from agentinfer.scheduling.mori import MORIProgramFactors, MORITier
+
+    strategy = policy.runtime_state._provider
+    strategy._set_factor(strategy._factors, ProgramRef("busy", 0), MORIProgramFactors(tier=MORITier.CPU))
+    if manager is not None:
+        manager._mori_drain_store_retries()
+
+
+def test_finished_rejected_store_retries_after_unbind_and_uses_native_job(finished_retry, monkeypatch):
+    from types import SimpleNamespace
+
+    manager, policy, request, blocks = _finish_retry_request(finished_retry)
+    assert manager._pending_finished_stores == []
+    assert all(block.ref_cnt == 0 for block in blocks)
+    assert policy.runtime_state.program_for_request(request.request_id) is None
+    _commit_retry_demotion(policy)
+    assert manager._pending_finished_stores == []
+    assert manager.has_pending_stores()
+    assert all(block.ref_cnt == 0 for block in blocks)
+    # A transfer-only scheduler step uses the existing dispatch path.
+    monkeypatch.setattr(manager, "prepare_store_specs", lambda _: ([], [], [], None))
+    meta = manager.build_connector_meta(SimpleNamespace(preempted_req_ids=set()))
+    assert meta.store_gpu_blocks == [block.block_id for block in blocks]
+    assert manager._pending_finished_stores == []
+    transfer = manager._store_event_to_blocks[meta.store_event]
+    assert all(block.ref_cnt == 1 for block in blocks)
+    assert all(policy.index.owners(block_id) == {ProgramRef("busy", 0)} for block_id in transfer.cpu_block_ids)
+    assert all(manager.cpu_block_pool.blocks[i].block_hash is None for i in transfer.cpu_block_ids)
+    manager._process_store_event(meta.store_event)
+    assert not manager.has_pending_stores()
+    assert all(block.ref_cnt == 0 for block in blocks)
+    assert all(
+        manager.cpu_block_pool.blocks[i].block_hash == block.block_hash
+        for i, block in zip(transfer.cpu_block_ids, blocks, strict=True)
+    )
+
+
+@pytest.mark.parametrize("invalidate", ["replace", "release"])
+def test_finished_retry_invalidated_context_never_pins(finished_retry, invalidate):
+    manager, policy, _request, blocks = _finish_retry_request(finished_retry)
+    owner = ProgramRef("busy", 0)
+    if invalidate == "replace":
+        policy.runtime_state.replace_context(owner)
+    else:
+        policy.runtime_state.on_program_released(owner)
+    assert manager._mori_store_retries == {}
+    _commit_retry_demotion(policy, manager)
+    assert manager._pending_finished_stores == []
+    assert all(block.ref_cnt == 0 for block in blocks)
+
+
+def test_finished_retry_revalidates_source_content(finished_retry):
+    from vllm.v1.core.kv_cache_utils import BlockHash, make_block_hash_with_group_id
+
+    manager, policy, _request, blocks = _finish_retry_request(finished_retry)
+    changed = blocks[0]
+    manager._gpu_block_pool.evict_blocks({changed.block_id})
+    manager._gpu_block_pool._insert_block_hash(
+        make_block_hash_with_group_id(BlockHash(b"z" * 32), 0), changed, num_tokens=16
+    )
+    _commit_retry_demotion(policy, manager)
+    assert manager._pending_finished_stores[0].gpu_block_ids == [blocks[1].block_id]
+    assert changed.ref_cnt == 0
+
+
+def test_finished_retry_admission_rejection_holds_no_pins(finished_retry, monkeypatch):
+    manager, policy, _request, blocks = _finish_retry_request(finished_retry)
+    monkeypatch.setattr(policy, "propose_for_store", lambda *args: None)
+    _commit_retry_demotion(policy, manager)
+    assert manager._mori_store_retries == {}
+    assert manager._pending_finished_stores == []
+    assert all(block.ref_cnt == 0 for block in blocks)
+    assert manager.cpu_block_pool.get_num_free_blocks() == 2
+
+
+@pytest.mark.parametrize("dedup", ["cached", "inflight"])
+def test_finished_retry_deduplicates_at_submission(finished_retry, dedup):
+    manager, policy, _request, blocks = _finish_retry_request(finished_retry)
+    if dedup == "cached":
+        destination = manager._allocate_store_blocks(1, "idle")[0]
+        manager.cpu_block_pool._insert_block_hash(blocks[0].block_hash, destination, num_tokens=16)
+        manager._observe_mori_owner("idle", [destination])
+        manager.cpu_block_pool.free_blocks([destination])
+    else:
+        manager._in_flight_store_gpu_blocks.add(blocks[0].block_id)
+    _commit_retry_demotion(policy, manager)
+    assert manager._pending_finished_stores[0].gpu_block_ids == [blocks[1].block_id]
+    assert blocks[0].ref_cnt == 0
+
+
+def test_retry_recaptures_block_cached_at_finish_but_later_evicted(finished_retry):
+    manager, policy, _request, blocks = finished_retry
+    destination = manager._allocate_store_blocks(1, "idle")[0]
+    manager.cpu_block_pool._insert_block_hash(blocks[0].block_hash, destination, num_tokens=16)
+    manager._observe_mori_owner("idle", [destination])
+    manager.cpu_block_pool.free_blocks([destination])
+    _finish_retry_request(finished_retry)
+    manager.cpu_block_pool.evict_blocks({destination.block_id})
+    _commit_retry_demotion(policy, manager)
+    assert manager._pending_finished_stores[0].gpu_block_ids == [block.block_id for block in blocks]
+
+
+def test_retry_completion_after_owner_release_keeps_native_cache_ownerless(finished_retry):
+    manager, policy, _request, blocks = _finish_retry_request(finished_retry)
+    _commit_retry_demotion(policy, manager)
+    transfer = manager._pending_finished_stores.pop()
+    policy.runtime_state.on_program_released(ProgramRef("busy", 0))
+    manager._process_store_completion(transfer.gpu_block_ids, transfer.cpu_block_ids)
+    assert all(not policy.index.owners(block_id) for block_id in transfer.cpu_block_ids)
+    assert all(manager.cpu_block_pool.blocks[i].block_hash is not None for i in transfer.cpu_block_ids)
+    assert all(block.ref_cnt == 0 for block in blocks)
+
+
+def test_retry_capture_rejects_wrong_position_and_unconfirmed_tail(finished_retry):
+    manager, _policy, request, blocks = finished_retry
+    request.num_computed_tokens = 31
+    # First position's native hash belongs to another position; second block isn't fully confirmed.
+    manager._mori_capture_finished_store(request, ([blocks[1].block_id, blocks[0].block_id],))
+    assert manager._mori_store_retries == {}
+
+
+@pytest.mark.parametrize("dispatched", [False, True])
+def test_retry_reset_preserves_inflight_pins_and_never_publishes_abandoned_data(
+    finished_retry, native_cpu_module, monkeypatch, dispatched
+):
+    from types import SimpleNamespace
+
+    manager, policy, _request, blocks = _finish_retry_request(finished_retry)
+    _commit_retry_demotion(policy, manager)
+    transfer = manager._pending_finished_stores[0]
+    manager._abandoned_reqs_to_load = {}
+    manager.boundary_store_stats = native_cpu_module.BoundaryStoreStats()
+    manager._boundary_stats_snapshot = native_cpu_module.BoundaryStoreStats()
+    if dispatched:
+        monkeypatch.setattr(manager, "prepare_store_specs", lambda _: ([], [], [], None))
+        metadata = manager.build_connector_meta(SimpleNamespace(preempted_req_ids=set()))
+    assert manager.reset() is (not dispatched)
+    assert all(block.ref_cnt == int(dispatched) for block in blocks)
+    assert all(manager.cpu_block_pool.blocks[i].block_hash is None for i in transfer.cpu_block_ids)
+    if dispatched:
+        assert manager.has_pending_stores()
+        manager._process_store_event(metadata.store_event)
+    assert not manager.has_pending_stores()
+    assert all(block.ref_cnt == 0 for block in blocks)
+    assert all(manager.cpu_block_pool.blocks[i].ref_cnt == 0 for i in transfer.cpu_block_ids)
+    assert all(not policy.index.owners(i) for i in transfer.cpu_block_ids)
+    assert all(manager.cpu_block_pool.blocks[i].block_hash is None for i in transfer.cpu_block_ids)
+
+
+def test_cpu_registration_rejects_hook_api_without_context_retry(cpu_store):
+    manager, policy = cpu_store
+    with pytest.raises(ValueError, match="unsupported MORI SimpleCPU"):
+        manager.register_mori_offload_tier_provider(2, policy)
+
+
+def test_context_replacement_cancels_demoted_intent_before_native_allocation(finished_retry):
+    manager, policy, _request, blocks = _finish_retry_request(finished_retry)
+    _commit_retry_demotion(policy)
+    assert manager.has_pending_stores()
+    policy.runtime_state.replace_context(ProgramRef("busy", 0))
+    assert not manager.has_pending_stores()
+    manager._mori_drain_store_retries()
+    assert manager._pending_finished_stores == []
+    assert all(block.ref_cnt == 0 for block in blocks)

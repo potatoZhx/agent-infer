@@ -1,0 +1,113 @@
+ruff check...............................................................Passed
+ruff format..............................................................Passed
+typos....................................................................Passed
+markdownlint-cli2........................................................Failed
+- hook id: markdownlint-cli2
+- files were modified by this hook
+
+markdownlint-cli2 v0.21.0 (markdownlint v0.40.0)
+Finding: design/superpowers/specs/agentcache-skills-design.md benchmarks/mori-formal/swe-cc-local-trace/traces/README.md docs/en/how-to/run-trace-replay.md design/module/benchmarking/index.md
+Linting: 4 file(s)
+Summary: 0 error(s)
+markdownlint-cli2 v0.21.0 (markdownlint v0.40.0)
+Finding: tests/agentbench/replay/README.md docs/en/reference/benchmark-cli.md design/superpowers/specs/agentcache-skills-batch2.md docs/zh/explanation/design-documents.md
+Linting: 4 file(s)
+Summary: 0 error(s)
+markdownlint-cli2 v0.21.0 (markdownlint v0.40.0)
+Finding: skills/ac-review/SKILL.md skills/ac-review/criteria/20-api.md docs/zh/how-to/deploy-semantic-router-on-windows.md skills/agentbench-investigate-regression/SKILL.md
+Linting: 4 file(s)
+Summary: 0 error(s)
+markdownlint-cli2 v0.21.0 (markdownlint v0.40.0)
+Finding: design/module/benchmarking/artifacts-and-evaluation.md skills/README.md docs/zh/reference/benchmark-config.md docs/zh/how-to/deploy-semantic-router.md
+Linting: 4 file(s)
+Summary: 0 error(s)
+markdownlint-cli2 v0.21.0 (markdownlint v0.40.0)
+Finding: tools/calibration/README.md design/module/scheduling/mori-paper-audit-20261028.zh-CN.md tests/e2e/perf/README.md skills/ac-benchmark/SKILL.md
+Linting: 4 file(s)
+Summary: 0 error(s)
+markdownlint-cli2 v0.21.0 (markdownlint v0.40.0)
+Finding: skills/ac-review/criteria/README.md agentinfer/agentrouter/README.md docs/en/tutorial/01-quick-start.md CONTRIBUTING.md
+Linting: 4 file(s)
+Summary: 0 error(s)
+markdownlint-cli2 v0.21.0 (markdownlint v0.40.0)
+Finding: docs/en/how-to/integrate-vllm.md design/module/scheduling/mori-redesign-20261028.zh-CN.md design/module/scheduling/mori-performance.md design/module/benchmarking/agent-runtime-adapters.md
+Linting: 4 file(s)
+Summary: 0 error(s)
+markdownlint-cli2 v0.21.0 (markdownlint v0.40.0)
+Finding: docs/zh/how-to/run-trace-replay.md docs/zh/reference/python-api.md docs/zh/how-to/deploy-vllm-router.md docs/zh/how-to/use-mori.md
+Linting: 4 file(s)
+Summary: 0 error(s)
+markdownlint-cli2 v0.21.0 (markdownlint v0.40.0)
+Finding: design/ci-ut-fixes.md design/module/scheduling/mori-implementation.zh-CN.md skills/ac-review/criteria/00-meta.md skills/ac-review/criteria/40-perf.md
+Linting: 4 file(s)
+Summary: 0 error(s)
+markdownlint-cli2 v0.21.0 (markdownlint v0.40.0)
+Finding: docs/en/reference/benchmark-config.md skills/ac-design/SKILL.md AGENTS.md skills/ac-integrate/SKILL.md
+Linting: 4 file(s)
+Summary: 0 error(s)
+markdownlint-cli2 v0.21.0 (markdownlint v0.40.0)
+Finding: design/superpowers/plans/agentcache-skills-implementation.md design/module/scheduling/vllm-runtime-integration.md design/module/benchmarking/benchkit-orchestration.md design/module/scheduling/program-state-machine.md
+Linting: 4 file(s)
+Summary: 0 error(s)
+markdownlint-cli2 v0.21.0 (markdownlint v0.40.0)
+Finding: tests/e2e/README.md design/README.md skills/ac-review/criteria/50-safety.md docs/zh/reference/benchmark-cli.md
+Linting: 4 file(s)
+Summary: 0 error(s)
+markdownlint-cli2 v0.21.0 (markdownlint v0.40.0)
+Finding: tests/e2e/function/tracereplay/README.md design/module/benchmarking/request-proxy-and-hints.md design/module/scheduling/agentinfer-serve-flag.md README.md
+Linting: 4 file(s)
+Summary: 0 error(s)
+markdownlint-cli2 v0.21.0 (markdownlint v0.40.0)
+Finding: skills/ac-review/criteria/80-architecture.md benchmarks/mori-formal/swe-cc-local-trace/README.md docs/zh/reference/inferrsi.md .github/PULL_REQUEST_TEMPLATE.md
+Linting: 4 file(s)
+Summary: 0 error(s)
+markdownlint-cli2 v0.21.0 (markdownlint v0.40.0)
+Finding: docs/zh/explanation/architecture.md skills/ac-review/criteria/90-observability.md docs/zh/tutorial/01-quick-start.md benchmarks/mori-formal/agentx/README.md
+Linting: 4 file(s)
+Summary: 0 error(s)
+markdownlint-cli2 v0.21.0 (markdownlint v0.40.0)
+Finding: docs/zh/how-to/deploy-vllm-router-on-windows.md design/module/scheduling/mori-slow-request-diagnostics.zh-CN.md benchmarks/mori-formal/swe-cc-local-trace/PROVENANCE.md agentinfer/agentbench/data/AGENTX_TRACES.md
+Linting: 4 file(s)
+Summary: 0 error(s)
+markdownlint-cli2 v0.21.0 (markdownlint v0.40.0)
+Finding: CHANGELOG.md design/module/scheduling/progress-ttl-scheduling.md agentinfer/agentbench/README.md skills/ac-review/criteria/_template.md
+Linting: 4 file(s)
+Summary: 0 error(s)
+markdownlint-cli2 v0.21.0 (markdownlint v0.40.0)
+Finding: README.zh.md docs/en/how-to/run-benchmark.md design/module/scheduling/mori-scheduling.md tests/README.md
+Linting: 4 file(s)
+Summary: 0 error(s)
+markdownlint-cli2 v0.21.0 (markdownlint v0.40.0)
+Finding: docs/en/reference/inferrsi.md docs/en/explanation/architecture.md skills/ac-review/criteria/70-regression.md docs/en/how-to/use-mori.md
+Linting: 4 file(s)
+Summary: 0 error(s)
+markdownlint-cli2 v0.21.0 (markdownlint v0.40.0)
+Finding: agentinfer/agentcache/patches/README.md docs/en/explanation/design-documents.md docs/en/reference/python-api.md design/module/scheduling/mori-state-refactor-20261028.zh-CN.md
+Linting: 4 file(s)
+Summary: 0 error(s)
+markdownlint-cli2 v0.21.0 (markdownlint v0.40.0)
+Finding: tests/agentbench/README.md tests/e2e/function/README.md docs/zh/explanation/benchmark-methodology.md agentinfer/agentrouter/agent_hint_affinity/README.md
+Linting: 4 file(s)
+Summary: 0 error(s)
+markdownlint-cli2 v0.21.0 (markdownlint v0.40.0)
+Finding: benchmarks/mori-formal/README.md docs/en/reference/run-artifacts.md skills/ac-review/criteria/30-testing.md design/ci-cd-quality-gate-setup-guide.md
+Linting: 4 file(s)
+Summary: 0 error(s)
+markdownlint-cli2 v0.21.0 (markdownlint v0.40.0)
+Finding: docs/zh/reference/run-artifacts.md design/module/scheduling/mori-relative-rebalance-20261028.zh-CN.md docs/zh/how-to/run-benchmark.md skills/ac-review/criteria/60-workflow.md
+Linting: 4 file(s)
+Summary: 0 error(s)
+markdownlint-cli2 v0.21.0 (markdownlint v0.40.0)
+Finding: docs/en/explanation/benchmark-methodology.md docs/README.md design/module/scheduling/mori-paper-alignment-20261028.zh-CN.md skills/ac-review/criteria/10-style.md
+Linting: 4 file(s)
+Summary: 0 error(s)
+markdownlint-cli2 v0.21.0 (markdownlint v0.40.0)
+Finding: docs/zh/how-to/integrate-vllm.md skills/ac-bootstrap/SKILL.md
+Linting: 2 file(s)
+Summary: 0 error(s)
+
+Suggestion...............................................................Passed
+- hook id: suggestion
+- duration: 0s
+
+To bypass all the pre-commit hooks, add --no-verify to git commit. To skip a specific hook, prefix the commit command with SKIP=<hook-id>.

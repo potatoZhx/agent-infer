@@ -76,6 +76,9 @@ class EmbeddedSchedulerController(Protocol[RetainedRequestT]):
     def needs_schedule_cycle(self, now_monotonic_s: float) -> bool:
         """Return whether this native poll needs AgentCache strategy work."""
 
+    def on_cache_pressure(self, now_monotonic_s: float) -> None:
+        """Request policy evaluation without forcing any placement transition."""
+
     def run_due_lightweight_checks(self, now_monotonic_s: float) -> None:
         """Apply due factor-only checks without entering a full scheduling cycle."""
 
@@ -240,6 +243,11 @@ class _VllmAdmissionHooks:
         """Run one AgentCache cycle and transfer admitted requests to native waiting."""
         self._drain_lifecycle_signals()
         now = time.monotonic()
+        if (
+            isinstance(getattr(self.controller, "strategy", None), MORIStrategy)
+            and MORI_RUNTIME_STATE.consume_hbm_pressure()
+        ):
+            self.controller.on_cache_pressure(now)
         self.controller.run_due_lightweight_checks(now)
         needs_cycle = self.controller.needs_schedule_cycle(now)
         if not needs_cycle and not self._prefix_refresh_pending:

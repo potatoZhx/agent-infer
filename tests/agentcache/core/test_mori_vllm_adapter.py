@@ -151,7 +151,7 @@ def test_full_adapter_installs_and_uninstalls_simple_cpu_provider() -> None:
 
     adapter = install_vllm_mori(owner, full)
     cpu_policy = adapter.cpu_policy
-    assert getattr(cpu_policy, "HOOK_API_VERSION", None) == 2
+    assert getattr(cpu_policy, "HOOK_API_VERSION", None) == 3
     adapter.close()
     adapter.close()
 

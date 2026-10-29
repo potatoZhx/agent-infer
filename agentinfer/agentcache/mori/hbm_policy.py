@@ -66,6 +66,7 @@ class MORIHBMPolicy:
         self.index.remove(block_id)
 
     def on_cache_reset(self) -> None:
+        self.runtime_state.consume_hbm_pressure()
         self.runtime_state.footprints.clear("gpu")
         self.index.clear()
 
@@ -75,8 +76,11 @@ class MORIHBMPolicy:
         self.runtime_state.unregister_index(self.index)
 
     def propose(self, count: int, protected_block_ids: Iterable[int] = ()) -> tuple[int, ...] | None:
-        """Return advice only; the native hook validates and performs eviction."""
-        return self.index.propose_exact(count, protected_block_ids)
+        """Plan one native allocation, recording BUSY pressure without performing eviction."""
+        proposed = self.index.propose_exact(count, protected_block_ids)
+        if proposed and any(self.index.cache_class(block) is CacheClass.BUSY for block in proposed):
+            self.runtime_state.report_hbm_pressure()
+        return proposed
 
     def _owners(self, request_ids: Iterable[str]) -> frozenset[ProgramRef]:
         return frozenset(
