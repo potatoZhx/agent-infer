@@ -1,0 +1,13 @@
+$ pre-commit run --files agentinfer/agentcache/core/controller.py agentinfer/scheduling/mori/config.py agentinfer/scheduling/mori/diagnostics.py agentinfer/scheduling/mori/strategy.py agentinfer/scheduling/request_diagnostics.py agentinfer/scheduling/runtime.py agentinfer/scheduling/strategy.py design/module/scheduling/artifacts/mori-diagnostics-20261029/overhead-validation.txt design/module/scheduling/artifacts/mori-diagnostics-20261029/overhead.json design/module/scheduling/artifacts/mori-diagnostics-20261029/pytest.txt design/module/scheduling/mori-slow-request-diagnostics.zh-CN.md tests/agentcache/core/test_mori_controller.py tests/scheduling/test_mori_diagnostics.py tests/scheduling/test_request_diagnostics.py tools/benchmark_mori_diagnostics.py
+ruff check...............................................................Passed
+ruff format..............................................................Passed
+typos....................................................................Passed
+markdownlint-cli2........................................................Passed
+Suggestion...............................................................Passed
+- hook id: suggestion
+- duration: 0s
+
+To bypass all the pre-commit hooks, add --no-verify to git commit. To skip a specific hook, prefix the commit command with SKIP=<hook-id>.
+
+
+exit_code=0

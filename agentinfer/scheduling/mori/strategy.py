@@ -17,7 +17,9 @@ from agentinfer.scheduling.events import SchedulingEvent, StrategyDiagnostic
 from agentinfer.scheduling.factors import StrategyFactors
 from agentinfer.scheduling.mori.capacity import CapacityClaim, CapacityLedger, FootprintProvider, ReliefProjection
 from agentinfer.scheduling.mori.config import MORIConfig, MORIMode
+from agentinfer.scheduling.mori.diagnostics import MORIDiagnosticState
 from agentinfer.scheduling.mori.factors import MORIGlobalFactors, MORIProgramFactors, MORITier
+from agentinfer.scheduling.request_diagnostics import RequestDiagnostics
 from agentinfer.scheduling.snapshot import SchedulingSnapshot
 from agentinfer.scheduling.strategy import SchedulingCycleOrder, SchedulingStrategy
 from agentinfer.scheduling.transitions import TransitionController, TransitionResult
@@ -43,6 +45,24 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         self._cache_class_epoch = 0
         self._observers: list[ProgramCacheClassObserver] = []
         self._footprints: FootprintProvider | None = None
+        self._slow_diagnostics = (
+            MORIDiagnosticState(self, config.slow_request_threshold_seconds)
+            if config.slow_request_threshold_seconds > 0
+            else None
+        )
+        self._request_diagnostics = (
+            RequestDiagnostics(
+                threshold_seconds=config.slow_request_threshold_seconds,
+                repeat_seconds=config.slow_request_repeat_seconds,
+                context_provider=self._slow_diagnostics.context,
+            )
+            if self._slow_diagnostics is not None
+            else None
+        )
+
+    def request_diagnostics(self) -> RequestDiagnostics | None:
+        """Return the one bounded lifecycle tracker, or None when disabled."""
+        return self._request_diagnostics
 
     @property
     def uses_request_branches(self) -> bool:
@@ -55,6 +75,8 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
 
     def on_context_replaced(self, program: ProgramRef) -> None:
         """Invalidate previous-prompt block proof and wake placement planning."""
+        if self._slow_diagnostics is not None:
+            self._slow_diagnostics.release(program)
         if self._footprints is not None:
             self._footprints.invalidate_footprint(program)
         if self._factors is not None:
@@ -148,6 +170,8 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         transitions: TransitionController,
         candidate: ProgramRef,
     ) -> AdmissionOutcome:
+        if self._slow_diagnostics is not None:
+            self._slow_diagnostics.observe(snapshot)
         started = time.thread_time()
         try:
             view = snapshot.program(candidate)
@@ -211,6 +235,8 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         strategy_factors: MORIFactors,
         transitions: TransitionController,
     ) -> None:
+        if self._slow_diagnostics is not None:
+            self._slow_diagnostics.observe(snapshot)
         started = time.thread_time()
         try:
             demoted = self._select_pending(snapshot, strategy_factors, transitions)
@@ -246,6 +272,19 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         quota = self._gpu_quota(snapshot)
         if gpu.used > quota:
             self.counters["promotion_blocked_capacity_debt"] += 1
+            if self._slow_diagnostics is not None:
+                for candidate in candidates:
+                    decision = self._slow_diagnostics.begin(
+                        candidate,
+                        snapshot,
+                        strategy_factors,
+                        gpu,
+                        None,
+                        rank=None,
+                        admitted_before=0,
+                    )
+                    if decision is not None:
+                        decision["reason"] = "global_capacity_debt"
             return ()
         now = snapshot.observed_at_monotonic_s
         candidates.sort(key=lambda p: self._promotion_key(p, strategy_factors, snapshot, now))
@@ -265,11 +304,21 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         removed = 0
         exchange_valid = True
         demoted = []
-        for candidate in candidates:
+        admitted_before = 0
+        for rank, candidate in enumerate(candidates):
             self.counters["planning_candidates"] += 1
             claim = self._claim(candidate, snapshot, gpu=True)
+            decision = (
+                self._slow_diagnostics.begin(
+                    candidate, snapshot, strategy_factors, gpu, claim, rank=rank, admitted_before=admitted_before
+                )
+                if self._slow_diagnostics is not None
+                else None
+            )
             if claim.tokens > quota:
                 self.counters["promotion_exceeds_total_quota"] += 1
+                if decision is not None:
+                    decision["reason"] = "claim_exceeds_total_quota"
                 continue
             if gpu.used + gpu.incremental(claim) > quota:
                 candidate_idle = self._idleness(self._factor(strategy_factors, candidate.ref), now)
@@ -278,8 +327,29 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                 if not has_reasoning and projection.required(eligible, claim) > quota:
                     eligible = len(victims)
                     reason = "mori_idle_gpu_progress"
+                if decision is not None:
+                    eligible_required = projection.required(eligible, claim)
+                    all_acting_required = projection.required(len(victims), claim)
+                    decision["relief"] = {
+                        "eligible_acting_prefix": eligible,
+                        "all_acting_count": len(victims),
+                        "already_removed_acting_count": removed,
+                        "required_after_eligible_tokens": eligible_required,
+                        "required_after_all_acting_tokens": all_acting_required,
+                        "has_gpu_reasoning": has_reasoning,
+                        "idle_gpu_progress_override": reason == "mori_idle_gpu_progress",
+                        "exchange_valid": exchange_valid,
+                    }
                 if not exchange_valid or projection.required(eligible, claim) > quota:
                     self.counters["promotion_no_fit"] += 1
+                    if decision is not None:
+                        decision["reason"] = (
+                            "exchange_invalid"
+                            if not exchange_valid
+                            else "idleness_limited"
+                            if all_acting_required <= quota
+                            else "no_all_acting_fit"
+                        )
                     continue
                 # Establish a feasible whole plan before evicting anything.
                 # Candidate/victim sharing makes individual claim sizes unsafe
@@ -306,6 +376,8 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                     if reason == "mori_idle_gpu_progress":
                         self.counters["idle_gpu_progress_demotions"] += 1
                 if gpu.used + gpu.incremental(claim) > quota:
+                    if decision is not None:
+                        decision["reason"] = "demotion_rejected"
                     continue
             result = (transitions.resume if candidate.step_count else transitions.admit)(
                 candidate.ref, reason="mori_cycle_promote", backend_id=snapshot.backend_id
@@ -316,6 +388,10 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                 cpu.remove(candidate.ref)
                 has_reasoning = True
                 self.counters["promotion_applied"] += 1
+                admitted_before += 1
+            if decision is not None:
+                decision["reason"] = "promotion_applied" if result.applied else "promotion_rejected"
+                decision["transition_reason"] = result.reason
         return tuple(demoted)
 
     def repair_capacity(
@@ -324,6 +400,8 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         strategy_factors: MORIFactors,
         transitions: TransitionController,
     ) -> None:
+        if self._slow_diagnostics is not None:
+            self._slow_diagnostics.observe(snapshot)
         started = time.thread_time()
         try:
             self._repair_cpu_capacity(snapshot, strategy_factors)
@@ -592,6 +670,8 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
     def on_program_released(self, strategy_factors: MORIFactors, event: SchedulingEvent) -> None:
         if event.program is None:
             return
+        if self._slow_diagnostics is not None:
+            self._slow_diagnostics.release(event.program)
         self._request_schedule(strategy_factors, event.occurred_at_monotonic_s)
         strategy_factors.remove_program_factors(event.program)
         self._classes.pop(event.program, None)

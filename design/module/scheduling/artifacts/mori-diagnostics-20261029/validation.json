@@ -1,0 +1,53 @@
+{
+  "base_commit": "6ecf627d06f609840ad02dbaf47232c9a41ed9f6",
+  "pytest_command": "PYTHONDONTWRITEBYTECODE=1 /data/zx-envs/agentinfer-vllm-0.31.0/bin/python -m pytest -q -p no:cacheprovider tests/scheduling tests/agentcache -m cpu_test",
+  "pytest_exit_code": 0,
+  "pytest_result": {
+    "passed": 581,
+    "skipped": 23,
+    "deselected": 26
+  },
+  "skip_reason": "23 native patch tests require MORI_VLLM_SOURCE pointing at a clean vLLM v0.31.0 source tree; native patches are unchanged.",
+  "skip_source": "tests/agentcache/test_mori_native_patch.py:24-27",
+  "deselection": "GPU and non-CPU tests excluded by -m cpu_test.",
+  "overhead_command": "/data/zx-envs/agentinfer-vllm-0.31.0/bin/python -m tools.benchmark_mori_diagnostics --output-dir design/module/scheduling/artifacts/mori-diagnostics-20261029 --repeats 7 --lifecycle-count 2000 --callback-count 100000 --cycle-count 500 --pending-count 4096",
+  "overhead_exit_code": 0,
+  "overhead_passed": true,
+  "measured_sources_still_match": true,
+  "precommit_exit_code": 0,
+  "precommit_evidence": "pre-commit.txt",
+  "not_run": [
+    "32/16 and 16/8 GPU end-to-end workload reruns; CPU timing is not a GPU throughput claim."
+  ],
+  "raw_logs_sha256": {
+    "production-slow-256-disabled-0.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "production-slow-256-disabled-1.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "production-slow-256-disabled-2.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "production-slow-256-disabled-3.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "production-slow-256-disabled-4.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "production-slow-256-disabled-5.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "production-slow-256-disabled-6.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "production-slow-256-enabled-0.log": "c3bc86a72779190a318d2c3b95c87718ec81d6b644efee4cf9c3ac879469ffcb",
+    "production-slow-256-enabled-1.log": "c3bc86a72779190a318d2c3b95c87718ec81d6b644efee4cf9c3ac879469ffcb",
+    "production-slow-256-enabled-2.log": "c3bc86a72779190a318d2c3b95c87718ec81d6b644efee4cf9c3ac879469ffcb",
+    "production-slow-256-enabled-3.log": "c3bc86a72779190a318d2c3b95c87718ec81d6b644efee4cf9c3ac879469ffcb",
+    "production-slow-256-enabled-4.log": "c3bc86a72779190a318d2c3b95c87718ec81d6b644efee4cf9c3ac879469ffcb",
+    "production-slow-256-enabled-5.log": "c3bc86a72779190a318d2c3b95c87718ec81d6b644efee4cf9c3ac879469ffcb",
+    "production-slow-256-enabled-6.log": "c3bc86a72779190a318d2c3b95c87718ec81d6b644efee4cf9c3ac879469ffcb",
+    "production-slow-32-disabled-0.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "production-slow-32-disabled-1.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "production-slow-32-disabled-2.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "production-slow-32-disabled-3.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "production-slow-32-disabled-4.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "production-slow-32-disabled-5.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "production-slow-32-disabled-6.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "production-slow-32-enabled-0.log": "f83741f60f2029e82965d613f5242f7279cd81ebff5dbd29ba78930d650531d2",
+    "production-slow-32-enabled-1.log": "f83741f60f2029e82965d613f5242f7279cd81ebff5dbd29ba78930d650531d2",
+    "production-slow-32-enabled-2.log": "f83741f60f2029e82965d613f5242f7279cd81ebff5dbd29ba78930d650531d2",
+    "production-slow-32-enabled-3.log": "f83741f60f2029e82965d613f5242f7279cd81ebff5dbd29ba78930d650531d2",
+    "production-slow-32-enabled-4.log": "f83741f60f2029e82965d613f5242f7279cd81ebff5dbd29ba78930d650531d2",
+    "production-slow-32-enabled-5.log": "f83741f60f2029e82965d613f5242f7279cd81ebff5dbd29ba78930d650531d2",
+    "production-slow-32-enabled-6.log": "f83741f60f2029e82965d613f5242f7279cd81ebff5dbd29ba78930d650531d2",
+    "slow-burst.log": "af61947c43287561aa9d759f04ae7536dda30f69dfc7aa2e1259540d38bedd08"
+  }
+}

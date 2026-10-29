@@ -8,7 +8,7 @@ import pytest
 
 from agentinfer.agentcache.core.controller import build_controller, build_mori_controller
 from agentinfer.scheduling.backend import BackendInfo, BackendPoolInfo, DpRankInfo
-from agentinfer.scheduling.mori import MORIMode, MORIStrategy
+from agentinfer.scheduling.mori import MORIConfig, MORIMode, MORIStrategy
 
 pytestmark = pytest.mark.cpu_test
 
@@ -62,6 +62,37 @@ def test_placement_only_is_an_explicit_ablation_without_dram() -> None:
 def test_decode_buffer_cannot_be_overridden() -> None:
     with pytest.raises(ValueError, match="fixed implementation"):
         build_mori_controller(backend(), {"mori": {"decode_buffer_tokens": 999}})
+
+
+def test_slow_request_diagnostics_default_and_explicit_settings() -> None:
+    default = build_mori_controller(backend(), {})
+    tracker = default.strategy.request_diagnostics()
+    assert tracker is not None
+    assert tracker.threshold_seconds == 30.0
+    assert tracker.repeat_seconds == 60.0
+    configured = build_mori_controller(
+        backend(), {"mori": {"slow_request_threshold_seconds": 15.0, "slow_request_repeat_seconds": 90.0}}
+    )
+    tracker = configured.strategy.request_diagnostics()
+    assert tracker is not None
+    assert tracker.threshold_seconds == 15.0
+    assert tracker.repeat_seconds == 90.0
+    disabled = build_mori_controller(backend(), {"mori": {"slow_request_threshold_seconds": 0}})
+    assert disabled.strategy.request_diagnostics() is None
+
+
+@pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf"), True])
+@pytest.mark.parametrize("setting", ["slow_request_threshold_seconds", "slow_request_repeat_seconds"])
+def test_invalid_slow_request_settings_fail_early(setting: str, value: float) -> None:
+    with pytest.raises(ValueError):
+        build_mori_controller(backend(), {"mori": {setting: value}})
+    with pytest.raises(ValueError):
+        MORIConfig(**{setting: value})
+
+
+def test_zero_repeat_interval_is_rejected() -> None:
+    with pytest.raises(ValueError, match="slow_request_repeat_seconds"):
+        build_mori_controller(backend(), {"mori": {"slow_request_repeat_seconds": 0}})
 
 
 @pytest.mark.parametrize(

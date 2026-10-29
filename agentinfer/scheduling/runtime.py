@@ -87,6 +87,7 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
             raise ValueError("schedule_interval_seconds must be finite and positive")
         self.strategy = strategy
         self.strategy_factors = strategy_factors
+        self._request_diagnostics = strategy.request_diagnostics()
         self.backend_pool_info = backend_pool_info
         self._dispatch_target = DispatchTarget(backend.backend_id, dp_rank.dp_rank)
         self.request_pool: RequestPool[RetainedRequestT] = RequestPool()
@@ -227,6 +228,10 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
             track_segment_share,
         )
         self._program_requests.setdefault(program.ref, set()).add(request_id)
+        if self._request_diagnostics is not None:
+            self._request_diagnostics.arrive(
+                request_id, program.ref, now, external_program_id=external_id, prompt_tokens=max(0, prompt_tokens)
+            )
         self.request_pool.add(
             RequestPoolEntry(
                 request_id=request_id,
@@ -286,6 +291,8 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
         self._replace_backend_info(backend_pool_info)
         now = time.monotonic()
         if not self.needs_schedule_cycle(now):
+            if self._request_diagnostics is not None:
+                self._request_diagnostics.poll(now)
             return
         controller = TransitionController(self._apply_transition)
         snapshot = self._snapshot()
@@ -307,6 +314,9 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
         self._next_check_at_monotonic_s = self._strategy_next_check_at()
         self._next_lightweight_check_at_monotonic_s = self.strategy.next_lightweight_check_at(self.strategy_factors)
 
+        if self._request_diagnostics is not None:
+            self._request_diagnostics.poll(now)
+
     def consume_admitted_requests(
         self,
     ) -> tuple[tuple[RequestPoolEntry[RetainedRequestT], DispatchTarget], ...]:
@@ -320,7 +330,10 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
         """Record RequestPool residence before handing one request to the host engine."""
         binding = self._request_bindings.get(request_id)
         if binding is not None and binding.scheduler_queue_seconds is None:
-            binding.scheduler_queue_seconds = max(0.0, time.monotonic() - arrived_at_monotonic_s)
+            now = time.monotonic()
+            binding.scheduler_queue_seconds = max(0.0, now - arrived_at_monotonic_s)
+            if self._request_diagnostics is not None:
+                self._request_diagnostics.admitted(request_id, now)
 
     def on_stream_output(self, request_id: str, total_output_tokens: int) -> None:
         """Update request progress without changing Program reasoning status."""
@@ -328,6 +341,8 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
         if binding is not None:
             if total_output_tokens > 0 and binding.first_output_at_monotonic_s is None:
                 binding.first_output_at_monotonic_s = time.monotonic()
+                if self._request_diagnostics is not None:
+                    self._request_diagnostics.first_output(request_id, binding.first_output_at_monotonic_s)
             previous_output = binding.output_tokens
             binding.output_tokens = max(binding.output_tokens, max(0, total_output_tokens))
             if self.strategy.observes_streaming_context_growth and binding.output_tokens > previous_output:
@@ -357,9 +372,10 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
     def on_native_execution(self, request_id: str, *, running: bool) -> None:
         binding = self._request_bindings.get(request_id)
         if binding is not None:
-            self.strategy.on_execution_changed(
-                self.strategy_factors, binding.program, time.monotonic(), running=running
-            )
+            now = time.monotonic()
+            self.strategy.on_execution_changed(self.strategy_factors, binding.program, now, running=running)
+            if self._request_diagnostics is not None:
+                self._request_diagnostics.native_execution(request_id, now, running=running)
 
     def program_ref_for_request(self, request_id: str) -> ProgramRef | None:
         """Return the exact Program generation bound to one live request attempt."""
@@ -385,6 +401,16 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
         if binding is None:
             return
         cached = min(binding.prompt_tokens, max(0, cached_prefix_tokens))
+        if self._request_diagnostics is not None:
+            self._request_diagnostics.cache_observation(
+                request_id,
+                cached_prefix_tokens=cached,
+                hbm_cached_prefix_tokens=(
+                    min(binding.prompt_tokens, max(0, hbm_cached_prefix_tokens))
+                    if hbm_cached_prefix_tokens is not None
+                    else None
+                ),
+            )
         shared = min(cached, max(0, shared_prefix_tokens)) if shared_prefix_tokens is not None else None
         if shared is not None:
             binding.cached_prefix_tokens = cached
@@ -437,11 +463,13 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
         binding = self._pop_binding(request_id)
         if binding is None:
             return
+        now = time.monotonic()
+        if self._request_diagnostics is not None:
+            self._request_diagnostics.finish(request_id, now)
         self._cycle_dirty = True
         program = self.registry.get(binding.program)
         if program is None:
             return
-        now = time.monotonic()
         self._last_request_finished_at[binding.program] = now
         previous_status = self.registry.record_completion(binding.program, total_tokens=max(0, total_tokens))
         current_status = ProgramStatus.REASONING if self._has_current_request(binding.program) else ProgramStatus.ACTING
@@ -611,6 +639,8 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
         """
         entry = self.request_pool.cancel(request_id)
         binding = self._pop_binding(request_id)
+        if self._request_diagnostics is not None:
+            self._request_diagnostics.finish(request_id, time.monotonic(), outcome="cancelled")
         if entry is not None or binding is not None:
             self._cycle_dirty = True
         if binding is not None:
@@ -708,6 +738,8 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
                 self.registry.retire(program.ref, lifecycle_token=self._latest_lifecycle_tokens.get(program.ref))
             else:
                 self.registry.release(program.ref)
+            if self._request_diagnostics is not None:
+                self._request_diagnostics.release(program.ref, time.monotonic())
             self._set_lifecycle_token(program.ref, None)
             self._request_branches.release(program.ref)
             self._last_request_finished_at.pop(program.ref, None)

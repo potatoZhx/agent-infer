@@ -25,6 +25,7 @@ from agentinfer.scheduling.admission_outcome import AdmissionOutcome
 from agentinfer.scheduling.domain import ProgramRef, ProgramView
 from agentinfer.scheduling.events import SchedulingEvent, SchedulingEventKind, StrategyDiagnostic
 from agentinfer.scheduling.factors import StrategyFactors, StrategyGlobalFactorsT, StrategyProgramFactorsT
+from agentinfer.scheduling.request_diagnostics import RequestDiagnostics
 from agentinfer.scheduling.snapshot import SchedulingSnapshot
 from agentinfer.scheduling.transitions import TransitionController
 
@@ -63,6 +64,10 @@ class SchedulingStrategy(Generic[StrategyGlobalFactorsT, StrategyProgramFactorsT
     def uses_request_branches(self) -> bool:
         """Isolate overlapping requests into server-owned scheduling branches."""
         return False
+
+    def request_diagnostics(self) -> RequestDiagnostics | None:
+        """Optionally provide bounded slow-request tracking independent of debug logs."""
+        return None
 
     def on_context_replaced(self, program: ProgramRef) -> None:
         """Invalidate optional cache-footprint evidence when a new prompt becomes current."""

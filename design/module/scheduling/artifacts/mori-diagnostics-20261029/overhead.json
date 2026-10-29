@@ -1,0 +1,1156 @@
+{
+  "scope": "CPU callback overhead only; no GPU/end-to-end throughput benchmark was run.",
+  "clock": "time.thread_time_ns (per-thread CPU); perf_counter_ns also recorded",
+  "command": "/data/zx-envs/agentinfer-vllm-0.31.0/bin/python -m tools.benchmark_mori_diagnostics --output-dir design/module/scheduling/artifacts/mori-diagnostics-20261029 --repeats 7 --lifecycle-count 2000 --callback-count 100000 --cycle-count 500 --pending-count 4096",
+  "python": "3.12.13 (main, Mar  4 2026, 09:23:07) [GCC 11.4.0]",
+  "platform": "Linux-5.10.134-16.103.al8.x86_64-x86_64-with-glibc2.35",
+  "source_sha256": {
+    "/data/zx/agent-kvc/.worktrees/mori/tools/benchmark_mori_diagnostics.py": "a939d557d987343bd9927dbb6c7e10adbd740df0f4e34968e2af72076bb5a1d1",
+    "agentinfer/scheduling/request_diagnostics.py": "d95867bb1d2d75f4e9b1a066416613b4ca3ecced7a1c3a54df4dca87ad5ce612",
+    "agentinfer/scheduling/runtime.py": "a64e66b351535c35001395f52918ab0c0a3f2fb42272ab5b23192f35a2dd1a8d",
+    "agentinfer/scheduling/mori/strategy.py": "b10d724b399e48fab1f24fa457e184d0b97eaed004f03540c49900c7673ed9dd",
+    "agentinfer/scheduling/mori/config.py": "800812d3f10c56a9d6049d066d185d5331bc9a13648fdb471e0546f92ed0c19b",
+    "agentinfer/scheduling/mori/diagnostics.py": "199b41fd830c5b8ec887fb81965274562aed51b713ca6d84d51eeb1cc7eb5fbd"
+  },
+  "budget_rationale": "Absolute incremental budget: 10 us per request lifecycle, 1 us per hot callback, 20 us per real plan; slow diagnostics at most eight rows/poll and median CPU below 5 ms per five-second poll; terminal summaries are outside that poll cap and budgeted at 200 us CPU per request. These are engineering acceptance budgets, not GPU performance claims.",
+  "fast_paths": {
+    "request_lifecycle": {
+      "operation_count_per_sample": 2000,
+      "disabled_median_thread_cpu_ns_per_operation": 120353.3735,
+      "enabled_median_thread_cpu_ns_per_operation": 123379.7745,
+      "median_paired_added_thread_cpu_ns_per_operation": 4502.039000000004,
+      "added_cpu_budget_ns_per_operation": 10000,
+      "passed": true,
+      "samples": [
+        {
+          "repeat": 0,
+          "disabled": {
+            "thread_cpu_ns_per_operation": 120944.6255,
+            "wall_ns_per_operation": 121595.6515,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "enabled": {
+            "thread_cpu_ns_per_operation": 124227.7715,
+            "wall_ns_per_operation": 125747.523,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": 3283.146000000008
+        },
+        {
+          "repeat": 1,
+          "enabled": {
+            "thread_cpu_ns_per_operation": 123023.2735,
+            "wall_ns_per_operation": 123620.025,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "disabled": {
+            "thread_cpu_ns_per_operation": 118963.562,
+            "wall_ns_per_operation": 121581.064,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": 4059.7114999999903
+        },
+        {
+          "repeat": 2,
+          "disabled": {
+            "thread_cpu_ns_per_operation": 118790.0695,
+            "wall_ns_per_operation": 119468.984,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "enabled": {
+            "thread_cpu_ns_per_operation": 123379.7745,
+            "wall_ns_per_operation": 124068.132,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": 4589.705000000002
+        },
+        {
+          "repeat": 3,
+          "enabled": {
+            "thread_cpu_ns_per_operation": 122680.2315,
+            "wall_ns_per_operation": 123578.0995,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "disabled": {
+            "thread_cpu_ns_per_operation": 120353.3735,
+            "wall_ns_per_operation": 121023.7595,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": 2326.857999999993
+        },
+        {
+          "repeat": 4,
+          "disabled": {
+            "thread_cpu_ns_per_operation": 121367.605,
+            "wall_ns_per_operation": 122003.1255,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "enabled": {
+            "thread_cpu_ns_per_operation": 125869.644,
+            "wall_ns_per_operation": 126497.698,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": 4502.039000000004
+        },
+        {
+          "repeat": 5,
+          "enabled": {
+            "thread_cpu_ns_per_operation": 125537.617,
+            "wall_ns_per_operation": 128677.0165,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "disabled": {
+            "thread_cpu_ns_per_operation": 120990.316,
+            "wall_ns_per_operation": 125910.1355,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": 4547.300999999992
+        },
+        {
+          "repeat": 6,
+          "disabled": {
+            "thread_cpu_ns_per_operation": 116364.9475,
+            "wall_ns_per_operation": 118488.52,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "enabled": {
+            "thread_cpu_ns_per_operation": 121059.874,
+            "wall_ns_per_operation": 122119.813,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": 4694.926500000001
+        }
+      ]
+    },
+    "native_before_first_output": {
+      "operation_count_per_sample": 100000,
+      "disabled_median_thread_cpu_ns_per_operation": 816.64336,
+      "enabled_median_thread_cpu_ns_per_operation": 934.4521,
+      "median_paired_added_thread_cpu_ns_per_operation": 117.80873999999994,
+      "added_cpu_budget_ns_per_operation": 1000,
+      "passed": true,
+      "samples": [
+        {
+          "repeat": 0,
+          "disabled": {
+            "thread_cpu_ns_per_operation": 815.56244,
+            "wall_ns_per_operation": 820.41296,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "enabled": {
+            "thread_cpu_ns_per_operation": 942.2635,
+            "wall_ns_per_operation": 946.92375,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": 126.70105999999998
+        },
+        {
+          "repeat": 1,
+          "enabled": {
+            "thread_cpu_ns_per_operation": 934.4521,
+            "wall_ns_per_operation": 939.16448,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "disabled": {
+            "thread_cpu_ns_per_operation": 816.64336,
+            "wall_ns_per_operation": 820.60784,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": 117.80873999999994
+        },
+        {
+          "repeat": 2,
+          "disabled": {
+            "thread_cpu_ns_per_operation": 815.57061,
+            "wall_ns_per_operation": 827.41881,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "enabled": {
+            "thread_cpu_ns_per_operation": 929.56228,
+            "wall_ns_per_operation": 936.75658,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": 113.99167
+        },
+        {
+          "repeat": 3,
+          "enabled": {
+            "thread_cpu_ns_per_operation": 920.20486,
+            "wall_ns_per_operation": 924.5942,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "disabled": {
+            "thread_cpu_ns_per_operation": 867.52734,
+            "wall_ns_per_operation": 871.86471,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": 52.67752000000007
+        },
+        {
+          "repeat": 4,
+          "disabled": {
+            "thread_cpu_ns_per_operation": 810.37044,
+            "wall_ns_per_operation": 814.26647,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "enabled": {
+            "thread_cpu_ns_per_operation": 952.06482,
+            "wall_ns_per_operation": 956.456,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": 141.69438000000002
+        },
+        {
+          "repeat": 5,
+          "enabled": {
+            "thread_cpu_ns_per_operation": 990.48462,
+            "wall_ns_per_operation": 997.12321,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "disabled": {
+            "thread_cpu_ns_per_operation": 861.6086,
+            "wall_ns_per_operation": 866.02391,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": 128.87601999999993
+        },
+        {
+          "repeat": 6,
+          "disabled": {
+            "thread_cpu_ns_per_operation": 819.26854,
+            "wall_ns_per_operation": 823.65945,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "enabled": {
+            "thread_cpu_ns_per_operation": 920.36216,
+            "wall_ns_per_operation": 925.85313,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": 101.09361999999999
+        }
+      ]
+    },
+    "native_after_first_output": {
+      "operation_count_per_sample": 100000,
+      "disabled_median_thread_cpu_ns_per_operation": 812.97392,
+      "enabled_median_thread_cpu_ns_per_operation": 922.71586,
+      "median_paired_added_thread_cpu_ns_per_operation": 108.27089999999998,
+      "added_cpu_budget_ns_per_operation": 1000,
+      "passed": true,
+      "samples": [
+        {
+          "repeat": 0,
+          "disabled": {
+            "thread_cpu_ns_per_operation": 809.16414,
+            "wall_ns_per_operation": 814.46533,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "enabled": {
+            "thread_cpu_ns_per_operation": 920.62741,
+            "wall_ns_per_operation": 926.16343,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": 111.46327000000008
+        },
+        {
+          "repeat": 1,
+          "enabled": {
+            "thread_cpu_ns_per_operation": 1030.33128,
+            "wall_ns_per_operation": 1036.77789,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "disabled": {
+            "thread_cpu_ns_per_operation": 943.47975,
+            "wall_ns_per_operation": 952.31864,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": 86.85153000000014
+        },
+        {
+          "repeat": 2,
+          "disabled": {
+            "thread_cpu_ns_per_operation": 812.97392,
+            "wall_ns_per_operation": 817.00684,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "enabled": {
+            "thread_cpu_ns_per_operation": 938.05447,
+            "wall_ns_per_operation": 942.84125,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": 125.08055000000002
+        },
+        {
+          "repeat": 3,
+          "enabled": {
+            "thread_cpu_ns_per_operation": 938.33227,
+            "wall_ns_per_operation": 944.52611,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "disabled": {
+            "thread_cpu_ns_per_operation": 809.0311,
+            "wall_ns_per_operation": 813.80172,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": 129.30116999999996
+        },
+        {
+          "repeat": 4,
+          "disabled": {
+            "thread_cpu_ns_per_operation": 814.60018,
+            "wall_ns_per_operation": 819.54871,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "enabled": {
+            "thread_cpu_ns_per_operation": 918.41834,
+            "wall_ns_per_operation": 925.58939,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": 103.81815999999992
+        },
+        {
+          "repeat": 5,
+          "enabled": {
+            "thread_cpu_ns_per_operation": 922.71586,
+            "wall_ns_per_operation": 927.27405,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "disabled": {
+            "thread_cpu_ns_per_operation": 815.36236,
+            "wall_ns_per_operation": 820.98859,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": 107.35350000000005
+        },
+        {
+          "repeat": 6,
+          "disabled": {
+            "thread_cpu_ns_per_operation": 811.87525,
+            "wall_ns_per_operation": 816.32206,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "enabled": {
+            "thread_cpu_ns_per_operation": 920.14615,
+            "wall_ns_per_operation": 924.45545,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": 108.27089999999998
+        }
+      ]
+    },
+    "stream_output": {
+      "operation_count_per_sample": 100000,
+      "disabled_median_thread_cpu_ns_per_operation": 4721.67205,
+      "enabled_median_thread_cpu_ns_per_operation": 4677.64526,
+      "median_paired_added_thread_cpu_ns_per_operation": -35.86745999999948,
+      "added_cpu_budget_ns_per_operation": 1000,
+      "passed": true,
+      "samples": [
+        {
+          "repeat": 0,
+          "disabled": {
+            "thread_cpu_ns_per_operation": 5477.77095,
+            "wall_ns_per_operation": 5523.90591,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "enabled": {
+            "thread_cpu_ns_per_operation": 5603.13123,
+            "wall_ns_per_operation": 5660.9091,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": 125.36027999999988
+        },
+        {
+          "repeat": 1,
+          "enabled": {
+            "thread_cpu_ns_per_operation": 4636.87088,
+            "wall_ns_per_operation": 4691.01728,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "disabled": {
+            "thread_cpu_ns_per_operation": 4672.73834,
+            "wall_ns_per_operation": 4695.47595,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": -35.86745999999948
+        },
+        {
+          "repeat": 2,
+          "disabled": {
+            "thread_cpu_ns_per_operation": 4658.10462,
+            "wall_ns_per_operation": 4680.61692,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "enabled": {
+            "thread_cpu_ns_per_operation": 4677.64526,
+            "wall_ns_per_operation": 4698.61636,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": 19.540640000000167
+        },
+        {
+          "repeat": 3,
+          "enabled": {
+            "thread_cpu_ns_per_operation": 4604.48523,
+            "wall_ns_per_operation": 4633.44058,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "disabled": {
+            "thread_cpu_ns_per_operation": 4721.67205,
+            "wall_ns_per_operation": 4749.59773,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": -117.1868199999999
+        },
+        {
+          "repeat": 4,
+          "disabled": {
+            "thread_cpu_ns_per_operation": 4739.8758,
+            "wall_ns_per_operation": 4761.93173,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "enabled": {
+            "thread_cpu_ns_per_operation": 4624.71944,
+            "wall_ns_per_operation": 4647.6223,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": -115.15635999999995
+        },
+        {
+          "repeat": 5,
+          "enabled": {
+            "thread_cpu_ns_per_operation": 4781.0509,
+            "wall_ns_per_operation": 4808.15424,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "disabled": {
+            "thread_cpu_ns_per_operation": 4655.43389,
+            "wall_ns_per_operation": 4680.44474,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": 125.61700999999994
+        },
+        {
+          "repeat": 6,
+          "disabled": {
+            "thread_cpu_ns_per_operation": 5014.70419,
+            "wall_ns_per_operation": 5040.57154,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "enabled": {
+            "thread_cpu_ns_per_operation": 4831.3914,
+            "wall_ns_per_operation": 4870.9488,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": -183.31278999999995
+        }
+      ]
+    },
+    "schedule_cycle_16_requests": {
+      "operation_count_per_sample": 500,
+      "disabled_median_thread_cpu_ns_per_operation": 147051.652,
+      "enabled_median_thread_cpu_ns_per_operation": 143163.02,
+      "median_paired_added_thread_cpu_ns_per_operation": 964.570000000007,
+      "added_cpu_budget_ns_per_operation": 20000,
+      "passed": true,
+      "samples": [
+        {
+          "repeat": 0,
+          "disabled": {
+            "thread_cpu_ns_per_operation": 140619.63,
+            "wall_ns_per_operation": 141321.296,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "enabled": {
+            "thread_cpu_ns_per_operation": 143163.02,
+            "wall_ns_per_operation": 143715.892,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": 2543.389999999985
+        },
+        {
+          "repeat": 1,
+          "enabled": {
+            "thread_cpu_ns_per_operation": 141535.526,
+            "wall_ns_per_operation": 142831.06,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "disabled": {
+            "thread_cpu_ns_per_operation": 142175.27,
+            "wall_ns_per_operation": 143933.806,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": -639.743999999977
+        },
+        {
+          "repeat": 2,
+          "disabled": {
+            "thread_cpu_ns_per_operation": 140617.88,
+            "wall_ns_per_operation": 141241.094,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "enabled": {
+            "thread_cpu_ns_per_operation": 145135.092,
+            "wall_ns_per_operation": 146872.456,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": 4517.2119999999995
+        },
+        {
+          "repeat": 3,
+          "enabled": {
+            "thread_cpu_ns_per_operation": 141396.716,
+            "wall_ns_per_operation": 142153.214,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "disabled": {
+            "thread_cpu_ns_per_operation": 173740.982,
+            "wall_ns_per_operation": 174723.822,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": -32344.266000000003
+        },
+        {
+          "repeat": 4,
+          "disabled": {
+            "thread_cpu_ns_per_operation": 155895.734,
+            "wall_ns_per_operation": 156853.464,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "enabled": {
+            "thread_cpu_ns_per_operation": 140183.224,
+            "wall_ns_per_operation": 140825.98,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": -15712.51000000001
+        },
+        {
+          "repeat": 5,
+          "enabled": {
+            "thread_cpu_ns_per_operation": 148395.862,
+            "wall_ns_per_operation": 149917.374,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "disabled": {
+            "thread_cpu_ns_per_operation": 147431.292,
+            "wall_ns_per_operation": 148201.32,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": 964.570000000007
+        },
+        {
+          "repeat": 6,
+          "disabled": {
+            "thread_cpu_ns_per_operation": 147051.652,
+            "wall_ns_per_operation": 147782.39,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "enabled": {
+            "thread_cpu_ns_per_operation": 150805.73,
+            "wall_ns_per_operation": 151999.54,
+            "log_rows_during_timed_fast_path": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_operation": 3754.0780000000086
+        }
+      ]
+    }
+  },
+  "slow_burst": {
+    "context_scope": "small synthetic context provider; actual production context measured separately",
+    "pending_requests": 4096,
+    "polls": 32,
+    "max_events_per_poll": 8,
+    "poll_median_thread_cpu_us": 253.5145,
+    "poll_max_thread_cpu_us": 828.257,
+    "poll_cpu_budget_us": 5000,
+    "poll_log_rows": 256,
+    "all_log_rows_including_cleanup": 4352,
+    "log_bytes": 3197284,
+    "log_sample_artifact": "design/module/scheduling/artifacts/mori-diagnostics-20261029/slow-burst.log",
+    "log_sample_selection": "first 16 and last 4 rows; all rows if at most 20",
+    "log_sample_rows": 20,
+    "terminal_summaries_share_poll_cap": false,
+    "terminal_summary_rows": 4096,
+    "terminal_burst_thread_cpu_ms": 97.398587,
+    "terminal_burst_wall_ms": 98.105276,
+    "terminal_cpu_budget_us_per_request": 200,
+    "context_provider_calls": 4352,
+    "cleanup_thread_cpu_ns_per_request": 23778.951904296875,
+    "active_diagnostics_after_cleanup": 0,
+    "passed": true,
+    "samples": [
+      {
+        "thread_cpu_ns_per_operation": 828257.0,
+        "wall_ns_per_operation": 830168.0,
+        "new_log_rows": 8
+      },
+      {
+        "thread_cpu_ns_per_operation": 457437.0,
+        "wall_ns_per_operation": 663859.0,
+        "new_log_rows": 8
+      },
+      {
+        "thread_cpu_ns_per_operation": 238961.0,
+        "wall_ns_per_operation": 437696.0,
+        "new_log_rows": 8
+      },
+      {
+        "thread_cpu_ns_per_operation": 288001.0,
+        "wall_ns_per_operation": 512087.0,
+        "new_log_rows": 8
+      },
+      {
+        "thread_cpu_ns_per_operation": 235256.0,
+        "wall_ns_per_operation": 490657.0,
+        "new_log_rows": 8
+      },
+      {
+        "thread_cpu_ns_per_operation": 219601.0,
+        "wall_ns_per_operation": 456721.0,
+        "new_log_rows": 8
+      },
+      {
+        "thread_cpu_ns_per_operation": 219301.0,
+        "wall_ns_per_operation": 431862.0,
+        "new_log_rows": 8
+      },
+      {
+        "thread_cpu_ns_per_operation": 241266.0,
+        "wall_ns_per_operation": 435332.0,
+        "new_log_rows": 8
+      },
+      {
+        "thread_cpu_ns_per_operation": 222806.0,
+        "wall_ns_per_operation": 615262.0,
+        "new_log_rows": 8
+      },
+      {
+        "thread_cpu_ns_per_operation": 410418.0,
+        "wall_ns_per_operation": 620158.0,
+        "new_log_rows": 8
+      },
+      {
+        "thread_cpu_ns_per_operation": 380996.0,
+        "wall_ns_per_operation": 593182.0,
+        "new_log_rows": 8
+      },
+      {
+        "thread_cpu_ns_per_operation": 260943.0,
+        "wall_ns_per_operation": 469515.0,
+        "new_log_rows": 8
+      },
+      {
+        "thread_cpu_ns_per_operation": 229591.0,
+        "wall_ns_per_operation": 427062.0,
+        "new_log_rows": 8
+      },
+      {
+        "thread_cpu_ns_per_operation": 219291.0,
+        "wall_ns_per_operation": 396672.0,
+        "new_log_rows": 8
+      },
+      {
+        "thread_cpu_ns_per_operation": 222398.0,
+        "wall_ns_per_operation": 401471.0,
+        "new_log_rows": 8
+      },
+      {
+        "thread_cpu_ns_per_operation": 226838.0,
+        "wall_ns_per_operation": 480815.0,
+        "new_log_rows": 8
+      },
+      {
+        "thread_cpu_ns_per_operation": 275981.0,
+        "wall_ns_per_operation": 526064.0,
+        "new_log_rows": 8
+      },
+      {
+        "thread_cpu_ns_per_operation": 211203.0,
+        "wall_ns_per_operation": 392001.0,
+        "new_log_rows": 8
+      },
+      {
+        "thread_cpu_ns_per_operation": 367849.0,
+        "wall_ns_per_operation": 576819.0,
+        "new_log_rows": 8
+      },
+      {
+        "thread_cpu_ns_per_operation": 246086.0,
+        "wall_ns_per_operation": 448317.0,
+        "new_log_rows": 8
+      },
+      {
+        "thread_cpu_ns_per_operation": 223383.0,
+        "wall_ns_per_operation": 446219.0,
+        "new_log_rows": 8
+      },
+      {
+        "thread_cpu_ns_per_operation": 230674.0,
+        "wall_ns_per_operation": 413358.0,
+        "new_log_rows": 8
+      },
+      {
+        "thread_cpu_ns_per_operation": 410114.0,
+        "wall_ns_per_operation": 635852.0,
+        "new_log_rows": 8
+      },
+      {
+        "thread_cpu_ns_per_operation": 278468.0,
+        "wall_ns_per_operation": 529619.0,
+        "new_log_rows": 8
+      },
+      {
+        "thread_cpu_ns_per_operation": 230586.0,
+        "wall_ns_per_operation": 426560.0,
+        "new_log_rows": 8
+      },
+      {
+        "thread_cpu_ns_per_operation": 389454.0,
+        "wall_ns_per_operation": 662615.0,
+        "new_log_rows": 8
+      },
+      {
+        "thread_cpu_ns_per_operation": 438056.0,
+        "wall_ns_per_operation": 624549.0,
+        "new_log_rows": 8
+      },
+      {
+        "thread_cpu_ns_per_operation": 289882.0,
+        "wall_ns_per_operation": 508879.0,
+        "new_log_rows": 8
+      },
+      {
+        "thread_cpu_ns_per_operation": 380760.0,
+        "wall_ns_per_operation": 602266.0,
+        "new_log_rows": 8
+      },
+      {
+        "thread_cpu_ns_per_operation": 360634.0,
+        "wall_ns_per_operation": 570269.0,
+        "new_log_rows": 8
+      },
+      {
+        "thread_cpu_ns_per_operation": 243352.0,
+        "wall_ns_per_operation": 436981.0,
+        "new_log_rows": 8
+      },
+      {
+        "thread_cpu_ns_per_operation": 380974.0,
+        "wall_ns_per_operation": 611461.0,
+        "new_log_rows": 8
+      }
+    ]
+  },
+  "slow_production_planning": {
+    "32": {
+      "owners": 32,
+      "scope": "real MORI plan and production diagnostic context; all requests overdue before first output",
+      "disabled_median_thread_cpu_ms_per_plan": 0.415078,
+      "enabled_median_thread_cpu_ms_per_plan": 1.499227,
+      "median_paired_added_thread_cpu_ms_per_plan": 1.060229,
+      "added_cpu_budget_ms_per_plan": 5,
+      "passed": true,
+      "samples": [
+        {
+          "repeat": 0,
+          "disabled": {
+            "thread_cpu_ns_per_operation": 497509.0,
+            "wall_ns_per_operation": 501994.0,
+            "log_rows": 0,
+            "log_bytes": 0,
+            "retained_requests_before_plan": 29,
+            "active_diagnostics_after_plan": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "enabled": {
+            "thread_cpu_ns_per_operation": 1557738.0,
+            "wall_ns_per_operation": 1562836.0,
+            "log_rows": 8,
+            "log_bytes": 16650,
+            "retained_requests_before_plan": 29,
+            "active_diagnostics_after_plan": 32,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_plan": 1060229.0
+        },
+        {
+          "repeat": 1,
+          "enabled": {
+            "thread_cpu_ns_per_operation": 1514877.0,
+            "wall_ns_per_operation": 1546182.0,
+            "log_rows": 8,
+            "log_bytes": 16650,
+            "retained_requests_before_plan": 29,
+            "active_diagnostics_after_plan": 32,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "disabled": {
+            "thread_cpu_ns_per_operation": 415078.0,
+            "wall_ns_per_operation": 428752.0,
+            "log_rows": 0,
+            "log_bytes": 0,
+            "retained_requests_before_plan": 29,
+            "active_diagnostics_after_plan": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_plan": 1099799.0
+        },
+        {
+          "repeat": 2,
+          "disabled": {
+            "thread_cpu_ns_per_operation": 409305.0,
+            "wall_ns_per_operation": 412220.0,
+            "log_rows": 0,
+            "log_bytes": 0,
+            "retained_requests_before_plan": 29,
+            "active_diagnostics_after_plan": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "enabled": {
+            "thread_cpu_ns_per_operation": 1411059.0,
+            "wall_ns_per_operation": 1420015.0,
+            "log_rows": 8,
+            "log_bytes": 16650,
+            "retained_requests_before_plan": 29,
+            "active_diagnostics_after_plan": 32,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_plan": 1001754.0
+        },
+        {
+          "repeat": 3,
+          "enabled": {
+            "thread_cpu_ns_per_operation": 1470747.0,
+            "wall_ns_per_operation": 1482231.0,
+            "log_rows": 8,
+            "log_bytes": 16650,
+            "retained_requests_before_plan": 29,
+            "active_diagnostics_after_plan": 32,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "disabled": {
+            "thread_cpu_ns_per_operation": 421740.0,
+            "wall_ns_per_operation": 420310.0,
+            "log_rows": 0,
+            "log_bytes": 0,
+            "retained_requests_before_plan": 29,
+            "active_diagnostics_after_plan": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_plan": 1049007.0
+        },
+        {
+          "repeat": 4,
+          "disabled": {
+            "thread_cpu_ns_per_operation": 407119.0,
+            "wall_ns_per_operation": 410570.0,
+            "log_rows": 0,
+            "log_bytes": 0,
+            "retained_requests_before_plan": 29,
+            "active_diagnostics_after_plan": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "enabled": {
+            "thread_cpu_ns_per_operation": 1499227.0,
+            "wall_ns_per_operation": 1508347.0,
+            "log_rows": 8,
+            "log_bytes": 16650,
+            "retained_requests_before_plan": 29,
+            "active_diagnostics_after_plan": 32,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_plan": 1092108.0
+        },
+        {
+          "repeat": 5,
+          "enabled": {
+            "thread_cpu_ns_per_operation": 1451836.0,
+            "wall_ns_per_operation": 1456836.0,
+            "log_rows": 8,
+            "log_bytes": 16650,
+            "retained_requests_before_plan": 29,
+            "active_diagnostics_after_plan": 32,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "disabled": {
+            "thread_cpu_ns_per_operation": 417731.0,
+            "wall_ns_per_operation": 416254.0,
+            "log_rows": 0,
+            "log_bytes": 0,
+            "retained_requests_before_plan": 29,
+            "active_diagnostics_after_plan": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_plan": 1034105.0
+        },
+        {
+          "repeat": 6,
+          "disabled": {
+            "thread_cpu_ns_per_operation": 402591.0,
+            "wall_ns_per_operation": 401241.0,
+            "log_rows": 0,
+            "log_bytes": 0,
+            "retained_requests_before_plan": 29,
+            "active_diagnostics_after_plan": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "enabled": {
+            "thread_cpu_ns_per_operation": 1783370.0,
+            "wall_ns_per_operation": 1790825.0,
+            "log_rows": 8,
+            "log_bytes": 16650,
+            "retained_requests_before_plan": 29,
+            "active_diagnostics_after_plan": 32,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_plan": 1380779.0
+        }
+      ]
+    },
+    "256": {
+      "owners": 256,
+      "scope": "real MORI plan and production diagnostic context; all requests overdue before first output",
+      "disabled_median_thread_cpu_ms_per_plan": 2.643909,
+      "enabled_median_thread_cpu_ms_per_plan": 5.410888,
+      "median_paired_added_thread_cpu_ms_per_plan": 2.677176,
+      "added_cpu_budget_ms_per_plan": 5,
+      "passed": true,
+      "samples": [
+        {
+          "repeat": 0,
+          "disabled": {
+            "thread_cpu_ns_per_operation": 3012485.0,
+            "wall_ns_per_operation": 3022814.0,
+            "log_rows": 0,
+            "log_bytes": 0,
+            "retained_requests_before_plan": 253,
+            "active_diagnostics_after_plan": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "enabled": {
+            "thread_cpu_ns_per_operation": 5429907.0,
+            "wall_ns_per_operation": 5476665.0,
+            "log_rows": 8,
+            "log_bytes": 16663,
+            "retained_requests_before_plan": 253,
+            "active_diagnostics_after_plan": 256,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_plan": 2417422.0
+        },
+        {
+          "repeat": 1,
+          "enabled": {
+            "thread_cpu_ns_per_operation": 5287774.0,
+            "wall_ns_per_operation": 5310061.0,
+            "log_rows": 8,
+            "log_bytes": 16663,
+            "retained_requests_before_plan": 253,
+            "active_diagnostics_after_plan": 256,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "disabled": {
+            "thread_cpu_ns_per_operation": 2610598.0,
+            "wall_ns_per_operation": 2620515.0,
+            "log_rows": 0,
+            "log_bytes": 0,
+            "retained_requests_before_plan": 253,
+            "active_diagnostics_after_plan": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_plan": 2677176.0
+        },
+        {
+          "repeat": 2,
+          "disabled": {
+            "thread_cpu_ns_per_operation": 2643909.0,
+            "wall_ns_per_operation": 2656622.0,
+            "log_rows": 0,
+            "log_bytes": 0,
+            "retained_requests_before_plan": 253,
+            "active_diagnostics_after_plan": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "enabled": {
+            "thread_cpu_ns_per_operation": 5568155.0,
+            "wall_ns_per_operation": 5597059.0,
+            "log_rows": 8,
+            "log_bytes": 16663,
+            "retained_requests_before_plan": 253,
+            "active_diagnostics_after_plan": 256,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_plan": 2924246.0
+        },
+        {
+          "repeat": 3,
+          "enabled": {
+            "thread_cpu_ns_per_operation": 5278534.0,
+            "wall_ns_per_operation": 5297969.0,
+            "log_rows": 8,
+            "log_bytes": 16663,
+            "retained_requests_before_plan": 253,
+            "active_diagnostics_after_plan": 256,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "disabled": {
+            "thread_cpu_ns_per_operation": 3215751.0,
+            "wall_ns_per_operation": 3229272.0,
+            "log_rows": 0,
+            "log_bytes": 0,
+            "retained_requests_before_plan": 253,
+            "active_diagnostics_after_plan": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_plan": 2062783.0
+        },
+        {
+          "repeat": 4,
+          "disabled": {
+            "thread_cpu_ns_per_operation": 2618372.0,
+            "wall_ns_per_operation": 2629148.0,
+            "log_rows": 0,
+            "log_bytes": 0,
+            "retained_requests_before_plan": 253,
+            "active_diagnostics_after_plan": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "enabled": {
+            "thread_cpu_ns_per_operation": 5410888.0,
+            "wall_ns_per_operation": 5442618.0,
+            "log_rows": 8,
+            "log_bytes": 16663,
+            "retained_requests_before_plan": 253,
+            "active_diagnostics_after_plan": 256,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_plan": 2792516.0
+        },
+        {
+          "repeat": 5,
+          "enabled": {
+            "thread_cpu_ns_per_operation": 5271344.0,
+            "wall_ns_per_operation": 5291177.0,
+            "log_rows": 8,
+            "log_bytes": 16663,
+            "retained_requests_before_plan": 253,
+            "active_diagnostics_after_plan": 256,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "disabled": {
+            "thread_cpu_ns_per_operation": 2619139.0,
+            "wall_ns_per_operation": 2627459.0,
+            "log_rows": 0,
+            "log_bytes": 0,
+            "retained_requests_before_plan": 253,
+            "active_diagnostics_after_plan": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_plan": 2652205.0
+        },
+        {
+          "repeat": 6,
+          "disabled": {
+            "thread_cpu_ns_per_operation": 2652744.0,
+            "wall_ns_per_operation": 2665027.0,
+            "log_rows": 0,
+            "log_bytes": 0,
+            "retained_requests_before_plan": 253,
+            "active_diagnostics_after_plan": 0,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "enabled": {
+            "thread_cpu_ns_per_operation": 5416319.0,
+            "wall_ns_per_operation": 5535262.0,
+            "log_rows": 8,
+            "log_bytes": 16663,
+            "retained_requests_before_plan": 253,
+            "active_diagnostics_after_plan": 256,
+            "active_diagnostics_after_cleanup": 0
+          },
+          "added_thread_cpu_ns_per_plan": 2763575.0
+        }
+      ]
+    }
+  },
+  "source_sha256_after": {
+    "/data/zx/agent-kvc/.worktrees/mori/tools/benchmark_mori_diagnostics.py": "a939d557d987343bd9927dbb6c7e10adbd740df0f4e34968e2af72076bb5a1d1",
+    "agentinfer/scheduling/request_diagnostics.py": "d95867bb1d2d75f4e9b1a066416613b4ca3ecced7a1c3a54df4dca87ad5ce612",
+    "agentinfer/scheduling/runtime.py": "a64e66b351535c35001395f52918ab0c0a3f2fb42272ab5b23192f35a2dd1a8d",
+    "agentinfer/scheduling/mori/strategy.py": "b10d724b399e48fab1f24fa457e184d0b97eaed004f03540c49900c7673ed9dd",
+    "agentinfer/scheduling/mori/config.py": "800812d3f10c56a9d6049d066d185d5331bc9a13648fdb471e0546f92ed0c19b",
+    "agentinfer/scheduling/mori/diagnostics.py": "199b41fd830c5b8ec887fb81965274562aed51b713ca6d84d51eeb1cc7eb5fbd"
+  },
+  "source_unchanged": true,
+  "passed": true
+}

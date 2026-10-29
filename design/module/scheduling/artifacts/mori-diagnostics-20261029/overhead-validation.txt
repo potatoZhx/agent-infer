@@ -1,0 +1,22 @@
+$ /data/zx-envs/agentinfer-vllm-0.31.0/bin/python -m tools.benchmark_mori_diagnostics --output-dir design/module/scheduling/artifacts/mori-diagnostics-20261029 --repeats 7 --lifecycle-count 2000 --callback-count 100000 --cycle-count 500 --pending-count 4096
+exit_code=0
+passed=True
+source_unchanged=True
+
+request_lifecycle: paired median added CPU 4502.039 ns/op, budget 10000 ns/op, passed=True
+native_before_first_output: paired median added CPU 117.809 ns/op, budget 1000 ns/op, passed=True
+native_after_first_output: paired median added CPU 108.271 ns/op, budget 1000 ns/op, passed=True
+stream_output: paired median added CPU -35.867 ns/op, budget 1000 ns/op, passed=True
+schedule_cycle_16_requests: paired median added CPU 964.570 ns/op, budget 20000 ns/op, passed=True
+production slow plan 32 owners: paired median added CPU 1.060229 ms/plan, budget 5 ms/plan, passed=True
+production slow plan 256 owners: paired median added CPU 2.677176 ms/plan, budget 5 ms/plan, passed=True
+
+$ ruff check tools/benchmark_mori_diagnostics.py
+All checks passed!
+
+exit_code=0
+
+$ ruff format --check tools/benchmark_mori_diagnostics.py
+1 file already formatted
+
+exit_code=0
