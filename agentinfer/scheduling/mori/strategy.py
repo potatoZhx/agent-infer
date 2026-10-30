@@ -332,15 +332,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             and self._factor(strategy_factors, frontier_ref).service_bypass_tokens
             >= max(1, gpu.incremental(service_debt_claim))
         )
-        candidates.sort(
-            key=lambda p: self._promotion_key(
-                p,
-                strategy_factors,
-                snapshot,
-                now,
-                service_debt_urgent=frontier_saturated_at_cycle_entry and p.ref == frontier_ref,
-            )
-        )
+        candidates.sort(key=lambda p: self._promotion_key(p, strategy_factors, snapshot, now))
         victims = [
             p
             for p in snapshot.programs
@@ -404,7 +396,8 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                     "saturated": service_debt_urgent,
                     "is_frontier": is_service_debt_frontier,
                     "frontier_generation": frontier_ref.generation if frontier_ref is not None else None,
-                    "binary_urgent": service_debt_urgent,
+                    "binary_urgent": False,
+                    "capacity_override_eligible": False,
                     "capacity_state": "evaluating",
                     "all_acting_required_tokens": None,
                     "election_state": "not_considered",
@@ -432,6 +425,12 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                 )
                 if service_debt_decision is not None:
                     service_debt_decision["all_acting_required_tokens"] = all_acting_required
+                    service_debt_decision["capacity_override_eligible"] = bool(
+                        service_debt_urgent
+                        and exchange_valid
+                        and all_acting_required is not None
+                        and all_acting_required <= quota
+                    )
                     service_debt_decision["capacity_state"] = (
                         "fits_after_acting"
                         if all_acting_required is not None and all_acting_required <= quota
@@ -1257,23 +1256,18 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         factors: MORIFactors,
         snapshot: SchedulingSnapshot,
         now: float,
-        *,
-        service_debt_urgent: bool = False,
     ) -> tuple[object, ...]:
         """Order by MORI tier, new context size, idleness and stable identity."""
         tier = self._factor(factors, program.ref).tier
         priority = 0 if tier is MORITier.CPU else 1 if program.step_count > 0 else 2
         new_context = self._gpu_target(program, snapshot) if priority == 2 else 0
-        legacy_key = (
+        return (
             priority,
             new_context,
             self._idleness(self._factor(factors, program.ref), now),
             program.ref.program_id,
             program.ref.generation,
         )
-        if not self.config.enable_bounded_service_debt:
-            return legacy_key
-        return (0 if service_debt_urgent else 1, *legacy_key)
 
     @staticmethod
     def _wait_seconds(program: ProgramView, now: float) -> float:

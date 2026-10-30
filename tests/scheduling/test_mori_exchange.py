@@ -540,14 +540,8 @@ def test_over_quota_frontier_clears_and_does_not_convoy_feasible_work():
     assert components.strategy.counters["service_debt_frontier_clears_exceeds_quota"] == 1
 
 
-@pytest.mark.parametrize(
-    ("debt", "expected"),
-    [
-        (0, ("competitor", "owner")),
-        (200, ("owner", "competitor")),
-    ],
-)
-def test_only_saturated_frontier_gets_binary_priority(debt, expected):
+@pytest.mark.parametrize("debt", [0, 200])
+def test_saturated_frontier_does_not_overtake_higher_legacy_tier(debt):
     components = build_mori_strategy(MORIConfig(decode_buffer_tokens=0, enable_bounded_service_debt=True))
     running = _program("running", 700, gpu=True)
     owner = _program("owner", 200)
@@ -564,11 +558,110 @@ def test_only_saturated_frontier_gets_binary_priority(debt, expected):
         _controller(components, calls),
     )
 
-    refs = {"owner": owner.ref, "competitor": competitor.ref}
-    assert [call.program for call in calls] == [refs[name] for name in expected]
+    assert [call.program for call in calls] == [competitor.ref, owner.ref]
 
 
-def test_capacity_release_serves_persistent_saturated_frontier_first_without_clock_advance():
+@pytest.mark.parametrize(
+    ("enabled", "frontier_tokens"),
+    [
+        (False, None),
+        (False, 200),
+        (True, None),
+        (True, 100),
+        (True, 200),
+    ],
+    ids=["disabled-absent", "disabled-seeded", "enabled-absent", "enabled-unsaturated", "enabled-saturated"],
+)
+@pytest.mark.parametrize(
+    ("tier", "step_count", "expected_priority", "expected_new_context"),
+    [
+        (MORITier.CPU, 1, 0, 0),
+        (MORITier.WAITING, 1, 1, 0),
+        (MORITier.WAITING, 0, 2, 200),
+    ],
+    ids=["cpu", "returning", "new"],
+)
+def test_service_debt_preserves_exact_five_field_legacy_key(
+    enabled,
+    frontier_tokens,
+    tier,
+    step_count,
+    expected_priority,
+    expected_new_context,
+):
+    components = build_mori_strategy(MORIConfig(decode_buffer_tokens=0, enable_bounded_service_debt=enabled))
+    owner = replace(
+        view(
+            "owner",
+            state=ProgramState.PAUSED,
+            status=ProgramStatus.REASONING,
+            tokens=200,
+            step_count=step_count,
+        ),
+        ref=ProgramRef("owner", 7),
+    )
+    set_tier(components, owner, tier, idleness=0.8)
+    if frontier_tokens is not None:
+        _set_service_debt(components, owner, frontier_tokens)
+    observed = snapshot(owner, hbm=1000)
+
+    owner_key = components.strategy._promotion_key(
+        owner,
+        components.initial_factors,
+        observed,
+        observed.observed_at_monotonic_s,
+    )
+    assert owner_key == (
+        expected_priority,
+        expected_new_context,
+        pytest.approx(0.8),
+        "owner",
+        7,
+    )
+
+
+def test_saturated_frontier_preserves_all_same_tier_legacy_tiebreakers():
+    components = build_mori_strategy(MORIConfig(decode_buffer_tokens=0, enable_bounded_service_debt=True))
+    context_first = replace(
+        view(
+            "z-context",
+            state=ProgramState.PAUSED,
+            status=ProgramStatus.REASONING,
+            tokens=100,
+            step_count=0,
+        ),
+        ref=ProgramRef("z-context", 0),
+    )
+    idle_first = replace(
+        context_first,
+        ref=ProgramRef("z-idle", 0),
+        tokens=replace(context_first.tokens, estimated_context_tokens=200),
+    )
+    identity_first = replace(idle_first, ref=ProgramRef("a-identity", 5))
+    generation_second = replace(idle_first, ref=ProgramRef("a-identity", 6))
+    identity_second = replace(idle_first, ref=ProgramRef("b-identity", 0))
+    set_tier(components, context_first, MORITier.WAITING, idleness=0.9)
+    set_tier(components, idle_first, MORITier.WAITING, idleness=0.1)
+    set_tier(components, identity_first, MORITier.WAITING, idleness=0.2)
+    set_tier(components, generation_second, MORITier.WAITING, idleness=0.2)
+    set_tier(components, identity_second, MORITier.WAITING, idleness=0.2)
+    _set_service_debt(components, generation_second, 200)
+    observed = snapshot(context_first, idle_first, identity_first, generation_second, identity_second, hbm=1000)
+
+    ordered = sorted(
+        observed.programs,
+        key=lambda program: components.strategy._promotion_key(
+            program,
+            components.initial_factors,
+            observed,
+            observed.observed_at_monotonic_s,
+        ),
+    )
+
+    assert ordered == [context_first, idle_first, identity_first, generation_second, identity_second]
+
+
+def test_capacity_release_keeps_legacy_order_then_serves_owner_without_clock_advance():
     components = build_mori_strategy(MORIConfig(decode_buffer_tokens=0, enable_bounded_service_debt=True))
     running = _program("running", 800, gpu=True)
     owner = _program("owner", 400)
@@ -606,17 +699,75 @@ def test_capacity_release_serves_persistent_saturated_frontier_first_without_clo
 
     assert first_calls == []
     assert first_snapshot.observed_at_monotonic_s == second_snapshot.observed_at_monotonic_s
-    assert [call.program for call in second_calls] == [owner.ref, competitor.ref]
+    assert [call.program for call in second_calls] == [competitor.ref, owner.ref]
     assert components.initial_factors.global_factors.service_debt_frontier is None
     assert components.strategy.counters["service_debt_urgent_services"] == 1
     assert components.strategy.counters["service_debt_frontier_elections"] == 1
 
 
+def test_earlier_legacy_admission_can_pin_owner_without_convoy_or_debt_reset():
+    components = build_mori_strategy(
+        MORIConfig(
+            decode_buffer_tokens=0,
+            enable_bounded_service_debt=True,
+            slow_request_threshold_seconds=1,
+        )
+    )
+    running = _program("running", 600, gpu=True)
+    victim = _program("victim", 200, acting=True, gpu=True)
+    competitor = replace(_program("competitor", 150), wait_started_at_monotonic_s=0.0)
+    owner = replace(
+        _program("a-owner", 300),
+        ref=ProgramRef("a-owner", 7),
+        wait_started_at_monotonic_s=0.0,
+    )
+    later_fit = replace(_program("z-later-fit", 50), wait_started_at_monotonic_s=0.0)
+    set_tier(components, running, MORITier.GPU)
+    set_tier(components, victim, MORITier.GPU, idleness=0.5)
+    set_tier(components, competitor, MORITier.CPU)
+    set_tier(components, owner, MORITier.WAITING)
+    set_tier(components, later_fit, MORITier.WAITING)
+    _set_service_debt(components, owner, 300)
+    calls = []
+    observed = snapshot(running, victim, competitor, owner, later_fit, hbm=1000)
+
+    components.strategy.schedule_resume(
+        observed,
+        components.initial_factors,
+        _controller(components, calls),
+    )
+
+    assert [(call.kind, call.program) for call in calls] == [
+        (TransitionKind.RESUME, competitor.ref),
+        (TransitionKind.RESUME, later_fit.ref),
+    ]
+    assert components.initial_factors.global_factors.service_debt_frontier == owner.ref
+    assert components.initial_factors.for_program(owner.ref).service_bypass_tokens == 300
+    assert components.initial_factors.for_program(running.ref).tier is MORITier.GPU
+    assert components.initial_factors.for_program(victim.ref).tier is MORITier.GPU
+    owner_decision = components.strategy._slow_diagnostics.decisions[owner.ref]
+    assert owner_decision["capacity"]["gpu_committed_tokens"] == 950
+    assert owner_decision["ranking"] == {
+        "candidate_rank": 1,
+        "admitted_before_in_cycle": 1,
+        "service_bypass_tokens": 300,
+        "bounded_service_debt_enabled": True,
+        "priority_group": "returning",
+        "ordering_is_not_causal_attribution": True,
+    }
+    assert owner_decision["service_debt"]["capacity_state"] == "pinned_infeasible"
+    assert owner_decision["service_debt"]["all_acting_required_tokens"] == 1050
+    assert owner_decision["service_debt"]["binary_urgent"] is False
+    assert owner_decision["service_debt"]["capacity_override_eligible"] is False
+    assert components.strategy.counters["service_debt_pinned_infeasible_evaluations"] == 1
+    assert components.strategy.counters["service_debt_pinned_backfill_admissions"] == 1
+
+
 def test_synchronous_owner_service_clears_frontier_without_recharging_it():
     components = build_mori_strategy(MORIConfig(decode_buffer_tokens=0, enable_bounded_service_debt=True))
     running = _program("running", 500, gpu=True)
-    owner = _program("owner", 400)
-    backfill = _program("backfill", 50)
+    owner = _program("a-owner", 400)
+    backfill = _program("z-backfill", 50)
     set_tier(components, running, MORITier.GPU)
     set_tier(components, owner, MORITier.WAITING)
     _set_service_debt(components, owner, 400)
@@ -645,9 +796,9 @@ def test_served_owner_is_absent_from_later_slow_decisions_without_same_cycle_ree
         )
     )
     running = _program("running", 500, gpu=True)
-    owner = replace(_program("owner", 400), wait_started_at_monotonic_s=0.0)
-    blocked = replace(_program("a-blocked", 200), wait_started_at_monotonic_s=0.0)
-    backfill = replace(_program("z-backfill", 50), wait_started_at_monotonic_s=0.0)
+    owner = replace(_program("a-owner", 400), wait_started_at_monotonic_s=0.0)
+    blocked = replace(_program("z-blocked", 200), wait_started_at_monotonic_s=0.0)
+    backfill = replace(_program("zz-backfill", 50), wait_started_at_monotonic_s=0.0)
     set_tier(components, running, MORITier.GPU)
     set_tier(components, owner, MORITier.WAITING)
     _set_service_debt(components, owner, 400)
@@ -669,12 +820,18 @@ def test_served_owner_is_absent_from_later_slow_decisions_without_same_cycle_ree
 
 
 def test_mature_service_debt_uses_minimal_safe_acting_prefix_without_changing_idleness():
-    components = build_mori_strategy(MORIConfig(decode_buffer_tokens=0, enable_bounded_service_debt=True))
+    components = build_mori_strategy(
+        MORIConfig(
+            decode_buffer_tokens=0,
+            enable_bounded_service_debt=True,
+            slow_request_threshold_seconds=1,
+        )
+    )
     first = _program("a-first", 200, acting=True, gpu=True)
     second = _program("b-second", 200, acting=True, gpu=True)
     retained = _program("c-retained", 200, acting=True, gpu=True)
     running = _program("running", 400, gpu=True)
-    blocked = _program("blocked", 300)
+    blocked = replace(_program("blocked", 300), wait_started_at_monotonic_s=0.0)
     set_tier(components, first, MORITier.GPU, idleness=0.9)
     set_tier(components, second, MORITier.GPU, idleness=0.7)
     set_tier(components, retained, MORITier.GPU, idleness=0.6)
@@ -699,6 +856,11 @@ def test_mature_service_debt_uses_minimal_safe_acting_prefix_without_changing_id
     assert components.initial_factors.for_program(retained.ref).tier is MORITier.GPU
     assert components.initial_factors.for_program(blocked.ref).service_bypass_tokens == 0
     assert components.strategy.counters["service_debt_rebalances"] == 1
+    decision = components.strategy._slow_diagnostics.decisions[blocked.ref]
+    assert decision["ranking"]["candidate_rank"] == 0
+    assert decision["ranking"]["admitted_before_in_cycle"] == 0
+    assert decision["service_debt"]["binary_urgent"] is False
+    assert decision["service_debt"]["capacity_override_eligible"] is True
 
 
 def test_rejected_pause_does_not_count_planned_service_debt_rebalance():
