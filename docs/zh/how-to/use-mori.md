@@ -119,14 +119,15 @@ CPU owner，才会在整组方案确认可装入后把这些 owner 移到 Waitin
 的情况。此规则不增加超时或调参项，首个请求成功准入后即停止生效，也不会抢占 Reasoning；
 本轮新准入的请求同样受到保护。
 
-request pool 和 native queue 的等待时间只进入 diagnostics 观测，不进入调度 idleness，也不占历史窗口槽位。
-只有实际观察到的 native 执行才计入当前部分 Reasoning，完成历史只保存真实 Reasoning 和 Acting 时间。
-层级决策和 diagnostics 使用同一评分函数，不增加等待超时、等待提权或历史衰减参数。
+request pool 中暂停的 Reasoning 会把本次等待临时计入调度 idleness 分母中的 Reasoning 时间；首次观察到
+native 执行前的 native queue 等待也进入当前实时槽位。request pool 等待在准入 GPU 时冻结；Reasoning
+完成后两类临时等待都清除，所以完成历史仍只保存真实 Reasoning 和 Acting 时间。native 抢占间隙不增加
+等待补偿。层级决策和 diagnostics 使用同一评分函数，不增加等待超时或历史衰减参数。
 
 本地仍保留一项扩展：Acting owner 已提交到 WAITING 时，当轮退出 MORI 记账并释放 native ownership。后续请求获得新 generation、
 空历史及新 Program 的排序优先级。业务 task/parent 关系继续保留；物理共享 KV 与未完成的 native 传输仍由
 引擎管理。匹配的 terminal 凭证可以结束旧业务记录，但不能影响后来的 generation。Acting 很久本身不会
-触发退出，必须已经离开 GPU 与 CPU 两个逻辑缓存层；观测到的等待不会改变排序、创造空闲容量或保证等待时间有界。
+触发退出，必须已经离开 GPU 与 CPU 两个逻辑缓存层；等待补偿只改变相对排序，不能创造空闲容量或保证等待时间有界。
 
 不再保留候选独占的未来回收额度，也没有额外等待超时、最短驻留或 idleness 差值门槛。
 

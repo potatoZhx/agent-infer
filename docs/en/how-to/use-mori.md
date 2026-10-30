@@ -124,18 +124,19 @@ adds no timeout or tuning parameter, stops after the first successful admission,
 It prevents retained Acting caches, including parents waiting for children, from keeping an otherwise idle
 engine blocked. Newly admitted requests remain protected throughout the same scheduling cycle.
 
-Request-pool and native-queue waiting are observable in diagnostics but do not enter the scheduling idleness score or
-consume a history-window slot. Only observed native execution contributes partial Reasoning time; completed history
-contains actual Reasoning and Acting time. Placement and diagnostics use the same score, with no wait timeout, aging
-bonus, or historical decay parameter.
+Paused Reasoning in the request pool receives its elapsed wait as temporary Reasoning time in the scheduling idleness
+denominator. Initial native-queue delay also contributes to the live current slot until execution is first observed.
+Request-pool credit freezes on GPU admission; both forms of transient credit disappear when Reasoning completes, so
+completed history still contains only actual Reasoning and Acting time. Native preemption gaps do not add credit.
+Placement and diagnostics use the same score, with no wait timeout, aging bonus, or historical decay parameter.
 
 One local extension remains: Acting owners committed to WAITING retire their MORI accounting and native ownership
 in the same cycle. A subsequent request
 gets a new generation, empty history, and new-Program priority. Business task/parent relationships survive retirement;
 physical shared KV and pending native transfers remain engine-managed. A matching terminal receipt can finish the
 retired business record, but cannot affect a later generation. Retirement does not happen merely because Acting lasts
-a long time: it still requires leaving both logical cache tiers. Observed waiting neither changes ranking nor creates
-free capacity or a bounded-wait guarantee.
+a long time: it still requires leaving both logical cache tiers. Waiting credit changes only relative ranking; it does
+not create free capacity or a bounded-wait guarantee.
 
 There is no beneficiary-owned future capacity, wait timeout, minimum residence or extra idleness margin.
 Placement settings under `agentcache.mori` are `mode` and `window_size`; remove the former `min_residency_seconds`,

@@ -24,10 +24,11 @@ def score_components(sidecar: MORIProgramFactors, now: float, window_size: int) 
         has_partial = True
         partial_reasoning = sidecar.pending_reasoning_seconds
         partial_acting = max(0.0, now - sidecar.acting_started_at_monotonic_s)
-    elif sidecar.execution_observed and sidecar.reasoning_started_at_monotonic_s is not None:
+    elif sidecar.reasoning_started_at_monotonic_s is not None:
         has_partial = True
         partial_reasoning = max(0.0, now - sidecar.reasoning_started_at_monotonic_s)
-        partial_reasoning += sidecar.pending_reasoning_seconds
+        if sidecar.execution_observed:
+            partial_reasoning += sidecar.pending_reasoning_seconds
     elif sidecar.execution_observed:
         has_partial = True
         partial_reasoning = sidecar.pending_reasoning_seconds
@@ -35,12 +36,13 @@ def score_components(sidecar: MORIProgramFactors, now: float, window_size: int) 
     if sidecar.acting_started_at_monotonic_s is None:
         wait_credit = sidecar.reasoning_wait_seconds
         if sidecar.reasoning_wait_started_at_monotonic_s is not None:
+            has_partial = True
             wait_credit += max(0.0, now - sidecar.reasoning_wait_started_at_monotonic_s)
     keep = max(0, window_size - int(has_partial))
     cycles = sidecar.cycles[-keep:] if keep else ()
     completed_reasoning = sum(cycle[0] for cycle in cycles)
     completed_acting = sum(cycle[1] for cycle in cycles)
-    reasoning = completed_reasoning + partial_reasoning
+    reasoning = completed_reasoning + partial_reasoning + wait_credit
     acting = completed_acting + partial_acting
     return {
         "idleness": acting / (acting + reasoning) if acting + reasoning else 0.0,
@@ -51,7 +53,7 @@ def score_components(sidecar: MORIProgramFactors, now: float, window_size: int) 
         "partial_reasoning_seconds": partial_reasoning,
         "partial_acting_seconds": partial_acting,
         "current_wait_credit_seconds": wait_credit,
-        "wait_affects_idleness": False,
+        "wait_affects_idleness": True,
         "execution_observed": sidecar.execution_observed,
     }
 

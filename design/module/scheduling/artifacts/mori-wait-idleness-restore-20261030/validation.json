@@ -1,0 +1,31 @@
+{
+  "date": "2026-10-30",
+  "decision": {
+    "isolated_performance_evidence_for_excluding_scheduler_wait": false,
+    "reason": "Commit 30129ad combined cache-owner handoff, CPU-boundary replacement, and scheduler-wait scoring changes; commit 22b4322 then changed owner handoff again. Existing end-to-end results cannot attribute their improvement to wait exclusion.",
+    "action": "Restore request-pool wait and initial native-queue delay as temporary current-cycle Reasoning credit before rerunning the same MORI benchmark."
+  },
+  "restored_semantics": {
+    "request_pool_wait_affects_live_idleness": true,
+    "initial_native_queue_wait_affects_live_idleness": true,
+    "wait_is_committed_to_completed_history": false,
+    "native_preemption_wait_affects_idleness": false
+  },
+  "checks": [
+    {
+      "command": "MORI_VLLM_SOURCE=/tmp/mori-review-fixes-20261027/upstream PYTHONPATH=. /data/zx-envs/agentinfer-vllm-0.31.0/bin/python -m pytest -q -m cpu_test tests/scheduling/test_mori_waiting.py tests/scheduling/test_mori_diagnostics.py tests/scheduling/test_mori_strategy.py tests/scheduling/test_mori_branches.py tests/scheduling/test_mori_rebalance.py",
+      "result": "81 passed in 0.60s",
+      "exit_code": 0
+    },
+    {
+      "command": "MORI_VLLM_SOURCE=/tmp/mori-review-fixes-20261027/upstream PYTHONPATH=. /data/zx-envs/agentinfer-vllm-0.31.0/bin/python -m pytest -q -m cpu_test tests/scheduling tests/agentcache",
+      "result": "643 passed, 26 deselected, 14 warnings in 162.37s",
+      "exit_code": 0
+    },
+    {
+      "command": "pre-commit run --files agentinfer/scheduling/mori/diagnostics.py agentinfer/scheduling/mori/strategy.py design/module/scheduling/mori-scheduling.md docs/en/how-to/use-mori.md docs/zh/how-to/use-mori.md tests/scheduling/test_mori_diagnostics.py tests/scheduling/test_mori_rebalance.py tests/scheduling/test_mori_waiting.py",
+      "result": "ruff check, ruff format, typos, markdownlint-cli2, and Suggestion passed",
+      "exit_code": 0
+    }
+  ]
+}

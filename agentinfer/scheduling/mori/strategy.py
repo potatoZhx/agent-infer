@@ -962,13 +962,22 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             has_partial = True
             partial_reasoning = sidecar.pending_reasoning_seconds
             partial_acting = max(0.0, now - sidecar.acting_started_at_monotonic_s)
-        elif sidecar.execution_observed and sidecar.reasoning_started_at_monotonic_s is not None:
+        elif sidecar.reasoning_started_at_monotonic_s is not None:
             has_partial = True
             partial_reasoning = max(0.0, now - sidecar.reasoning_started_at_monotonic_s)
-            partial_reasoning += sidecar.pending_reasoning_seconds
+            if sidecar.execution_observed:
+                partial_reasoning += sidecar.pending_reasoning_seconds
         elif sidecar.execution_observed:
             has_partial = True
             partial_reasoning = sidecar.pending_reasoning_seconds
+        # A queued current Reasoning is already the current window slot, even
+        # before native execution starts. Its credit survives admission but is
+        # discarded on completion; completed (R, A) pairs remain factual.
+        if sidecar.acting_started_at_monotonic_s is None:
+            partial_reasoning += sidecar.reasoning_wait_seconds
+            if sidecar.reasoning_wait_started_at_monotonic_s is not None:
+                has_partial = True
+                partial_reasoning += max(0.0, now - sidecar.reasoning_wait_started_at_monotonic_s)
         keep = max(0, self.config.window_size - int(has_partial))
         cycles = sidecar.cycles[-keep:] if keep else ()
         reasoning = sum(item[0] for item in cycles) + partial_reasoning

@@ -200,9 +200,10 @@ error rather than unmanaged compatibility traffic sharing the same capacity pool
 idleness = acting_seconds / (reasoning_seconds + acting_seconds)
 ```
 
-窗口优先包含当前 partial cycle，再取最近完整周期补足 `k`。服务端 scheduler queue time 从 request latency 中
-扣除后才作为 Reasoning 时间；等待准入不属于 Reasoning/Acting。分母为零时结果为 0。idleness 只决定候选或
-victim 的相对顺序，绝不因排名交叉单独触发 tier reshuffle。
+窗口优先包含当前 partial cycle，再取最近完整周期补足 `k`。request pool 等待作为当前 Reasoning 槽位的
+临时 credit，准入后冻结；首次 native 执行前的 queue delay 也临时进入实时槽位。Reasoning 完成时这些等待
+不会写入完整历史，native 抢占间隙也不计入。分母为零时结果为 0。idleness 只决定候选或 victim 的相对
+顺序，绝不因排名交叉单独触发 tier reshuffle。
 
 ## 容量 reservation
 
