@@ -551,6 +551,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                 (
                     ("mode", self.config.mode.value),
                     ("window_size", self.config.window_size),
+                    ("enable_wait_credit", self.config.enable_wait_credit),
                     ("decode_buffer_tokens", self.config.decode_buffer_tokens),
                     ("gpu_programs", tiers[MORITier.GPU.value]),
                     ("cpu_programs", tiers[MORITier.CPU.value]),
@@ -1034,7 +1035,8 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         # while a Reasoning request waits outside GPU. Admission removes it;
         # native queueing before first execution is neither credit nor work.
         if (
-            sidecar.tier is not MORITier.GPU
+            self.config.enable_wait_credit
+            and sidecar.tier is not MORITier.GPU
             and sidecar.acting_started_at_monotonic_s is None
             and sidecar.reasoning_wait_started_at_monotonic_s is not None
         ):

@@ -41,6 +41,7 @@ def test_controller_selects_mori_without_a_dynamic_factory() -> None:
 
     assert isinstance(controller.strategy, MORIStrategy)
     assert controller.strategy.config.mode is MORIMode.FULL
+    assert controller.strategy.config.enable_wait_credit is True
     assert controller.strategy.config.decode_buffer_tokens == 100
     assert controller._schedule_interval_seconds == 5.0
 
@@ -62,6 +63,20 @@ def test_placement_only_is_an_explicit_ablation_without_dram() -> None:
 def test_decode_buffer_cannot_be_overridden() -> None:
     with pytest.raises(ValueError, match="fixed implementation"):
         build_mori_controller(backend(), {"mori": {"decode_buffer_tokens": 999}})
+
+
+def test_wait_credit_can_be_disabled_for_exchange_only_ablation() -> None:
+    controller = build_mori_controller(backend(), {"mori": {"enable_wait_credit": False}})
+
+    assert controller.strategy.config.enable_wait_credit is False
+
+
+@pytest.mark.parametrize("value", [0, 1, "false", None])
+def test_wait_credit_requires_an_exact_boolean(value: object) -> None:
+    with pytest.raises(ValueError, match="enable_wait_credit must be a boolean"):
+        build_mori_controller(backend(), {"mori": {"enable_wait_credit": value}})
+    with pytest.raises(ValueError, match="enable_wait_credit must be a boolean"):
+        MORIConfig(enable_wait_credit=value)  # type: ignore[arg-type]
 
 
 def test_slow_request_diagnostics_default_and_explicit_settings() -> None:

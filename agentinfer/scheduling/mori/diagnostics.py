@@ -15,7 +15,9 @@ if TYPE_CHECKING:
     from agentinfer.scheduling.mori.strategy import MORIFactors, MORIStrategy
 
 
-def score_components(sidecar: MORIProgramFactors, now: float, window_size: int) -> dict[str, object]:
+def score_components(
+    sidecar: MORIProgramFactors, now: float, window_size: int, *, wait_credit_enabled: bool = True
+) -> dict[str, object]:
     """Explain the exact current-window score without changing factual history."""
     partial_reasoning = 0.0
     partial_acting = 0.0
@@ -31,7 +33,8 @@ def score_components(sidecar: MORIProgramFactors, now: float, window_size: int) 
             partial_reasoning += max(0.0, now - sidecar.reasoning_started_at_monotonic_s)
     wait_credit = 0.0
     waiting = (
-        sidecar.tier is not MORITier.GPU
+        wait_credit_enabled
+        and sidecar.tier is not MORITier.GPU
         and sidecar.acting_started_at_monotonic_s is None
         and sidecar.reasoning_wait_started_at_monotonic_s is not None
     )
@@ -52,6 +55,7 @@ def score_components(sidecar: MORIProgramFactors, now: float, window_size: int) 
         "partial_reasoning_seconds": partial_reasoning,
         "partial_acting_seconds": partial_acting,
         "current_wait_credit_seconds": wait_credit,
+        "wait_credit_enabled": wait_credit_enabled,
         "wait_affects_idleness": waiting,
         "execution_observed": sidecar.execution_observed,
     }
@@ -97,7 +101,12 @@ class MORIDiagnosticState:
             "observed_at_monotonic_s": now,
             "reason": "evaluating",
             "tier": factor.tier.value,
-            "score": score_components(factor, now, self.strategy.config.window_size),
+            "score": score_components(
+                factor,
+                now,
+                self.strategy.config.window_size,
+                wait_credit_enabled=self.strategy.config.enable_wait_credit,
+            ),
             "capacity": {
                 "gpu_committed_tokens": gpu.used,
                 "gpu_quota_tokens": snapshot.total_kv_tokens,
@@ -136,7 +145,12 @@ class MORIDiagnosticState:
                 "pending_tier": factor.pending_tier.value if factor.pending_tier else None,
                 "generation": program.generation,
             }
-            context["current_score"] = score_components(factor, now, strategy.config.window_size)
+            context["current_score"] = score_components(
+                factor,
+                now,
+                strategy.config.window_size,
+                wait_credit_enabled=strategy.config.enable_wait_credit,
+            )
         decision = self.decisions.get(program)
         if decision is not None:
             context["last_decision"] = decision

@@ -119,6 +119,25 @@ def test_waiting_credit_preserves_completed_window(window, expected):
     assert components.initial_factors.for_program(owner).cycles == ((1.0, 100.0), (1.0, 9.0))
 
 
+def test_disabled_wait_credit_preserves_score_while_waiting():
+    components = build_mori_strategy(MORIConfig(window_size=1, enable_wait_credit=False))
+    owner = ProgramRef("waiting", 0)
+    sidecar = MORIProgramFactors(
+        tier=MORITier.CPU,
+        cycles=((10.0, 90.0),),
+        reasoning_wait_started_at_monotonic_s=10.0,
+    )
+    components.strategy._set_factor(components.initial_factors, owner, sidecar)
+
+    assert components.strategy.idleness_for_program(owner, 10.0) == pytest.approx(0.9)
+    assert components.strategy.idleness_for_program(owner, 110.0) == pytest.approx(0.9)
+    fields = score_components(sidecar, 110.0, 1, wait_credit_enabled=False)
+    assert fields["current_wait_credit_seconds"] == 0.0
+    assert fields["wait_credit_enabled"] is False
+    assert fields["wait_affects_idleness"] is False
+    assert fields["idleness"] == pytest.approx(0.9)
+
+
 @pytest.mark.parametrize("window", [1, 5])
 @pytest.mark.parametrize("tier", [MORITier.CPU, MORITier.WAITING, MORITier.GPU])
 @pytest.mark.parametrize("oldest_cycle", [(1.0, 99.0), (99.0, 1.0)])
