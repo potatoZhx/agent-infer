@@ -45,6 +45,9 @@ class MORIProgramFactors:
     # Non-GPU Reasoning fairness credit only; cleared at admission, never history.
     reasoning_wait_seconds: float = 0.0
     reasoning_wait_started_at_monotonic_s: float | None = None
+    # Resource-denominated service debt. Later admissions charge only the
+    # highest-ranked feasible waiter they bypass; successful service clears it.
+    service_bypass_tokens: int = 0
     pending_tier: MORITier | None = None
     execution_observed: bool = False
 
@@ -53,6 +56,10 @@ class MORIProgramFactors:
             raise ValueError("MORI tier must be a MORITier")
         if self.pending_tier is not None and not isinstance(self.pending_tier, MORITier):
             raise ValueError("MORI pending_tier must be a MORITier when supplied")
+        if isinstance(self.service_bypass_tokens, bool) or not isinstance(self.service_bypass_tokens, int):
+            raise ValueError("MORI service_bypass_tokens must be an integer")
+        if self.service_bypass_tokens < 0:
+            raise ValueError("MORI service_bypass_tokens must be non-negative")
         values = [self.pending_reasoning_seconds, self.reasoning_wait_seconds]
         values.extend(value for cycle in self.cycles for value in cycle)
         if any(not math.isfinite(value) or value < 0 for value in values):

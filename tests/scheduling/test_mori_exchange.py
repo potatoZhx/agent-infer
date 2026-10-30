@@ -9,7 +9,7 @@ import pytest
 
 from agentinfer.scheduling import ProgramState, ProgramStatus, TransitionController, TransitionKind, TransitionResult
 from agentinfer.scheduling.identity import AgentIdentity
-from agentinfer.scheduling.mori import MORIConfig, MORITier, build_mori_strategy
+from agentinfer.scheduling.mori import MORIConfig, MORIProgramFactors, MORITier, build_mori_strategy
 from tests.scheduling.test_mori_rebalance import pool, scheduler
 from tests.scheduling.test_mori_strategy import accepting_controller, set_tier, snapshot, view
 
@@ -36,6 +36,201 @@ def _program(name, tokens, *, acting=False, gpu=False):
         tokens=tokens,
         step_count=1,
     )
+
+
+def _set_service_debt(components, program, tokens):
+    current = components.initial_factors.for_program(program.ref)
+    assert current is not None
+    components.strategy._set_factor(
+        components.initial_factors,
+        program.ref,
+        replace(current, service_bypass_tokens=tokens),
+    )
+
+
+def test_later_admission_charges_only_actual_gpu_tokens_to_highest_blocked_candidate():
+    components = build_mori_strategy(MORIConfig(decode_buffer_tokens=0, enable_bounded_service_debt=True))
+    running = _program("running", 700, gpu=True)
+    blocked = _program("a-blocked", 400)
+    lower = _program("b-lower", 350)
+    first_backfill = _program("c-backfill", 50)
+    second_backfill = _program("d-backfill", 50)
+    set_tier(components, running, MORITier.GPU)
+    set_tier(components, blocked, MORITier.CPU, idleness=0.0)
+    set_tier(components, lower, MORITier.CPU, idleness=0.1)
+    calls = []
+
+    components.strategy.schedule_resume(
+        snapshot(running, blocked, lower, first_backfill, second_backfill, hbm=1000),
+        components.initial_factors,
+        _controller(components, calls),
+    )
+
+    assert [(call.kind, call.program) for call in calls] == [
+        (TransitionKind.RESUME, first_backfill.ref),
+        (TransitionKind.RESUME, second_backfill.ref),
+    ]
+    assert components.initial_factors.for_program(blocked.ref).service_bypass_tokens == 100
+    assert components.initial_factors.for_program(lower.ref).service_bypass_tokens == 0
+    assert components.strategy.counters["service_debt_charged_tokens"] == 100
+
+
+def test_rejected_backfill_does_not_charge_service_debt():
+    components = build_mori_strategy(MORIConfig(decode_buffer_tokens=0, enable_bounded_service_debt=True))
+    running = _program("running", 800, gpu=True)
+    blocked = _program("a-blocked", 400)
+    backfill = _program("b-backfill", 100)
+    set_tier(components, running, MORITier.GPU)
+    set_tier(components, blocked, MORITier.CPU)
+    calls = []
+
+    components.strategy.schedule_resume(
+        snapshot(running, blocked, backfill, hbm=1000),
+        components.initial_factors,
+        _controller(components, calls, reject=lambda request: request.program == backfill.ref),
+    )
+
+    assert [(call.kind, call.program) for call in calls] == [(TransitionKind.RESUME, backfill.ref)]
+    assert components.initial_factors.for_program(blocked.ref).service_bypass_tokens == 0
+    assert components.strategy.counters["service_debt_charged_tokens"] == 0
+
+
+def test_service_debt_stops_same_cycle_at_one_candidate_resource_quantum():
+    components = build_mori_strategy(MORIConfig(decode_buffer_tokens=0, enable_bounded_service_debt=True))
+    running = _program("running", 700, gpu=True)
+    blocked = _program("a-blocked", 400)
+    first_backfill = _program("b-backfill", 50)
+    second_backfill = _program("c-backfill", 50)
+    set_tier(components, running, MORITier.GPU)
+    set_tier(components, blocked, MORITier.CPU)
+    _set_service_debt(components, blocked, 350)
+    calls = []
+
+    components.strategy.schedule_resume(
+        snapshot(running, blocked, first_backfill, second_backfill, hbm=1000),
+        components.initial_factors,
+        _controller(components, calls),
+    )
+
+    assert [(call.kind, call.program) for call in calls] == [(TransitionKind.RESUME, first_backfill.ref)]
+    assert components.initial_factors.for_program(blocked.ref).service_bypass_tokens == 400
+    assert components.strategy.counters["service_debt_bypass_limits"] == 1
+
+
+def test_service_debt_charges_and_limits_shared_blocks_by_marginal_union_tokens():
+    components = build_mori_strategy(MORIConfig(decode_buffer_tokens=0, enable_bounded_service_debt=True))
+    running = _program("running", 700, gpu=True)
+    blocked = _program("a-blocked", 400)
+    first_backfill = _program("b-backfill", 200)
+    second_backfill = _program("c-backfill", 200)
+    blocks = {
+        running.ref: frozenset(range(300)),
+        blocked.ref: frozenset(range(300)),
+        first_backfill.ref: frozenset(range(150)),
+        second_backfill.ref: frozenset(range(150)),
+    }
+
+    class SharedGPU:
+        def footprint(self, ref, tier):
+            return blocks.get(ref, frozenset()) if tier == "gpu" else frozenset()
+
+    components.strategy.bind_footprints(SharedGPU())
+    set_tier(components, running, MORITier.GPU)
+    set_tier(components, blocked, MORITier.CPU)
+    _set_service_debt(components, blocked, 50)
+    calls = []
+
+    components.strategy.schedule_resume(
+        snapshot(running, blocked, first_backfill, second_backfill, hbm=750),
+        components.initial_factors,
+        _controller(components, calls),
+    )
+
+    assert [(call.kind, call.program) for call in calls] == [(TransitionKind.RESUME, first_backfill.ref)]
+    assert components.initial_factors.for_program(blocked.ref).service_bypass_tokens == 100
+    assert components.strategy.counters["service_debt_charged_tokens"] == 50
+    assert components.strategy.counters["service_debt_bypass_limits"] == 1
+
+
+def test_mature_service_debt_reserves_capacity_when_all_acting_relief_cannot_fit():
+    components = build_mori_strategy(MORIConfig(decode_buffer_tokens=0, enable_bounded_service_debt=True))
+    running = _program("running", 800, gpu=True)
+    blocked = _program("a-blocked", 400)
+    backfill = _program("b-backfill", 100)
+    set_tier(components, running, MORITier.GPU)
+    set_tier(components, blocked, MORITier.CPU)
+    _set_service_debt(components, blocked, 400)
+    calls = []
+
+    components.strategy.schedule_resume(
+        snapshot(running, blocked, backfill, hbm=1000),
+        components.initial_factors,
+        _controller(components, calls),
+    )
+
+    assert calls == []
+    assert components.initial_factors.for_program(blocked.ref).service_bypass_tokens == 400
+    assert components.strategy.counters["service_debt_reservations"] == 1
+
+
+def test_mature_service_debt_uses_minimal_safe_acting_prefix_without_changing_idleness():
+    components = build_mori_strategy(MORIConfig(decode_buffer_tokens=0, enable_bounded_service_debt=True))
+    first = _program("a-first", 200, acting=True, gpu=True)
+    second = _program("b-second", 200, acting=True, gpu=True)
+    retained = _program("c-retained", 200, acting=True, gpu=True)
+    running = _program("running", 400, gpu=True)
+    blocked = _program("blocked", 300)
+    set_tier(components, first, MORITier.GPU, idleness=0.9)
+    set_tier(components, second, MORITier.GPU, idleness=0.7)
+    set_tier(components, retained, MORITier.GPU, idleness=0.6)
+    set_tier(components, running, MORITier.GPU)
+    set_tier(components, blocked, MORITier.CPU, idleness=0.8)
+    _set_service_debt(components, blocked, 300)
+    before_idleness = components.strategy.idleness_for_program(blocked.ref, 100.0)
+    calls = []
+
+    components.strategy.schedule_resume(
+        snapshot(first, second, retained, running, blocked, hbm=1000),
+        components.initial_factors,
+        _controller(components, calls),
+    )
+
+    assert [(call.kind, call.program) for call in calls] == [
+        (TransitionKind.PAUSE, first.ref),
+        (TransitionKind.PAUSE, second.ref),
+        (TransitionKind.RESUME, blocked.ref),
+    ]
+    assert before_idleness == pytest.approx(0.8)
+    assert components.initial_factors.for_program(retained.ref).tier is MORITier.GPU
+    assert components.initial_factors.for_program(blocked.ref).service_bypass_tokens == 0
+    assert components.strategy.counters["service_debt_rebalances"] == 1
+
+
+def test_disabled_service_debt_preserves_relative_idleness_blocking():
+    components = build_mori_strategy(MORIConfig(decode_buffer_tokens=0))
+    victim = _program("victim", 600, acting=True, gpu=True)
+    running = _program("running", 100, gpu=True)
+    blocked = _program("blocked", 400)
+    set_tier(components, victim, MORITier.GPU, idleness=0.1)
+    set_tier(components, running, MORITier.GPU)
+    set_tier(components, blocked, MORITier.CPU, idleness=0.9)
+    _set_service_debt(components, blocked, 400)
+    calls = []
+
+    components.strategy.schedule_resume(
+        snapshot(victim, running, blocked, hbm=800),
+        components.initial_factors,
+        _controller(components, calls),
+    )
+
+    assert calls == []
+    assert components.strategy.idleness_for_program(blocked.ref, 100.0) == pytest.approx(0.9)
+
+
+@pytest.mark.parametrize("value", [-1, 1.5, True])
+def test_service_debt_factor_requires_non_negative_integer_tokens(value):
+    with pytest.raises(ValueError, match="service_bypass_tokens"):
+        MORIProgramFactors(service_bypass_tokens=value)
 
 
 def test_exchange_keeps_victim_in_cpu_space_released_by_successful_promotion():

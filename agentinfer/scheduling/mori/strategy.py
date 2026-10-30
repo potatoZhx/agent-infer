@@ -198,6 +198,8 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                         else snapshot.observed_at_monotonic_s
                     ),
                 )
+            elif view.state is ProgramState.ACTIVE and sidecar.service_bypass_tokens:
+                sidecar = replace(sidecar, service_bypass_tokens=0)
             self._set_factor(strategy_factors, candidate, sidecar)
             required = self._gpu_target(view, snapshot)
 
@@ -314,11 +316,23 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         exchange_valid = True
         demoted = []
         admitted_before = 0
+        service_debt_target: ProgramView | None = None
+        service_debt_claim: CapacityClaim | None = None
         for rank, candidate in enumerate(candidates):
             self.counters["planning_candidates"] += 1
             exchange_victims: list[ProgramView] = []
             needed_victims = removed
             claim = self._claim(candidate, snapshot, gpu=True)
+            candidate_incremental = gpu.incremental(claim)
+            candidate_factor = (
+                self._factor(strategy_factors, candidate.ref) if self.config.enable_bounded_service_debt else None
+            )
+            service_debt_required = max(1, candidate_incremental)
+            service_debt_urgent = (
+                self.config.enable_bounded_service_debt
+                and candidate_factor is not None
+                and candidate_factor.service_bypass_tokens >= service_debt_required
+            )
             decision = (
                 self._slow_diagnostics.begin(
                     candidate, snapshot, strategy_factors, gpu, claim, rank=rank, admitted_before=admitted_before
@@ -326,21 +340,41 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                 if self._slow_diagnostics is not None
                 else None
             )
+            if decision is not None:
+                decision["service_debt"] = {
+                    "charged_tokens": candidate_factor.service_bypass_tokens if candidate_factor is not None else 0,
+                    "required_tokens": service_debt_required,
+                    "urgent": service_debt_urgent,
+                }
             if claim.tokens > quota:
                 self.counters["promotion_exceeds_total_quota"] += 1
                 if decision is not None:
                     decision["reason"] = "claim_exceeds_total_quota"
                 continue
-            if gpu.used + gpu.incremental(claim) > quota:
+            if gpu.used + candidate_incremental > quota:
                 candidate_idle = self._idleness(self._factor(strategy_factors, candidate.ref), now)
                 eligible = max(removed, bisect_left(idle_keys, -candidate_idle))
                 reason = "mori_relative_rebalance"
                 if not has_reasoning and projection.required(eligible, claim) > quota:
                     eligible = len(victims)
                     reason = "mori_idle_gpu_progress"
+                eligible_required = projection.required(eligible, claim)
+                all_acting_required = (
+                    projection.required(len(victims), claim)
+                    if self.config.enable_bounded_service_debt or decision is not None
+                    else None
+                )
+                if (
+                    service_debt_urgent
+                    and exchange_valid
+                    and all_acting_required is not None
+                    and all_acting_required <= quota
+                ):
+                    eligible = len(victims)
+                    reason = "mori_service_debt_rebalance"
+                    self.counters["service_debt_rebalances"] += 1
+                    eligible_required = all_acting_required
                 if decision is not None:
-                    eligible_required = projection.required(eligible, claim)
-                    all_acting_required = projection.required(len(victims), claim)
                     decision["relief"] = {
                         "eligible_acting_prefix": eligible,
                         "all_acting_count": len(victims),
@@ -349,18 +383,29 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                         "required_after_all_acting_tokens": all_acting_required,
                         "has_gpu_reasoning": has_reasoning,
                         "idle_gpu_progress_override": reason == "mori_idle_gpu_progress",
+                        "service_debt_override": reason == "mori_service_debt_rebalance",
                         "exchange_valid": exchange_valid,
                     }
-                if not exchange_valid or projection.required(eligible, claim) > quota:
+                if not exchange_valid or eligible_required > quota:
                     self.counters["promotion_no_fit"] += 1
+                    block_reason = (
+                        "exchange_invalid"
+                        if not exchange_valid
+                        else "idleness_limited"
+                        if all_acting_required is not None and all_acting_required <= quota
+                        else "no_all_acting_fit"
+                    )
+                    if self.config.enable_bounded_service_debt and exchange_valid and service_debt_target is None:
+                        service_debt_target = candidate
+                        service_debt_claim = claim
+                        self.counters["service_debt_candidates"] += 1
+                    reserve_for_service = service_debt_urgent and block_reason == "no_all_acting_fit"
+                    if reserve_for_service:
+                        self.counters["service_debt_reservations"] += 1
                     if decision is not None:
-                        decision["reason"] = (
-                            "exchange_invalid"
-                            if not exchange_valid
-                            else "idleness_limited"
-                            if all_acting_required <= quota
-                            else "no_all_acting_fit"
-                        )
+                        decision["reason"] = "service_debt_reservation" if reserve_for_service else block_reason
+                    if reserve_for_service:
+                        break
                     continue
                 # Establish a feasible whole plan before evicting anything.
                 # Candidate/victim sharing makes individual claim sizes unsafe
@@ -397,12 +442,38 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                     candidate.ref, reason="mori_cycle_promote", backend_id=snapshot.backend_id
                 )
                 if result.applied:
+                    admitted_tokens = gpu.incremental(claim)
                     gpu.add(candidate.ref, claim)
                     projection.admit(claim)
                     cpu.remove(candidate.ref)
                     has_reasoning = True
                     self.counters["promotion_applied"] += 1
                     admitted_before += 1
+                    if (
+                        self.config.enable_bounded_service_debt
+                        and service_debt_target is not None
+                        and service_debt_claim is not None
+                        and admitted_tokens > 0
+                    ):
+                        target_factor = self._factor(strategy_factors, service_debt_target.ref)
+                        charged = target_factor.service_bypass_tokens + admitted_tokens
+                        self._set_factor(
+                            strategy_factors,
+                            service_debt_target.ref,
+                            replace(target_factor, service_bypass_tokens=charged),
+                        )
+                        self.counters["service_debt_charged_tokens"] += admitted_tokens
+                        if decision is not None:
+                            decision["charged_service_debt"] = {
+                                "program_id": service_debt_target.ref.program_id,
+                                "generation": service_debt_target.ref.generation,
+                                "tokens": admitted_tokens,
+                                "total_tokens": charged,
+                            }
+                        next_required = max(1, gpu.incremental(service_debt_claim))
+                        if charged >= next_required:
+                            self.counters["service_debt_bypass_limits"] += 1
+                            self._request_schedule(strategy_factors, now)
             finally:
                 # Spend CPU relief only after admission commits. Rejected
                 # promotions keep their CPU claim; accepted pauses still need
@@ -411,6 +482,15 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             if decision is not None:
                 decision["reason"] = "promotion_applied" if result.applied else "promotion_rejected"
                 decision["transition_reason"] = result.reason
+            if (
+                result.applied
+                and self.config.enable_bounded_service_debt
+                and service_debt_target is not None
+                and service_debt_claim is not None
+                and self._factor(strategy_factors, service_debt_target.ref).service_bypass_tokens
+                >= max(1, gpu.incremental(service_debt_claim))
+            ):
+                break
         return tuple(demoted)
 
     def _pause_for_exchange(
@@ -536,6 +616,11 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
     ) -> tuple[StrategyDiagnostic, ...]:
         now = snapshot.observed_at_monotonic_s
         tiers = Counter(self._factor(strategy_factors, program.ref).tier.value for program in snapshot.programs)
+        service_debts = (
+            [self._factor(strategy_factors, program.ref).service_bypass_tokens for program in snapshot.programs]
+            if self.config.enable_bounded_service_debt
+            else []
+        )
         gpu_reserved = self._gpu_reserved_tokens(snapshot, strategy_factors)
         cpu_reserved = self._cpu_reserved_tokens(snapshot, strategy_factors)
         prompt_tokens = self.counters["cache_prompt_tokens"]
@@ -552,6 +637,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                     ("mode", self.config.mode.value),
                     ("window_size", self.config.window_size),
                     ("enable_wait_credit", self.config.enable_wait_credit),
+                    ("enable_bounded_service_debt", self.config.enable_bounded_service_debt),
                     ("decode_buffer_tokens", self.config.decode_buffer_tokens),
                     ("gpu_programs", tiers[MORITier.GPU.value]),
                     ("cpu_programs", tiers[MORITier.CPU.value]),
@@ -573,6 +659,9 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                     ("cache_prefix_hit_ratio", prefix_hit_tokens / prompt_tokens if prompt_tokens else 0.0),
                     ("cache_hbm_hit_ratio", hbm_hit_tokens / prompt_tokens if prompt_tokens else 0.0),
                     ("mean_idleness", mean_idleness),
+                    ("service_debt_programs", sum(value > 0 for value in service_debts)),
+                    ("service_debt_tokens", sum(service_debts)),
+                    ("max_service_debt_tokens", max(service_debts, default=0)),
                     (
                         "max_wait_seconds",
                         max(
@@ -602,6 +691,11 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                             "owners_retired",
                             "rebalance_demotions",
                             "idle_gpu_progress_demotions",
+                            "service_debt_candidates",
+                            "service_debt_charged_tokens",
+                            "service_debt_bypass_limits",
+                            "service_debt_rebalances",
+                            "service_debt_reservations",
                         )
                     ),
                 ),
@@ -634,6 +728,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                     reasoning_started_at_monotonic_s=None,
                     reasoning_wait_seconds=0.0,
                     reasoning_wait_started_at_monotonic_s=None,
+                    service_bypass_tokens=0,
                     acting_started_at_monotonic_s=event.occurred_at_monotonic_s,
                 ),
             )
@@ -652,6 +747,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             cycles=cycles,
             pending_reasoning_seconds=0.0,
             reasoning_wait_seconds=0.0,
+            service_bypass_tokens=0,
             reasoning_wait_started_at_monotonic_s=(
                 event.occurred_at_monotonic_s if event.current_state is ProgramState.PAUSED else None
             ),
@@ -763,6 +859,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                 pending_tier=None,
                 reasoning_wait_seconds=0.0,
                 reasoning_wait_started_at_monotonic_s=None,
+                service_bypass_tokens=0,
                 reasoning_started_at_monotonic_s=(
                     event.occurred_at_monotonic_s
                     if event.current_status is ProgramStatus.REASONING

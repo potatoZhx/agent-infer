@@ -116,6 +116,8 @@ class MORIDiagnosticState:
             "ranking": {
                 "candidate_rank": rank,
                 "admitted_before_in_cycle": admitted_before,
+                "service_bypass_tokens": factor.service_bypass_tokens,
+                "bounded_service_debt_enabled": self.strategy.config.enable_bounded_service_debt,
                 "priority_group": "cpu"
                 if factor.tier is MORITier.CPU
                 else "returning"
@@ -144,6 +146,7 @@ class MORIDiagnosticState:
                 "tier": factor.tier.value,
                 "pending_tier": factor.pending_tier.value if factor.pending_tier else None,
                 "generation": program.generation,
+                "service_bypass_tokens": factor.service_bypass_tokens,
             }
             context["current_score"] = score_components(
                 factor,
