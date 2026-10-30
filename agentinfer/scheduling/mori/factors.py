@@ -8,6 +8,8 @@ import math
 from dataclasses import dataclass
 from enum import Enum
 
+from agentinfer.scheduling.domain import ProgramRef
+
 
 class MORITier(str, Enum):
     """Logical cache protection tier, independent of Program execution state."""
@@ -23,6 +25,9 @@ class MORIGlobalFactors:
 
     schedule_cycles: int = 0
     schedule_requested_at: float | None = None
+    # Exact generation owning the one cross-cycle resource-debt frontier.
+    # Keep new fields after the original public positional parameters.
+    service_debt_frontier: ProgramRef | None = None
 
     def __post_init__(self) -> None:
         if self.schedule_cycles < 0:
@@ -31,6 +36,8 @@ class MORIGlobalFactors:
             not math.isfinite(self.schedule_requested_at) or self.schedule_requested_at < 0
         ):
             raise ValueError("MORI schedule request time must be finite and non-negative")
+        if self.service_debt_frontier is not None and not isinstance(self.service_debt_frontier, ProgramRef):
+            raise ValueError("MORI service debt frontier must be a ProgramRef when supplied")
 
 
 @dataclass(frozen=True)

@@ -277,10 +277,37 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             for p in snapshot.programs
             if p.state is ProgramState.PAUSED and p.status is ProgramStatus.REASONING and not p.marked_for_pause
         ]
+        service_debt_frontier: ProgramView | None = None
+        frontier_ref = (
+            strategy_factors.global_factors.service_debt_frontier if self.config.enable_bounded_service_debt else None
+        )
+        if frontier_ref is not None:
+            frontier_view = snapshot.program(frontier_ref)
+            frontier_factor = strategy_factors.for_program(frontier_ref)
+            if frontier_view is None or frontier_factor is None:
+                self._clear_service_debt_frontier(strategy_factors, frontier_ref, "absent")
+                frontier_ref = None
+            elif frontier_view not in candidates:
+                self._clear_service_debt_frontier(strategy_factors, frontier_ref, "not_waiting")
+                frontier_ref = None
+            else:
+                service_debt_frontier = frontier_view
         if not candidates:
             return ()
         gpu, cpu = self._ledgers(snapshot, strategy_factors)
         quota = self._gpu_quota(snapshot)
+        service_debt_claim = (
+            self._claim(service_debt_frontier, snapshot, gpu=True) if service_debt_frontier is not None else None
+        )
+        if service_debt_claim is not None and service_debt_claim.tokens > quota:
+            assert frontier_ref is not None
+            self._clear_service_debt_frontier(strategy_factors, frontier_ref, "exceeds_quota")
+            frontier_ref = None
+            service_debt_frontier = None
+            service_debt_claim = None
+        elif service_debt_frontier is not None:
+            self.counters["service_debt_frontier_retained_cycles"] += 1
+        election_closed_this_cycle = frontier_ref is not None
         if gpu.used > quota:
             self.counters["promotion_blocked_capacity_debt"] += 1
             if self._slow_diagnostics is not None:
@@ -298,7 +325,21 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                         decision["reason"] = "global_capacity_debt"
             return ()
         now = snapshot.observed_at_monotonic_s
-        candidates.sort(key=lambda p: self._promotion_key(p, strategy_factors, snapshot, now))
+        frontier_saturated_at_cycle_entry = bool(
+            frontier_ref is not None
+            and service_debt_claim is not None
+            and self._factor(strategy_factors, frontier_ref).service_bypass_tokens
+            >= max(1, gpu.incremental(service_debt_claim))
+        )
+        candidates.sort(
+            key=lambda p: self._promotion_key(
+                p,
+                strategy_factors,
+                snapshot,
+                now,
+                service_debt_urgent=frontier_saturated_at_cycle_entry and p.ref == frontier_ref,
+            )
+        )
         victims = [
             p
             for p in snapshot.programs
@@ -316,11 +357,20 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         exchange_valid = True
         demoted = []
         admitted_before = 0
-        service_debt_target: ProgramView | None = None
-        service_debt_claim: CapacityClaim | None = None
+        service_debt_target = service_debt_frontier
+        service_debt_target_blocked = False
+        service_debt_target_saturated = frontier_saturated_at_cycle_entry
+        service_debt_target_pinned = False
+        saturation_reached = False
         for rank, candidate in enumerate(candidates):
             self.counters["planning_candidates"] += 1
+            frontier_ref = (
+                strategy_factors.global_factors.service_debt_frontier
+                if self.config.enable_bounded_service_debt
+                else None
+            )
             exchange_victims: list[ProgramView] = []
+            used_service_debt_rebalance = False
             needed_victims = removed
             claim = self._claim(candidate, snapshot, gpu=True)
             candidate_incremental = gpu.incremental(claim)
@@ -328,11 +378,15 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                 self._factor(strategy_factors, candidate.ref) if self.config.enable_bounded_service_debt else None
             )
             service_debt_required = max(1, candidate_incremental)
+            is_service_debt_frontier = frontier_ref == candidate.ref
             service_debt_urgent = (
                 self.config.enable_bounded_service_debt
+                and is_service_debt_frontier
                 and candidate_factor is not None
                 and candidate_factor.service_bypass_tokens >= service_debt_required
             )
+            if service_debt_urgent:
+                self.counters["service_debt_urgent_evaluations"] += 1
             decision = (
                 self._slow_diagnostics.begin(
                     candidate, snapshot, strategy_factors, gpu, claim, rank=rank, admitted_before=admitted_before
@@ -340,16 +394,26 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                 if self._slow_diagnostics is not None
                 else None
             )
+            service_debt_decision: dict[str, object] | None = None
             if decision is not None:
-                decision["service_debt"] = {
+                service_debt_decision = {
                     "charged_tokens": candidate_factor.service_bypass_tokens if candidate_factor is not None else 0,
                     "required_tokens": service_debt_required,
                     "urgent": service_debt_urgent,
+                    "saturated": service_debt_urgent,
+                    "is_frontier": is_service_debt_frontier,
+                    "frontier_generation": frontier_ref.generation if frontier_ref is not None else None,
+                    "binary_urgent": service_debt_urgent,
+                    "capacity_state": "evaluating",
+                    "all_acting_required_tokens": None,
                 }
+                decision["service_debt"] = service_debt_decision
             if claim.tokens > quota:
                 self.counters["promotion_exceeds_total_quota"] += 1
                 if decision is not None:
                     decision["reason"] = "claim_exceeds_total_quota"
+                    assert service_debt_decision is not None
+                    service_debt_decision["capacity_state"] = "exceeds_total_quota"
                 continue
             if gpu.used + candidate_incremental > quota:
                 candidate_idle = self._idleness(self._factor(strategy_factors, candidate.ref), now)
@@ -364,6 +428,13 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                     if self.config.enable_bounded_service_debt or decision is not None
                     else None
                 )
+                if service_debt_decision is not None:
+                    service_debt_decision["all_acting_required_tokens"] = all_acting_required
+                    service_debt_decision["capacity_state"] = (
+                        "fits_after_acting"
+                        if all_acting_required is not None and all_acting_required <= quota
+                        else "pinned_infeasible"
+                    )
                 if (
                     service_debt_urgent
                     and exchange_valid
@@ -372,7 +443,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                 ):
                     eligible = len(victims)
                     reason = "mori_service_debt_rebalance"
-                    self.counters["service_debt_rebalances"] += 1
+                    used_service_debt_rebalance = True
                     eligible_required = all_acting_required
                 if decision is not None:
                     decision["relief"] = {
@@ -395,17 +466,27 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                         if all_acting_required is not None and all_acting_required <= quota
                         else "no_all_acting_fit"
                     )
-                    if self.config.enable_bounded_service_debt and exchange_valid and service_debt_target is None:
-                        service_debt_target = candidate
-                        service_debt_claim = claim
-                        self.counters["service_debt_candidates"] += 1
-                    reserve_for_service = service_debt_urgent and block_reason == "no_all_acting_fit"
-                    if reserve_for_service:
-                        self.counters["service_debt_reservations"] += 1
+                    if self.config.enable_bounded_service_debt and exchange_valid:
+                        if frontier_ref is None and not election_closed_this_cycle:
+                            if self._set_service_debt_frontier(strategy_factors, candidate.ref):
+                                frontier_ref = candidate.ref
+                                election_closed_this_cycle = True
+                                service_debt_target = candidate
+                                service_debt_claim = claim
+                                service_debt_target_saturated = False
+                                if service_debt_decision is not None:
+                                    service_debt_decision["is_frontier"] = True
+                                    service_debt_decision["frontier_generation"] = candidate.ref.generation
+                        if candidate.ref == frontier_ref:
+                            service_debt_target = candidate
+                            service_debt_claim = claim
+                            service_debt_target_blocked = True
+                            service_debt_target_saturated = service_debt_urgent
+                            service_debt_target_pinned = service_debt_urgent and block_reason == "no_all_acting_fit"
+                            if service_debt_target_pinned:
+                                self.counters["service_debt_pinned_infeasible_evaluations"] += 1
                     if decision is not None:
-                        decision["reason"] = "service_debt_reservation" if reserve_for_service else block_reason
-                    if reserve_for_service:
-                        break
+                        decision["reason"] = block_reason
                     continue
                 # Establish a feasible whole plan before evicting anything.
                 # Candidate/victim sharing makes individual claim sizes unsafe
@@ -418,6 +499,8 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                     else:
                         low = middle + 1
                 needed_victims = low
+            elif service_debt_decision is not None:
+                service_debt_decision["capacity_state"] = "fits_now"
             try:
                 while removed < needed_victims:
                     victim = victims[removed]
@@ -438,42 +521,75 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                     if decision is not None:
                         decision["reason"] = "demotion_rejected"
                     continue
+                admitted_tokens = gpu.incremental(claim)
+                charge_target_ref: ProgramRef | None = None
+                charge_target_claim: CapacityClaim | None = None
+                charge_target_was_saturated = False
+                charge_target_was_pinned = False
+                if (
+                    self.config.enable_bounded_service_debt
+                    and service_debt_target is not None
+                    and service_debt_claim is not None
+                    and service_debt_target_blocked
+                    and strategy_factors.global_factors.service_debt_frontier == service_debt_target.ref
+                ):
+                    target_factor = strategy_factors.for_program(service_debt_target.ref)
+                    if target_factor is not None:
+                        charge_target_ref = service_debt_target.ref
+                        charge_target_claim = service_debt_claim
+                        charge_target_was_saturated = service_debt_target_saturated or (
+                            target_factor.service_bypass_tokens >= max(1, gpu.incremental(service_debt_claim))
+                        )
+                        charge_target_was_pinned = service_debt_target_pinned
+                was_urgent_owner = service_debt_urgent
                 result = (transitions.resume if candidate.step_count else transitions.admit)(
                     candidate.ref, reason="mori_cycle_promote", backend_id=snapshot.backend_id
                 )
                 if result.applied:
-                    admitted_tokens = gpu.incremental(claim)
                     gpu.add(candidate.ref, claim)
                     projection.admit(claim)
                     cpu.remove(candidate.ref)
                     has_reasoning = True
                     self.counters["promotion_applied"] += 1
                     admitted_before += 1
+                    if was_urgent_owner:
+                        self.counters["service_debt_urgent_services"] += 1
+                        if used_service_debt_rebalance:
+                            self.counters["service_debt_rebalances"] += 1
                     if (
-                        self.config.enable_bounded_service_debt
-                        and service_debt_target is not None
-                        and service_debt_claim is not None
-                        and admitted_tokens > 0
+                        charge_target_ref is not None
+                        and charge_target_claim is not None
+                        and strategy_factors.global_factors.service_debt_frontier == charge_target_ref
                     ):
-                        target_factor = self._factor(strategy_factors, service_debt_target.ref)
-                        charged = target_factor.service_bypass_tokens + admitted_tokens
-                        self._set_factor(
-                            strategy_factors,
-                            service_debt_target.ref,
-                            replace(target_factor, service_bypass_tokens=charged),
-                        )
-                        self.counters["service_debt_charged_tokens"] += admitted_tokens
-                        if decision is not None:
-                            decision["charged_service_debt"] = {
-                                "program_id": service_debt_target.ref.program_id,
-                                "generation": service_debt_target.ref.generation,
-                                "tokens": admitted_tokens,
-                                "total_tokens": charged,
-                            }
-                        next_required = max(1, gpu.incremental(service_debt_claim))
-                        if charged >= next_required:
-                            self.counters["service_debt_bypass_limits"] += 1
-                            self._request_schedule(strategy_factors, now)
+                        target_factor = strategy_factors.for_program(charge_target_ref)
+                        if target_factor is not None:
+                            if charge_target_was_saturated:
+                                if charge_target_was_pinned:
+                                    self.counters["service_debt_pinned_backfill_admissions"] += 1
+                            else:
+                                charged = target_factor.service_bypass_tokens
+                                if admitted_tokens > 0:
+                                    charged += admitted_tokens
+                                    self._set_factor(
+                                        strategy_factors,
+                                        charge_target_ref,
+                                        replace(target_factor, service_bypass_tokens=charged),
+                                    )
+                                    self.counters["service_debt_charge_events"] += 1
+                                    self.counters["service_debt_charged_tokens"] += admitted_tokens
+                                    if decision is not None:
+                                        decision["charged_service_debt"] = {
+                                            "program_id": charge_target_ref.program_id,
+                                            "generation": charge_target_ref.generation,
+                                            "tokens": admitted_tokens,
+                                            "total_tokens": charged,
+                                        }
+                                    next_required = max(1, gpu.incremental(charge_target_claim))
+                                    if charged >= next_required:
+                                        self.counters["service_debt_saturations"] += 1
+                                        self.counters["service_debt_bypass_limits"] += 1
+                                        self._request_schedule(strategy_factors, now)
+                                        saturation_reached = True
             finally:
                 # Spend CPU relief only after admission commits. Rejected
                 # promotions keep their CPU claim; accepted pauses still need
@@ -482,14 +598,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             if decision is not None:
                 decision["reason"] = "promotion_applied" if result.applied else "promotion_rejected"
                 decision["transition_reason"] = result.reason
-            if (
-                result.applied
-                and self.config.enable_bounded_service_debt
-                and service_debt_target is not None
-                and service_debt_claim is not None
-                and self._factor(strategy_factors, service_debt_target.ref).service_bypass_tokens
-                >= max(1, gpu.incremental(service_debt_claim))
-            ):
+            if saturation_reached:
                 break
         return tuple(demoted)
 
@@ -623,6 +732,63 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         )
         gpu_reserved = self._gpu_reserved_tokens(snapshot, strategy_factors)
         cpu_reserved = self._cpu_reserved_tokens(snapshot, strategy_factors)
+        frontier_ref = (
+            strategy_factors.global_factors.service_debt_frontier if self.config.enable_bounded_service_debt else None
+        )
+        frontier_present = False
+        frontier_program_id = None
+        frontier_generation = None
+        frontier_tokens = 0
+        frontier_claim_tokens = 0
+        frontier_incremental_tokens = 0
+        frontier_saturated = False
+        frontier_capacity_state = "absent"
+        frontier_all_acting_required_tokens = 0
+        frontier_view = snapshot.program(frontier_ref) if frontier_ref is not None else None
+        frontier_factor = strategy_factors.for_program(frontier_ref) if frontier_ref is not None else None
+        if (
+            frontier_ref is not None
+            and frontier_view is not None
+            and frontier_factor is not None
+            and frontier_view.state is ProgramState.PAUSED
+            and frontier_view.status is ProgramStatus.REASONING
+            and not frontier_view.marked_for_pause
+        ):
+            frontier_present = True
+            frontier_program_id = frontier_ref.program_id
+            frontier_generation = frontier_ref.generation
+            diagnostic_gpu = CapacityLedger(snapshot.hbm_block_size_tokens or 1)
+            for program in snapshot.programs:
+                sidecar = strategy_factors.for_program(program.ref)
+                if sidecar is not None and sidecar.tier is MORITier.GPU:
+                    diagnostic_gpu.add(program.ref, self._claim(program, snapshot, gpu=True))
+            frontier_claim = self._claim(frontier_view, snapshot, gpu=True)
+            frontier_tokens = frontier_factor.service_bypass_tokens
+            frontier_claim_tokens = frontier_claim.tokens
+            frontier_incremental_tokens = diagnostic_gpu.incremental(frontier_claim)
+            frontier_saturated = frontier_claim.tokens <= self._gpu_quota(snapshot) and frontier_tokens >= max(
+                1, frontier_incremental_tokens
+            )
+            diagnostic_victims = tuple(
+                program.ref
+                for program in snapshot.programs
+                if program.ref in diagnostic_gpu.claims
+                and program.state is ProgramState.ACTIVE
+                and program.status is ProgramStatus.ACTING
+                and not program.marked_for_pause
+                and self._factor(strategy_factors, program.ref).pending_tier is None
+            )
+            frontier_all_acting_required_tokens = ReliefProjection(diagnostic_gpu, diagnostic_victims).required(
+                len(diagnostic_victims), frontier_claim
+            )
+            if frontier_claim.tokens > self._gpu_quota(snapshot):
+                frontier_capacity_state = "exceeds_total_quota"
+            elif diagnostic_gpu.used + frontier_incremental_tokens <= self._gpu_quota(snapshot):
+                frontier_capacity_state = "fits_now"
+            elif frontier_all_acting_required_tokens <= self._gpu_quota(snapshot):
+                frontier_capacity_state = "fits_after_acting"
+            else:
+                frontier_capacity_state = "pinned_infeasible"
         prompt_tokens = self.counters["cache_prompt_tokens"]
         prefix_hit_tokens = self.counters["cache_prefix_hit_tokens"]
         hbm_hit_tokens = self.counters["cache_hbm_hit_tokens"]
@@ -662,6 +828,18 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                     ("service_debt_programs", sum(value > 0 for value in service_debts)),
                     ("service_debt_tokens", sum(service_debts)),
                     ("max_service_debt_tokens", max(service_debts, default=0)),
+                    ("service_debt_frontier_present", frontier_present),
+                    ("service_debt_frontier_program_id", frontier_program_id),
+                    ("service_debt_frontier_generation", frontier_generation),
+                    ("service_debt_frontier_tokens", frontier_tokens),
+                    ("service_debt_frontier_claim_tokens", frontier_claim_tokens),
+                    ("service_debt_frontier_incremental_tokens", frontier_incremental_tokens),
+                    ("service_debt_frontier_saturated", frontier_saturated),
+                    ("service_debt_frontier_capacity_state", frontier_capacity_state),
+                    (
+                        "service_debt_frontier_all_acting_required_tokens",
+                        frontier_all_acting_required_tokens,
+                    ),
                     (
                         "max_wait_seconds",
                         max(
@@ -692,10 +870,25 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                             "rebalance_demotions",
                             "idle_gpu_progress_demotions",
                             "service_debt_candidates",
+                            "service_debt_frontier_elections",
+                            "service_debt_frontier_retained_cycles",
+                            "service_debt_charge_events",
                             "service_debt_charged_tokens",
+                            "service_debt_saturations",
                             "service_debt_bypass_limits",
+                            "service_debt_urgent_evaluations",
+                            "service_debt_urgent_services",
                             "service_debt_rebalances",
                             "service_debt_reservations",
+                            "service_debt_frontier_clears_served",
+                            "service_debt_frontier_clears_cancelled",
+                            "service_debt_frontier_clears_new_spell",
+                            "service_debt_frontier_clears_released",
+                            "service_debt_frontier_clears_absent",
+                            "service_debt_frontier_clears_not_waiting",
+                            "service_debt_frontier_clears_exceeds_quota",
+                            "service_debt_pinned_infeasible_evaluations",
+                            "service_debt_pinned_backfill_admissions",
                         )
                     ),
                 ),
@@ -712,6 +905,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             and event.current_status is ProgramStatus.ACTING
             and event.reason == "request_cancelled"
         ):
+            self._clear_service_debt_frontier(strategy_factors, event.program, "cancelled")
             sidecar = self._factor(strategy_factors, event.program)
             elapsed = (
                 max(0.0, event.occurred_at_monotonic_s - sidecar.reasoning_started_at_monotonic_s)
@@ -736,6 +930,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             return
         if event.program is None or event.current_status is not ProgramStatus.REASONING:
             return
+        self._clear_service_debt_frontier(strategy_factors, event.program, "new_spell")
         sidecar = self._factor(strategy_factors, event.program)
         cycles = sidecar.cycles
         if sidecar.acting_started_at_monotonic_s is not None:
@@ -837,6 +1032,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
     def on_program_released(self, strategy_factors: MORIFactors, event: SchedulingEvent) -> None:
         if event.program is None:
             return
+        self._clear_service_debt_frontier(strategy_factors, event.program, "released")
         if self._slow_diagnostics is not None:
             self._slow_diagnostics.release(event.program)
         self._request_schedule(strategy_factors, event.occurred_at_monotonic_s)
@@ -849,6 +1045,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
     def _on_gpu_transition(self, strategy_factors: MORIFactors, event: SchedulingEvent) -> None:
         if event.program is None:
             return
+        self._clear_service_debt_frontier(strategy_factors, event.program, "served")
         sidecar = self._factor(strategy_factors, event.program)
         self._set_factor(
             strategy_factors,
@@ -1042,18 +1239,23 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         factors: MORIFactors,
         snapshot: SchedulingSnapshot,
         now: float,
-    ) -> tuple[int, int, float, str, int]:
+        *,
+        service_debt_urgent: bool = False,
+    ) -> tuple[object, ...]:
         """Order by MORI tier, new context size, idleness and stable identity."""
         tier = self._factor(factors, program.ref).tier
         priority = 0 if tier is MORITier.CPU else 1 if program.step_count > 0 else 2
         new_context = self._gpu_target(program, snapshot) if priority == 2 else 0
-        return (
+        legacy_key = (
             priority,
             new_context,
             self._idleness(self._factor(factors, program.ref), now),
             program.ref.program_id,
             program.ref.generation,
         )
+        if not self.config.enable_bounded_service_debt:
+            return legacy_key
+        return (0 if service_debt_urgent else 1, *legacy_key)
 
     @staticmethod
     def _wait_seconds(program: ProgramView, now: float) -> float:
@@ -1148,6 +1350,36 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
     def _factor(self, factors: MORIFactors, ref: ProgramRef) -> MORIProgramFactors:
         """Read without materializing an owner from a stale snapshot or callback."""
         return factors.for_program(ref) or MORIProgramFactors()
+
+    def _set_service_debt_frontier(self, factors: MORIFactors, ref: ProgramRef) -> bool:
+        """Elect one exact generation without replacing an existing frontier."""
+        if not self.config.enable_bounded_service_debt:
+            return False
+        current = factors.global_factors
+        if current.service_debt_frontier is not None or factors.for_program(ref) is None:
+            return False
+        sidecar = factors.for_program(ref)
+        assert sidecar is not None
+        if sidecar.service_bypass_tokens:
+            self._set_factor(factors, ref, replace(sidecar, service_bypass_tokens=0))
+        factors.set_global_factors(replace(current, service_debt_frontier=ref))
+        self.counters["service_debt_frontier_elections"] += 1
+        self.counters["service_debt_candidates"] += 1
+        return True
+
+    def _clear_service_debt_frontier(self, factors: MORIFactors, expected_ref: ProgramRef, reason: str) -> bool:
+        """Clear only the matching exact generation and its still-live credit."""
+        if not self.config.enable_bounded_service_debt:
+            return False
+        current = factors.global_factors
+        if current.service_debt_frontier != expected_ref:
+            return False
+        sidecar = factors.for_program(expected_ref)
+        if sidecar is not None and sidecar.service_bypass_tokens:
+            self._set_factor(factors, expected_ref, replace(sidecar, service_bypass_tokens=0))
+        factors.set_global_factors(replace(current, service_debt_frontier=None))
+        self.counters[f"service_debt_frontier_clears_{reason}"] += 1
+        return True
 
     def _set_factor(self, factors: MORIFactors, ref: ProgramRef, sidecar: MORIProgramFactors) -> None:
         previous_class = self._classes.get(ref, CacheClass.INACTIVE)
