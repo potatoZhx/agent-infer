@@ -45,11 +45,12 @@ class MORIProgramFactors:
     # Non-GPU Reasoning fairness credit only; cleared at admission, never history.
     reasoning_wait_seconds: float = 0.0
     reasoning_wait_started_at_monotonic_s: float | None = None
-    # Resource-denominated service debt. Later admissions charge only the
-    # highest-ranked feasible waiter they bypass; successful service clears it.
-    service_bypass_tokens: int = 0
     pending_tier: MORITier | None = None
     execution_observed: bool = False
+    # Resource-denominated service debt. Later admissions charge only the
+    # highest-ranked feasible waiter they bypass; successful service clears it.
+    # Keep new fields after the original public positional parameters.
+    service_bypass_tokens: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.tier, MORITier):

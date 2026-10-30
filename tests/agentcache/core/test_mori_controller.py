@@ -78,6 +78,17 @@ def test_bounded_service_debt_can_be_enabled_independently() -> None:
     assert controller.strategy.config.enable_bounded_service_debt is True
 
 
+def test_bounded_service_debt_preserves_original_config_positional_arguments() -> None:
+    config = MORIConfig(3, MORIMode.FULL, False, 7, 11.0, 13.0)
+
+    assert config.window_size == 3
+    assert config.enable_wait_credit is False
+    assert config.decode_buffer_tokens == 7
+    assert config.slow_request_threshold_seconds == 11.0
+    assert config.slow_request_repeat_seconds == 13.0
+    assert config.enable_bounded_service_debt is False
+
+
 @pytest.mark.parametrize("value", [0, 1, "false", None])
 def test_wait_credit_requires_an_exact_boolean(value: object) -> None:
     with pytest.raises(ValueError, match="enable_wait_credit must be a boolean"):

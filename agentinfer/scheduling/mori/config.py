@@ -23,10 +23,11 @@ class MORIConfig:
     window_size: int = 5
     mode: MORIMode = MORIMode.FULL
     enable_wait_credit: bool = True
-    enable_bounded_service_debt: bool = False
     decode_buffer_tokens: int = 100
     slow_request_threshold_seconds: float = 30.0
     slow_request_repeat_seconds: float = 60.0
+    # Keep new fields after the original public positional parameters.
+    enable_bounded_service_debt: bool = False
 
     def __post_init__(self) -> None:
         if self.window_size <= 0:

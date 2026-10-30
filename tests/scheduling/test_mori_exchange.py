@@ -233,6 +233,14 @@ def test_service_debt_factor_requires_non_negative_integer_tokens(value):
         MORIProgramFactors(service_bypass_tokens=value)
 
 
+def test_service_debt_preserves_original_factor_positional_arguments():
+    factor = MORIProgramFactors(MORITier.CPU, (), 1.0, 2.0, 3.0, 4.0, 5.0, MORITier.WAITING, True)
+
+    assert factor.pending_tier is MORITier.WAITING
+    assert factor.execution_observed is True
+    assert factor.service_bypass_tokens == 0
+
+
 def test_exchange_keeps_victim_in_cpu_space_released_by_successful_promotion():
     components = build_mori_strategy(MORIConfig(decode_buffer_tokens=0))
     victim = _program("victim", 700, acting=True, gpu=True)
