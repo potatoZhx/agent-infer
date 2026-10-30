@@ -105,6 +105,8 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         if sidecar is None:
             return
         if running:
+            if sidecar.reasoning_wait_seconds or sidecar.reasoning_wait_started_at_monotonic_s is not None:
+                sidecar = replace(sidecar, reasoning_wait_seconds=0.0, reasoning_wait_started_at_monotonic_s=None)
             if not sidecar.execution_observed:
                 sidecar = replace(
                     sidecar,
@@ -314,6 +316,8 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         admitted_before = 0
         for rank, candidate in enumerate(candidates):
             self.counters["planning_candidates"] += 1
+            exchange_victims: list[ProgramView] = []
+            needed_victims = removed
             claim = self._claim(candidate, snapshot, gpu=True)
             decision = (
                 self._slow_diagnostics.begin(
@@ -368,16 +372,19 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                         high = middle
                     else:
                         low = middle + 1
-                while removed < low:
+                needed_victims = low
+            try:
+                while removed < needed_victims:
                     victim = victims[removed]
                     self.counters["planning_victims"] += 1
-                    if not self._demote(victim, snapshot, strategy_factors, transitions, gpu, cpu, reason=reason):
+                    if not self._pause_for_exchange(victim, strategy_factors, transitions, gpu, reason=reason):
                         # Accepted earlier pauses remain real; a rejected one
                         # invalidates speculative exchanges for the rest of the
                         # round. Subsequent admissions may still use real slack.
                         exchange_valid = False
                         break
                     demoted.append(replace(victim, state=ProgramState.PAUSED, backend_id=None, marked_for_pause=False))
+                    exchange_victims.append(victim)
                     removed += 1
                     self.counters["rebalance_demotions"] += 1
                     if reason == "mori_idle_gpu_progress":
@@ -386,20 +393,70 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                     if decision is not None:
                         decision["reason"] = "demotion_rejected"
                     continue
-            result = (transitions.resume if candidate.step_count else transitions.admit)(
-                candidate.ref, reason="mori_cycle_promote", backend_id=snapshot.backend_id
-            )
-            if result.applied:
-                gpu.add(candidate.ref, claim)
-                projection.admit(claim)
-                cpu.remove(candidate.ref)
-                has_reasoning = True
-                self.counters["promotion_applied"] += 1
-                admitted_before += 1
+                result = (transitions.resume if candidate.step_count else transitions.admit)(
+                    candidate.ref, reason="mori_cycle_promote", backend_id=snapshot.backend_id
+                )
+                if result.applied:
+                    gpu.add(candidate.ref, claim)
+                    projection.admit(claim)
+                    cpu.remove(candidate.ref)
+                    has_reasoning = True
+                    self.counters["promotion_applied"] += 1
+                    admitted_before += 1
+            finally:
+                # Spend CPU relief only after admission commits. Rejected
+                # promotions keep their CPU claim; accepted pauses still need
+                # a destination based on that unchanged committed capacity.
+                self._place_exchange_victims(exchange_victims, snapshot, strategy_factors, cpu)
             if decision is not None:
                 decision["reason"] = "promotion_applied" if result.applied else "promotion_rejected"
                 decision["transition_reason"] = result.reason
         return tuple(demoted)
+
+    def _pause_for_exchange(
+        self,
+        victim: ProgramView,
+        factors: MORIFactors,
+        transitions: TransitionController,
+        gpu: CapacityLedger,
+        *,
+        reason: str,
+    ) -> bool:
+        """Pause an Acting lease while retaining protection until the exchange resolves.
+
+        The caller holds the scheduling lock for this synchronous hook. Keep
+        the GPU cache class through the pause so observers cannot retire the
+        owner or initiate a CPU retry using a speculative destination. Native
+        blocks and transfer pins remain entirely owned by the backend.
+        """
+        previous = self._factor(factors, victim.ref)
+        self._set_factor(factors, victim.ref, replace(previous, pending_tier=MORITier.GPU))
+        try:
+            result = transitions.pause(victim.ref, reason=reason)
+        except Exception:
+            self._set_factor(factors, victim.ref, previous)
+            raise
+        if not result.applied:
+            self._set_factor(factors, victim.ref, previous)
+            self.counters["demotion_rejected"] += 1
+            return False
+        gpu.remove(victim.ref)
+        return True
+
+    def _place_exchange_victims(
+        self,
+        victims: list[ProgramView],
+        snapshot: SchedulingSnapshot,
+        factors: MORIFactors,
+        cpu: CapacityLedger,
+    ) -> None:
+        """Commit paused victims against CPU capacity after the admission result."""
+        for victim in victims:
+            claim = self._claim(victim, snapshot, gpu=False)
+            target, replacements = self._cpu_destination(victim, snapshot, factors, cpu, claim)
+            sidecar = self._factor(factors, victim.ref)
+            self._set_factor(factors, victim.ref, replace(sidecar, tier=target, pending_tier=None))
+            self._commit_cpu_destination(victim, factors, cpu, claim, target, replacements)
 
     def repair_capacity(
         self,
@@ -673,6 +730,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                 tier=target,
                 pending_tier=None,
                 reasoning_started_at_monotonic_s=None,
+                reasoning_wait_seconds=0.0,
                 reasoning_wait_started_at_monotonic_s=(
                     event.occurred_at_monotonic_s if event.current_status is ProgramStatus.REASONING else None
                 ),
@@ -695,14 +753,6 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         if event.program is None:
             return
         sidecar = self._factor(strategy_factors, event.program)
-        waiting = sidecar.reasoning_wait_seconds
-        if sidecar.reasoning_wait_started_at_monotonic_s is not None:
-            interval = event.field("scheduler_wait_seconds")
-            waiting += (
-                self._event_non_negative_float(interval)
-                if interval is not None
-                else max(0.0, event.occurred_at_monotonic_s - sidecar.reasoning_wait_started_at_monotonic_s)
-            )
         self._set_factor(
             strategy_factors,
             event.program,
@@ -710,7 +760,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                 sidecar,
                 tier=MORITier.GPU,
                 pending_tier=None,
-                reasoning_wait_seconds=waiting,
+                reasoning_wait_seconds=0.0,
                 reasoning_wait_started_at_monotonic_s=None,
                 reasoning_started_at_monotonic_s=(
                     event.occurred_at_monotonic_s
@@ -766,17 +816,29 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             self._set_factor(factors, victim.ref, previous)
             self.counters["demotion_rejected"] += 1
             return False
-        for replaced in cpu_replacements:
+        self._commit_cpu_destination(victim, factors, cpu, cpu_claim, target, cpu_replacements)
+        if victim.status is ProgramStatus.ACTING:
+            gpu.remove(victim.ref)
+        return True
+
+    def _commit_cpu_destination(
+        self,
+        victim: ProgramView,
+        factors: MORIFactors,
+        cpu: CapacityLedger,
+        claim: CapacityClaim,
+        target: MORITier,
+        replacements: tuple[ProgramView, ...],
+    ) -> None:
+        """Apply one destination's CPU claims and relative replacements exactly once."""
+        for replaced in replacements:
             resident = self._factor(factors, replaced.ref)
             self._set_factor(factors, replaced.ref, replace(resident, tier=MORITier.WAITING))
             cpu.remove(replaced.ref)
             self.counters["cpu_relative_replacements"] += 1
         if target is MORITier.CPU:
-            cpu.add(victim.ref, cpu_claim)
-        if victim.status is ProgramStatus.ACTING:
-            gpu.remove(victim.ref)
+            cpu.add(victim.ref, claim)
         self.counters[f"demotion_to_{target.value}"] += 1
-        return True
 
     def _cpu_destination(
         self,
@@ -957,30 +1019,29 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
     def _idleness(self, sidecar: MORIProgramFactors, now: float) -> float:
         partial_reasoning = 0.0
         partial_acting = 0.0
+        wait_credit = 0.0
         has_partial = False
         if sidecar.acting_started_at_monotonic_s is not None:
             has_partial = True
             partial_reasoning = sidecar.pending_reasoning_seconds
             partial_acting = max(0.0, now - sidecar.acting_started_at_monotonic_s)
-        elif sidecar.reasoning_started_at_monotonic_s is not None:
-            has_partial = True
-            partial_reasoning = max(0.0, now - sidecar.reasoning_started_at_monotonic_s)
-            if sidecar.execution_observed:
-                partial_reasoning += sidecar.pending_reasoning_seconds
         elif sidecar.execution_observed:
             has_partial = True
             partial_reasoning = sidecar.pending_reasoning_seconds
-        # A queued current Reasoning is already the current window slot, even
-        # before native execution starts. Its credit survives admission but is
-        # discarded on completion; completed (R, A) pairs remain factual.
-        if sidecar.acting_started_at_monotonic_s is None:
-            partial_reasoning += sidecar.reasoning_wait_seconds
-            if sidecar.reasoning_wait_started_at_monotonic_s is not None:
-                has_partial = True
-                partial_reasoning += max(0.0, now - sidecar.reasoning_wait_started_at_monotonic_s)
+            if sidecar.reasoning_started_at_monotonic_s is not None:
+                partial_reasoning += max(0.0, now - sidecar.reasoning_started_at_monotonic_s)
+        # Fairness credit is separate from the factual window and exists only
+        # while a Reasoning request waits outside GPU. Admission removes it;
+        # native queueing before first execution is neither credit nor work.
+        if (
+            sidecar.tier is not MORITier.GPU
+            and sidecar.acting_started_at_monotonic_s is None
+            and sidecar.reasoning_wait_started_at_monotonic_s is not None
+        ):
+            wait_credit = max(0.0, now - sidecar.reasoning_wait_started_at_monotonic_s)
         keep = max(0, self.config.window_size - int(has_partial))
         cycles = sidecar.cycles[-keep:] if keep else ()
-        reasoning = sum(item[0] for item in cycles) + partial_reasoning
+        reasoning = sum(item[0] for item in cycles) + partial_reasoning + wait_credit
         acting = sum(item[1] for item in cycles) + partial_acting
         total = reasoning + acting
         return acting / total if total > 0 else 0.0

@@ -42,7 +42,7 @@ class MORIProgramFactors:
     pending_reasoning_seconds: float = 0.0
     acting_started_at_monotonic_s: float | None = None
     reasoning_started_at_monotonic_s: float | None = None
-    # Current-cycle scheduling credit only; never included in completed cycles.
+    # Non-GPU Reasoning fairness credit only; cleared at admission, never history.
     reasoning_wait_seconds: float = 0.0
     reasoning_wait_started_at_monotonic_s: float | None = None
     pending_tier: MORITier | None = None

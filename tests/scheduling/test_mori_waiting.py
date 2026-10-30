@@ -11,6 +11,7 @@ from agentinfer.scheduling.backend import BackendInfo, BackendPoolInfo, DpRankIn
 from agentinfer.scheduling.domain import ProgramRef, ProgramState, ProgramStatus
 from agentinfer.scheduling.identity import AgentIdentity
 from agentinfer.scheduling.mori import MORIConfig, MORIProgramFactors, MORITier, build_mori_strategy
+from agentinfer.scheduling.mori.diagnostics import score_components
 from agentinfer.scheduling.runtime import ProgramScheduler
 from tests.scheduling.test_mori_strategy import accepting_controller, snapshot, view
 
@@ -45,7 +46,7 @@ def runtime(window_size=3):
     return ProgramScheduler(components.strategy, components.initial_factors, pool(), schedule_interval_seconds=1)
 
 
-def test_waiting_survives_cpu_to_waiting_and_gpu_admission_but_never_enters_history():
+def test_waiting_survives_cpu_to_waiting_but_admission_clears_it_without_changing_history():
     scheduler = runtime()
     with patch("agentinfer.scheduling.runtime.time.monotonic", return_value=0.0) as clock:
         assert scheduler.on_request_arrival("first", AgentIdentity("p"), 96, pool(), "first")
@@ -75,22 +76,20 @@ def test_waiting_survives_cpu_to_waiting_and_gpu_admission_but_never_enters_hist
         scheduler.schedule_cycle(pool())
         assert [entry.request_id for entry, _ in scheduler.consume_admitted_requests()] == ["second"]
         admitted = scheduler.strategy_factors.for_program(ref)
-        assert admitted.reasoning_wait_seconds == 20.0
+        assert admitted.reasoning_wait_seconds == 0.0
         assert admitted.reasoning_wait_started_at_monotonic_s is None
         assert scheduler.registry.require(ref).wait_started_at_monotonic_s is None
-        assert scheduler.strategy.idleness_for_program(ref, 121.0) == pytest.approx(99 / 121)
+        assert scheduler.strategy.idleness_for_program(ref, 121.0) == pytest.approx(99 / 101)
 
         clock.return_value = 124.0
-        # Initial native-queue delay participates in the live current slot.
-        assert scheduler.strategy.idleness_for_program(ref, 124.0) == pytest.approx(99 / 124)
+        # Native waiting receives no fairness credit and occupies no window slot.
+        assert scheduler.strategy.idleness_for_program(ref, 124.0) == pytest.approx(99 / 101)
         scheduler.on_native_execution("second", running=True)
-        # The transient native wait is discarded once actual execution begins;
-        # request-pool wait remains frozen until this Reasoning step completes.
-        assert scheduler.strategy.idleness_for_program(ref, 124.0) == pytest.approx(99 / 121)
+        assert scheduler.strategy.idleness_for_program(ref, 124.0) == pytest.approx(99 / 101)
         clock.return_value = 126.0
         scheduler.on_native_execution("second", running=False)
         # Native preemption is neither real execution nor CPU/WAITING credit.
-        assert scheduler.strategy.idleness_for_program(ref, 136.0) == pytest.approx(99 / 123)
+        assert scheduler.strategy.idleness_for_program(ref, 136.0) == pytest.approx(99 / 103)
         clock.return_value = 136.0
         scheduler.on_native_execution("second", running=True)
         clock.return_value = 139.0
@@ -106,8 +105,8 @@ def test_waiting_survives_cpu_to_waiting_and_gpu_admission_but_never_enters_hist
         assert scheduler.strategy_factors.for_program(ref).cycles == ((2.0, 99.0), (5.0, 10.0))
 
 
-@pytest.mark.parametrize("window,expected", [(1, 0.0), (2, 9 / 15), (3, 109 / 116)])
-def test_waiting_current_cycle_uses_one_existing_window_slot(window, expected):
+@pytest.mark.parametrize("window,expected", [(1, 9 / 15), (2, 109 / 116), (3, 109 / 116)])
+def test_waiting_credit_preserves_completed_window(window, expected):
     components = build_mori_strategy(MORIConfig(window_size=window))
     owner = ProgramRef("waiting", 0)
     sidecar = MORIProgramFactors(
@@ -118,6 +117,99 @@ def test_waiting_current_cycle_uses_one_existing_window_slot(window, expected):
     components.strategy._set_factor(components.initial_factors, owner, sidecar)
     assert components.strategy.idleness_for_program(owner, 15.0) == pytest.approx(expected)
     assert components.initial_factors.for_program(owner).cycles == ((1.0, 100.0), (1.0, 9.0))
+
+
+@pytest.mark.parametrize("window", [1, 5])
+@pytest.mark.parametrize("tier", [MORITier.CPU, MORITier.WAITING, MORITier.GPU])
+@pytest.mark.parametrize("oldest_cycle", [(1.0, 99.0), (99.0, 1.0)])
+def test_entering_wait_does_not_drop_history_or_jump_score(window, tier, oldest_cycle):
+    components = build_mori_strategy(MORIConfig(window_size=window))
+    cycles = (oldest_cycle,) + ((50.0, 50.0),) * (window - 1)
+    before = MORIProgramFactors(tier=tier, cycles=cycles)
+    native_queue = tier is MORITier.GPU
+    queued = replace(
+        before,
+        reasoning_started_at_monotonic_s=10.0 if native_queue else None,
+        reasoning_wait_started_at_monotonic_s=None if native_queue else 10.0,
+    )
+    score = components.strategy._idleness
+    assert score(queued, 10.0) == score(before, 10.0)
+    reasoning = sum(cycle[0] for cycle in cycles)
+    acting = sum(cycle[1] for cycle in cycles)
+    credit = 0.0 if native_queue else 10.0
+    assert score(queued, 20.0) == pytest.approx(acting / (reasoning + acting + credit))
+    fields = score_components(queued, 20.0, window)
+    assert fields["idleness"] == score(queued, 20.0)
+    assert fields["retained_cycles"] == window
+    assert fields["dropped_cycles"] == 0
+    assert fields["partial_reasoning_seconds"] == 0
+    assert fields["current_wait_credit_seconds"] == credit
+    assert fields["wait_affects_idleness"] is not native_queue
+
+
+@pytest.mark.parametrize("window", [1, 5])
+def test_first_execution_uses_partial_slot_without_wait_credit(window):
+    components = build_mori_strategy(MORIConfig(window_size=window))
+    owner = ProgramRef("queued", 0)
+    cycles = ((1.0, 99.0),) + ((50.0, 50.0),) * (window - 1)
+    queued = MORIProgramFactors(
+        tier=MORITier.GPU,
+        cycles=cycles,
+        reasoning_started_at_monotonic_s=10.0,
+    )
+    components.strategy._set_factor(components.initial_factors, owner, queued)
+    components.strategy.on_execution_changed(components.initial_factors, owner, 20.0, running=True)
+    running = components.initial_factors.for_program(owner)
+    fields = score_components(running, 23.0, window)
+    assert fields["retained_cycles"] == window - 1
+    assert fields["dropped_cycles"] == 1
+    assert fields["partial_reasoning_seconds"] == 3.0
+    assert fields["current_wait_credit_seconds"] == 0.0
+    assert fields["wait_affects_idleness"] is False
+    assert fields["idleness"] == pytest.approx(50 * (window - 1) / (100 * (window - 1) + 3))
+    assert fields["idleness"] == components.strategy._idleness(running, 23.0)
+    assert running.cycles == cycles
+
+
+def test_first_admission_clears_fairness_credit_before_native_execution():
+    scheduler = runtime()
+    with patch("agentinfer.scheduling.runtime.time.monotonic", return_value=0.0) as clock:
+        assert not scheduler.on_request_arrival("first", AgentIdentity("p"), 96, pool(hbm=0), "first")
+        ref = scheduler.program_ref_for_request("first")
+        waiting = scheduler.strategy_factors.for_program(ref)
+        assert score_components(waiting, 100.0, 3)["current_wait_credit_seconds"] == 100.0
+
+        clock.return_value = 100.0
+        scheduler.schedule_cycle(pool())
+        assert [entry.request_id for entry, _ in scheduler.consume_admitted_requests()] == ["first"]
+        admitted = scheduler.strategy_factors.for_program(ref)
+        assert admitted.tier is MORITier.GPU
+        assert not admitted.execution_observed
+        assert admitted.reasoning_wait_seconds == 0.0
+        assert admitted.reasoning_wait_started_at_monotonic_s is None
+        fields = score_components(admitted, 110.0, 3)
+        assert fields["current_wait_credit_seconds"] == 0.0
+        assert fields["partial_reasoning_seconds"] == 0.0
+        assert fields["wait_affects_idleness"] is False
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        {"tier": MORITier.GPU, "reasoning_started_at_monotonic_s": 10.0},
+        {"tier": MORITier.CPU, "acting_started_at_monotonic_s": 10.0},
+        {"tier": MORITier.WAITING, "acting_started_at_monotonic_s": 10.0},
+    ],
+)
+def test_gpu_or_acting_state_cannot_receive_stale_wait_credit(state):
+    components = build_mori_strategy()
+    clean = MORIProgramFactors(cycles=((10.0, 90.0),), **state)
+    stale = replace(clean, reasoning_wait_seconds=100.0, reasoning_wait_started_at_monotonic_s=0.0)
+    assert components.strategy._idleness(stale, 100.0) == components.strategy._idleness(clean, 100.0)
+    fields = score_components(stale, 100.0, 5)
+    assert fields["current_wait_credit_seconds"] == 0.0
+    assert fields["wait_affects_idleness"] is False
+    assert fields["idleness"] == components.strategy._idleness(stale, 100.0)
 
 
 @pytest.mark.parametrize("tier", [MORITier.CPU, MORITier.WAITING])

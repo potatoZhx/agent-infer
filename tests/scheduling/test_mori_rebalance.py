@@ -109,7 +109,7 @@ def test_idle_gpu_reclaims_acting_even_for_tied_or_higher_idleness_waiter(window
         waiter_score = runtime.strategy.idleness_for_program(waiter, 110.0)
         resident_score = runtime.strategy.idleness_for_program(resident, 110.0)
         assert resident_score == 0
-        assert waiter_score == 0 if window_size == 1 else waiter_score > resident_score
+        assert waiter_score > resident_score
 
         runtime.schedule_cycle(pool())
 

@@ -24,20 +24,19 @@ def score_components(sidecar: MORIProgramFactors, now: float, window_size: int) 
         has_partial = True
         partial_reasoning = sidecar.pending_reasoning_seconds
         partial_acting = max(0.0, now - sidecar.acting_started_at_monotonic_s)
-    elif sidecar.reasoning_started_at_monotonic_s is not None:
-        has_partial = True
-        partial_reasoning = max(0.0, now - sidecar.reasoning_started_at_monotonic_s)
-        if sidecar.execution_observed:
-            partial_reasoning += sidecar.pending_reasoning_seconds
     elif sidecar.execution_observed:
         has_partial = True
         partial_reasoning = sidecar.pending_reasoning_seconds
+        if sidecar.reasoning_started_at_monotonic_s is not None:
+            partial_reasoning += max(0.0, now - sidecar.reasoning_started_at_monotonic_s)
     wait_credit = 0.0
-    if sidecar.acting_started_at_monotonic_s is None:
-        wait_credit = sidecar.reasoning_wait_seconds
-        if sidecar.reasoning_wait_started_at_monotonic_s is not None:
-            has_partial = True
-            wait_credit += max(0.0, now - sidecar.reasoning_wait_started_at_monotonic_s)
+    waiting = (
+        sidecar.tier is not MORITier.GPU
+        and sidecar.acting_started_at_monotonic_s is None
+        and sidecar.reasoning_wait_started_at_monotonic_s is not None
+    )
+    if waiting:
+        wait_credit = max(0.0, now - sidecar.reasoning_wait_started_at_monotonic_s)
     keep = max(0, window_size - int(has_partial))
     cycles = sidecar.cycles[-keep:] if keep else ()
     completed_reasoning = sum(cycle[0] for cycle in cycles)
@@ -53,7 +52,7 @@ def score_components(sidecar: MORIProgramFactors, now: float, window_size: int) 
         "partial_reasoning_seconds": partial_reasoning,
         "partial_acting_seconds": partial_acting,
         "current_wait_credit_seconds": wait_credit,
-        "wait_affects_idleness": True,
+        "wait_affects_idleness": waiting,
         "execution_observed": sidecar.execution_observed,
     }
 
