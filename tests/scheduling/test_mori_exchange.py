@@ -66,18 +66,20 @@ def _set_service_debt(components, program, tokens):
 
 def test_later_admission_charges_only_actual_gpu_tokens_to_highest_blocked_candidate():
     components = build_mori_strategy(MORIConfig(decode_buffer_tokens=0, enable_bounded_service_debt=True))
-    running = _program("running", 700, gpu=True)
+    running = _program("running", 500, gpu=True)
+    victim = _program("victim", 200, acting=True, gpu=True)
     blocked = _program("a-blocked", 400)
     lower = _program("b-lower", 350)
     first_backfill = _program("c-backfill", 50)
     second_backfill = _program("d-backfill", 50)
     set_tier(components, running, MORITier.GPU)
+    set_tier(components, victim, MORITier.GPU)
     set_tier(components, blocked, MORITier.CPU, idleness=0.0)
     set_tier(components, lower, MORITier.CPU, idleness=0.1)
     calls = []
 
     components.strategy.schedule_resume(
-        snapshot(running, blocked, lower, first_backfill, second_backfill, hbm=1000),
+        snapshot(running, victim, blocked, lower, first_backfill, second_backfill, hbm=1000),
         components.initial_factors,
         _controller(components, calls),
     )
@@ -89,6 +91,81 @@ def test_later_admission_charges_only_actual_gpu_tokens_to_highest_blocked_candi
     assert components.initial_factors.for_program(blocked.ref).service_bypass_tokens == 100
     assert components.initial_factors.for_program(lower.ref).service_bypass_tokens == 0
     assert components.strategy.counters["service_debt_charged_tokens"] == 100
+
+
+def test_election_skips_pinned_prefix_and_selects_first_actionable_blocked_candidate():
+    components = build_mori_strategy(
+        MORIConfig(
+            decode_buffer_tokens=0,
+            enable_bounded_service_debt=True,
+            slow_request_threshold_seconds=1,
+        )
+    )
+    running = _program("running", 600, gpu=True)
+    victim = _program("victim", 200, acting=True, gpu=True)
+    first_pinned = replace(_program("a-pinned", 450), wait_started_at_monotonic_s=0.0)
+    second_pinned = replace(_program("b-pinned", 425), wait_started_at_monotonic_s=0.0)
+    actionable = replace(
+        _program("c-actionable", 350),
+        ref=ProgramRef("c-actionable", 7),
+        wait_started_at_monotonic_s=0.0,
+    )
+    later_fit = _program("z-later-fit", 100)
+    set_tier(components, running, MORITier.GPU)
+    set_tier(components, victim, MORITier.GPU, idleness=0.5)
+    set_tier(components, first_pinned, MORITier.CPU, idleness=0.0)
+    set_tier(components, second_pinned, MORITier.CPU, idleness=0.1)
+    set_tier(components, actionable, MORITier.CPU, idleness=0.9)
+    calls = []
+
+    components.strategy.schedule_resume(
+        snapshot(running, victim, first_pinned, second_pinned, actionable, later_fit, hbm=1000),
+        components.initial_factors,
+        _controller(components, calls),
+    )
+
+    assert [(call.kind, call.program) for call in calls] == [(TransitionKind.RESUME, later_fit.ref)]
+    assert components.initial_factors.global_factors.service_debt_frontier == actionable.ref
+    assert components.initial_factors.for_program(first_pinned.ref).service_bypass_tokens == 0
+    assert components.initial_factors.for_program(second_pinned.ref).service_bypass_tokens == 0
+    assert components.initial_factors.for_program(actionable.ref).service_bypass_tokens == 100
+    assert components.strategy.counters["service_debt_election_skipped_pinned"] == 2
+    assert components.strategy.counters["service_debt_frontier_elections_actionable"] == 1
+    assert components.strategy.counters["service_debt_frontier_elections"] == 1
+    first_decision = components.strategy._slow_diagnostics.decisions[first_pinned.ref]["service_debt"]
+    actionable_decision = components.strategy._slow_diagnostics.decisions[actionable.ref]["service_debt"]
+    assert first_decision["capacity_state"] == "pinned_infeasible"
+    assert first_decision["election_state"] == "skipped_pinned"
+    assert actionable_decision["capacity_state"] == "fits_after_acting"
+    assert actionable_decision["election_state"] == "elected_actionable"
+    assert actionable_decision["frontier_generation"] == actionable.ref.generation
+
+
+def test_rejected_exchange_does_not_elect_and_real_slack_still_admits_later_fit():
+    components = build_mori_strategy(MORIConfig(decode_buffer_tokens=0, enable_bounded_service_debt=True))
+    victim = _program("victim", 600, acting=True, gpu=True)
+    running = _program("running", 300, gpu=True)
+    rejected = _program("a-rejected", 500)
+    later_fit = _program("z-later-fit", 100)
+    set_tier(components, victim, MORITier.GPU, idleness=0.2)
+    set_tier(components, running, MORITier.GPU)
+    set_tier(components, rejected, MORITier.CPU, idleness=0.0)
+    calls = []
+
+    components.strategy.schedule_resume(
+        snapshot(victim, running, rejected, later_fit, hbm=1000),
+        components.initial_factors,
+        _controller(components, calls, reject=lambda request: request.kind is TransitionKind.PAUSE),
+    )
+
+    assert [(call.kind, call.program) for call in calls] == [
+        (TransitionKind.PAUSE, victim.ref),
+        (TransitionKind.RESUME, later_fit.ref),
+    ]
+    assert components.initial_factors.global_factors.service_debt_frontier is None
+    assert components.strategy.counters["service_debt_frontier_elections"] == 0
+    assert components.strategy.counters["service_debt_frontier_elections_actionable"] == 0
+    assert components.strategy.counters["service_debt_election_skipped_pinned"] == 0
 
 
 def test_admission_before_frontier_block_does_not_charge_it():
@@ -120,15 +197,17 @@ def test_admission_before_frontier_block_does_not_charge_it():
 
 def test_frontier_and_credit_persist_across_fresh_cycles_without_splitting():
     components = build_mori_strategy(MORIConfig(decode_buffer_tokens=0, enable_bounded_service_debt=True))
-    running = _program("running", 700, gpu=True)
+    running = _program("running", 500, gpu=True)
+    victim = _program("victim", 200, acting=True, gpu=True)
     owner = _program("b-owner", 400)
     first_backfill = _program("c-first", 50)
     set_tier(components, running, MORITier.GPU)
+    set_tier(components, victim, MORITier.GPU)
     set_tier(components, owner, MORITier.CPU, idleness=0.5)
     first_calls = []
 
     components.strategy.schedule_resume(
-        snapshot(running, owner, first_backfill, hbm=1000),
+        snapshot(running, victim, owner, first_backfill, hbm=1000),
         components.initial_factors,
         _controller(components, first_calls),
     )
@@ -139,7 +218,7 @@ def test_frontier_and_credit_persist_across_fresh_cycles_without_splitting():
     set_tier(components, competing, MORITier.CPU, idleness=0.0)
     second_calls = []
     components.strategy.schedule_resume(
-        snapshot(running, active_first, competing, owner, second_backfill, hbm=1000),
+        snapshot(running, victim, active_first, competing, owner, second_backfill, hbm=1000),
         components.initial_factors,
         _controller(components, second_calls),
     )
@@ -151,6 +230,48 @@ def test_frontier_and_credit_persist_across_fresh_cycles_without_splitting():
     assert components.initial_factors.for_program(competing.ref).service_bypass_tokens == 0
     assert components.strategy.counters["service_debt_frontier_elections"] == 1
     assert components.strategy.counters["service_debt_frontier_retained_cycles"] == 1
+
+
+def test_retained_owner_becoming_pinned_keeps_exact_debt_and_allows_later_fit_without_clock_advance():
+    components = build_mori_strategy(MORIConfig(decode_buffer_tokens=0, enable_bounded_service_debt=True))
+    running = _program("running", 400, gpu=True)
+    victim = _program("victim", 300, acting=True, gpu=True)
+    owner = replace(_program("owner", 400), ref=ProgramRef("owner", 3))
+    first_backfill = _program("first-backfill", 300)
+    set_tier(components, running, MORITier.GPU)
+    set_tier(components, victim, MORITier.GPU, idleness=0.2)
+    set_tier(components, owner, MORITier.CPU, idleness=0.9)
+    first_calls = []
+    first_snapshot = snapshot(running, victim, owner, first_backfill, hbm=1000)
+
+    components.strategy.schedule_resume(
+        first_snapshot,
+        components.initial_factors,
+        _controller(components, first_calls),
+    )
+
+    active_backfill = replace(first_backfill, state=ProgramState.ACTIVE, backend_id="backend")
+    new_reasoning = _program("new-reasoning", 200, gpu=True)
+    later_fit = _program("later-fit", 100)
+    set_tier(components, new_reasoning, MORITier.GPU)
+    second_calls = []
+    second_snapshot = snapshot(running, active_backfill, new_reasoning, owner, later_fit, hbm=1000)
+    components.strategy.schedule_resume(
+        second_snapshot,
+        components.initial_factors,
+        _controller(components, second_calls),
+    )
+
+    assert [(call.kind, call.program) for call in first_calls] == [(TransitionKind.RESUME, first_backfill.ref)]
+    assert [(call.kind, call.program) for call in second_calls] == [(TransitionKind.RESUME, later_fit.ref)]
+    assert first_snapshot.observed_at_monotonic_s == second_snapshot.observed_at_monotonic_s
+    assert components.initial_factors.global_factors.service_debt_frontier == owner.ref
+    assert components.initial_factors.for_program(owner.ref).service_bypass_tokens == 400
+    assert components.strategy.counters["service_debt_frontier_elections"] == 1
+    assert components.strategy.counters["service_debt_frontier_elections_actionable"] == 1
+    assert components.strategy.counters["service_debt_election_skipped_pinned"] == 0
+    assert components.strategy.counters["service_debt_frontier_retained_pinned_cycles"] == 1
+    assert components.strategy.counters["service_debt_reservations"] == 0
 
 
 def test_saved_frontier_clears_absent_when_exact_factor_is_missing():
@@ -224,21 +345,26 @@ def test_saved_frontier_clears_not_waiting_when_owner_is_ineligible(ineligible_o
 
 def test_rejected_backfill_does_not_charge_service_debt():
     components = build_mori_strategy(MORIConfig(decode_buffer_tokens=0, enable_bounded_service_debt=True))
-    running = _program("running", 800, gpu=True)
+    running = _program("running", 600, gpu=True)
+    victim = _program("victim", 200, acting=True, gpu=True)
     blocked = _program("a-blocked", 400)
     backfill = _program("b-backfill", 100)
     set_tier(components, running, MORITier.GPU)
-    set_tier(components, blocked, MORITier.CPU)
+    set_tier(components, victim, MORITier.GPU, idleness=0.2)
+    set_tier(components, blocked, MORITier.CPU, idleness=0.9)
     calls = []
 
     components.strategy.schedule_resume(
-        snapshot(running, blocked, backfill, hbm=1000),
+        snapshot(running, victim, blocked, backfill, hbm=1000),
         components.initial_factors,
         _controller(components, calls, reject=lambda request: request.program == backfill.ref),
     )
 
     assert [(call.kind, call.program) for call in calls] == [(TransitionKind.RESUME, backfill.ref)]
+    assert components.initial_factors.global_factors.service_debt_frontier == blocked.ref
     assert components.initial_factors.for_program(blocked.ref).service_bypass_tokens == 0
+    assert components.strategy.counters["service_debt_frontier_elections_actionable"] == 1
+    assert components.strategy.counters["service_debt_charge_events"] == 0
     assert components.strategy.counters["service_debt_charged_tokens"] == 0
 
 
@@ -645,6 +771,10 @@ def test_disabled_service_debt_preserves_relative_idleness_blocking():
 
     assert calls == []
     assert components.strategy.idleness_for_program(blocked.ref, 100.0) == pytest.approx(0.9)
+    assert components.initial_factors.global_factors.service_debt_frontier is None
+    assert components.strategy.counters["service_debt_frontier_elections_actionable"] == 0
+    assert components.strategy.counters["service_debt_election_skipped_pinned"] == 0
+    assert components.strategy.counters["service_debt_frontier_retained_pinned_cycles"] == 0
 
 
 def test_disabled_service_debt_ignores_seeded_frontier_and_preserves_legacy_order():
@@ -805,6 +935,9 @@ def test_frontier_diagnostics_are_scalar_exact_and_reset_when_absent():
     assert fields["service_debt_frontier_capacity_state"] == "pinned_infeasible"
     assert fields["service_debt_frontier_all_acting_required_tokens"] == 1200
     assert fields["service_debt_frontier_elections"] == 1
+    assert fields["service_debt_frontier_elections_actionable"] == 0
+    assert fields["service_debt_election_skipped_pinned"] == 0
+    assert fields["service_debt_frontier_retained_pinned_cycles"] == 0
     assert all(not isinstance(value, ProgramRef) for value in fields.values())
 
     components.strategy._clear_service_debt_frontier(components.initial_factors, owner.ref, "released")

@@ -307,6 +307,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             service_debt_claim = None
         elif service_debt_frontier is not None:
             self.counters["service_debt_frontier_retained_cycles"] += 1
+        retained_frontier_ref = frontier_ref
         election_closed_this_cycle = frontier_ref is not None
         if gpu.used > quota:
             self.counters["promotion_blocked_capacity_debt"] += 1
@@ -406,6 +407,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                     "binary_urgent": service_debt_urgent,
                     "capacity_state": "evaluating",
                     "all_acting_required_tokens": None,
+                    "election_state": "not_considered",
                 }
                 decision["service_debt"] = service_debt_decision
             if claim.tokens > quota:
@@ -468,21 +470,34 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                     )
                     if self.config.enable_bounded_service_debt and exchange_valid:
                         if frontier_ref is None and not election_closed_this_cycle:
-                            if self._set_service_debt_frontier(strategy_factors, candidate.ref):
+                            # Eligibility applies only to a new owner. Skipping a
+                            # pinned prefix leaves this sorted scan open, while a
+                            # retained exact owner is never cleared or replaced here.
+                            if all_acting_required is None or all_acting_required > quota:
+                                self.counters["service_debt_election_skipped_pinned"] += 1
+                                if service_debt_decision is not None:
+                                    service_debt_decision["election_state"] = "skipped_pinned"
+                            elif self._set_service_debt_frontier(strategy_factors, candidate.ref):
                                 frontier_ref = candidate.ref
                                 election_closed_this_cycle = True
                                 service_debt_target = candidate
                                 service_debt_claim = claim
                                 service_debt_target_saturated = False
+                                self.counters["service_debt_frontier_elections_actionable"] += 1
                                 if service_debt_decision is not None:
                                     service_debt_decision["is_frontier"] = True
                                     service_debt_decision["frontier_generation"] = candidate.ref.generation
+                                    service_debt_decision["election_state"] = "elected_actionable"
                         if candidate.ref == frontier_ref:
                             service_debt_target = candidate
                             service_debt_claim = claim
                             service_debt_target_blocked = True
                             service_debt_target_saturated = service_debt_urgent
                             service_debt_target_pinned = service_debt_urgent and block_reason == "no_all_acting_fit"
+                            if candidate.ref == retained_frontier_ref and block_reason == "no_all_acting_fit":
+                                self.counters["service_debt_frontier_retained_pinned_cycles"] += 1
+                                if service_debt_decision is not None:
+                                    service_debt_decision["election_state"] = "retained_pinned"
                             if service_debt_target_pinned:
                                 self.counters["service_debt_pinned_infeasible_evaluations"] += 1
                     if decision is not None:
@@ -871,7 +886,10 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                             "idle_gpu_progress_demotions",
                             "service_debt_candidates",
                             "service_debt_frontier_elections",
+                            "service_debt_frontier_elections_actionable",
+                            "service_debt_election_skipped_pinned",
                             "service_debt_frontier_retained_cycles",
+                            "service_debt_frontier_retained_pinned_cycles",
                             "service_debt_charge_events",
                             "service_debt_charged_tokens",
                             "service_debt_saturations",
