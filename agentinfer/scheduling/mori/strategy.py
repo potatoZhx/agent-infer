@@ -4,18 +4,25 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import math
 import time
-from bisect import bisect_left
 from collections import Counter
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 from agentinfer.scheduling.admission_outcome import AdmissionDisposition, AdmissionOutcome
 from agentinfer.scheduling.cache_placement import CacheClass, ProgramCacheClassObserver
-from agentinfer.scheduling.domain import ProgramRef, ProgramState, ProgramStatus, ProgramView
+from agentinfer.scheduling.domain import (
+    ProgramRef,
+    ProgramState,
+    ProgramStatus,
+    ProgramView,
+    TokenObservationSource,
+)
 from agentinfer.scheduling.events import SchedulingEvent, StrategyDiagnostic
 from agentinfer.scheduling.factors import StrategyFactors
-from agentinfer.scheduling.mori.capacity import CapacityClaim, CapacityLedger, FootprintProvider, ReliefProjection
+from agentinfer.scheduling.mori.capacity import CapacityClaim, CapacityLedger, FootprintProvider
 from agentinfer.scheduling.mori.config import MORIConfig, MORIMode
 from agentinfer.scheduling.mori.diagnostics import MORIDiagnosticState
 from agentinfer.scheduling.mori.factors import MORIGlobalFactors, MORIProgramFactors, MORITier
@@ -25,6 +32,19 @@ from agentinfer.scheduling.strategy import SchedulingCycleOrder, SchedulingStrat
 from agentinfer.scheduling.transitions import TransitionController, TransitionResult
 
 MORIFactors = StrategyFactors[MORIGlobalFactors, MORIProgramFactors]
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _VictimPlan:
+    """One exact candidate-added GPU plan in legacy demotion order."""
+
+    victims: tuple[ProgramView, ...]
+    final_used: int
+    overshoot: int
+    known_context_cost: int
+    unknown_refs: tuple[ProgramRef, ...]
 
 
 class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
@@ -40,11 +60,14 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         self.config = config
         self.counters: Counter[str] = Counter()
         self.decision_cpu_seconds = 0.0
+        self.replacement_planner_cpu_seconds = 0.0
+        self.replacement_telemetry_cpu_seconds = 0.0
         self._factors: MORIFactors | None = None
         self._classes: dict[ProgramRef, CacheClass] = {}
         self._cache_class_epoch = 0
         self._observers: list[ProgramCacheClassObserver] = []
         self._footprints: FootprintProvider | None = None
+        self._emit_replacement_telemetry = False
         self._slow_diagnostics = (
             MORIDiagnosticState(self, config.slow_request_threshold_seconds)
             if config.slow_request_threshold_seconds > 0
@@ -63,6 +86,10 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
     def request_diagnostics(self) -> RequestDiagnostics | None:
         """Return the one bounded lifecycle tracker, or None when disabled."""
         return self._request_diagnostics
+
+    def bind_observability(self, enabled: bool) -> None:
+        """Emit per-plan evidence only under the runtime's explicit opt-in."""
+        self._emit_replacement_telemetry = enabled
 
     @property
     def uses_request_branches(self) -> bool:
@@ -304,20 +331,23 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             and p.state is ProgramState.ACTIVE
             and p.status is ProgramStatus.ACTING
             and not p.marked_for_pause
+            and self._factor(strategy_factors, p.ref).tier is MORITier.GPU
             and self._factor(strategy_factors, p.ref).pending_tier is None
         ]
         victims.sort(key=lambda p: self._demotion_key(p, strategy_factors, now))
-        idle_keys = [-self._idleness(self._factor(strategy_factors, p.ref), now) for p in victims]
-        projection = ReliefProjection(gpu, tuple(p.ref for p in victims))
-        has_reasoning = any(p.ref in gpu.claims and p.status is ProgramStatus.REASONING for p in snapshot.programs)
-        removed = 0
+        victim_idleness = {
+            victim.ref: self._idleness(self._factor(strategy_factors, victim.ref), now) for victim in victims
+        }
         exchange_valid = True
-        demoted = []
+        demoted: list[ProgramView] = []
         admitted_before = 0
         for rank, candidate in enumerate(candidates):
             self.counters["planning_candidates"] += 1
             exchange_victims: list[ProgramView] = []
-            needed_victims = removed
+            placements: tuple[tuple[ProgramRef, str], ...] = ()
+            result: TransitionResult | None = None
+            plan_details: dict[str, object] | None = None
+            capture_plan_details = False
             claim = self._claim(candidate, snapshot, gpu=True)
             decision = (
                 self._slow_diagnostics.begin(
@@ -331,87 +361,370 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                 if decision is not None:
                     decision["reason"] = "claim_exceeds_total_quota"
                 continue
+            reason = "mori_relative_rebalance"
             if gpu.used + gpu.incremental(claim) > quota:
-                candidate_idle = self._idleness(self._factor(strategy_factors, candidate.ref), now)
-                eligible = max(removed, bisect_left(idle_keys, -candidate_idle))
-                reason = "mori_relative_rebalance"
-                if not has_reasoning and projection.required(eligible, claim) > quota:
-                    eligible = len(victims)
-                    reason = "mori_idle_gpu_progress"
-                if decision is not None:
-                    eligible_required = projection.required(eligible, claim)
-                    all_acting_required = projection.required(len(victims), claim)
-                    decision["relief"] = {
-                        "eligible_acting_prefix": eligible,
-                        "all_acting_count": len(victims),
-                        "already_removed_acting_count": removed,
-                        "required_after_eligible_tokens": eligible_required,
-                        "required_after_all_acting_tokens": all_acting_required,
-                        "has_gpu_reasoning": has_reasoning,
-                        "idle_gpu_progress_override": reason == "mori_idle_gpu_progress",
-                        "exchange_valid": exchange_valid,
-                    }
-                if not exchange_valid or projection.required(eligible, claim) > quota:
+                if not exchange_valid:
                     self.counters["promotion_no_fit"] += 1
                     if decision is not None:
-                        decision["reason"] = (
-                            "exchange_invalid"
-                            if not exchange_valid
-                            else "idleness_limited"
-                            if all_acting_required <= quota
-                            else "no_all_acting_fit"
-                        )
+                        decision["reason"] = "exchange_invalid"
                     continue
-                # Establish a feasible whole plan before evicting anything.
-                # Candidate/victim sharing makes individual claim sizes unsafe
-                # as an estimate of how much admission space a victim releases.
-                low, high = removed + 1, eligible
-                while low < high:
-                    middle = (low + high) // 2
-                    if projection.required(middle, claim) <= quota:
-                        high = middle
-                    else:
-                        low = middle + 1
-                needed_victims = low
+                candidate_idle = self._idleness(self._factor(strategy_factors, candidate.ref), now)
+                acting = [victim for victim in victims if victim.ref in gpu.claims]
+                eligible = [victim for victim in acting if victim_idleness[victim.ref] > candidate_idle]
+                has_reasoning = any(
+                    program.ref in gpu.claims and program.status is ProgramStatus.REASONING
+                    for program in snapshot.programs
+                )
+                candidate_ledger = gpu.copy()
+                candidate_ledger.add(candidate.ref, claim)
+                relative_required: int | None = None
+                all_acting_required: int | None = None
+                if decision is not None:
+                    relative_required = self._used_after_removing(candidate_ledger, eligible)
+                    all_acting_required = self._used_after_removing(candidate_ledger, acting)
+                    decision["relief"] = {
+                        "eligible_acting_prefix": len(eligible),
+                        "all_acting_count": len(acting),
+                        "already_removed_acting_count": 0,
+                        "required_after_eligible_tokens": relative_required,
+                        "required_after_all_acting_tokens": all_acting_required,
+                        "has_gpu_reasoning": has_reasoning,
+                        "idle_gpu_progress_override": not has_reasoning and relative_required > quota,
+                        "exchange_valid": exchange_valid,
+                    }
+                planner_started = time.thread_time()
+                legacy = self._legacy_victim_plan(candidate_ledger, eligible, quota)
+                if legacy is None and not has_reasoning:
+                    eligible = acting
+                    reason = "mori_idle_gpu_progress"
+                    legacy = self._legacy_victim_plan(candidate_ledger, eligible, quota)
+                if legacy is None:
+                    planner_elapsed = time.thread_time() - planner_started
+                    self.replacement_planner_cpu_seconds += planner_elapsed
+                    self.counters["promotion_no_fit"] += 1
+                    if decision is not None:
+                        assert all_acting_required is not None
+                        decision["reason"] = "idleness_limited" if all_acting_required <= quota else "no_all_acting_fit"
+                        decision["replacement_plan"] = {
+                            "candidate_ref": self._ref_text(candidate.ref),
+                            "candidate_rank": rank,
+                            "eligibility_mode": "relative" if has_reasoning else "idle_gpu_progress",
+                            "eligible_refs": [self._ref_text(victim.ref) for victim in eligible],
+                            "eligible_count": len(eligible),
+                            "candidate_added_used_tokens": candidate_ledger.used,
+                            "quota_tokens": quota,
+                            "fallback_reason": "no_feasible_legacy_prefix",
+                            "planner_cpu_seconds": planner_elapsed,
+                        }
+                    continue
+                self.counters["replacement_plans_considered"] += 1
+                capture_plan_details = decision is not None or self._emit_replacement_telemetry
+                chosen, plan_details = self._bounded_replacement_plan(
+                    candidate_ledger,
+                    eligible,
+                    legacy,
+                    quota,
+                    strategy_factors,
+                    capture_trials=capture_plan_details,
+                )
+                planner_elapsed = time.thread_time() - planner_started
+                self.replacement_planner_cpu_seconds += planner_elapsed
+                exchange_victims.extend(chosen.victims)
+                if capture_plan_details:
+                    plan_details["planner_cpu_seconds"] = planner_elapsed
+                    plan_details["eligibility_mode"] = (
+                        "idle_gpu_progress" if reason == "mori_idle_gpu_progress" else "relative"
+                    )
+                    plan_details["has_gpu_reasoning"] = has_reasoning
+                    plan_details["candidate_ref"] = self._ref_text(candidate.ref)
+                    plan_details["candidate_rank"] = rank
+                    plan_details["candidate_added_used_tokens"] = candidate_ledger.used
+                    plan_details["quota_tokens"] = quota
+                if decision is not None:
+                    decision["replacement_plan"] = plan_details
+            transition_error: str | None = None
             try:
-                while removed < needed_victims:
-                    victim = victims[removed]
+                for victim in exchange_victims:
                     self.counters["planning_victims"] += 1
                     if not self._pause_for_exchange(victim, strategy_factors, transitions, gpu, reason=reason):
                         # Accepted earlier pauses remain real; a rejected one
                         # invalidates speculative exchanges for the rest of the
                         # round. Subsequent admissions may still use real slack.
                         exchange_valid = False
+                        self.counters["replacement_transition_rejections"] += 1
                         break
                     demoted.append(replace(victim, state=ProgramState.PAUSED, backend_id=None, marked_for_pause=False))
-                    exchange_victims.append(victim)
-                    removed += 1
                     self.counters["rebalance_demotions"] += 1
                     if reason == "mori_idle_gpu_progress":
                         self.counters["idle_gpu_progress_demotions"] += 1
                 if gpu.used + gpu.incremental(claim) > quota:
                     if decision is not None:
                         decision["reason"] = "demotion_rejected"
-                    continue
-                result = (transitions.resume if candidate.step_count else transitions.admit)(
-                    candidate.ref, reason="mori_cycle_promote", backend_id=snapshot.backend_id
-                )
-                if result.applied:
-                    gpu.add(candidate.ref, claim)
-                    projection.admit(claim)
-                    cpu.remove(candidate.ref)
-                    has_reasoning = True
-                    self.counters["promotion_applied"] += 1
-                    admitted_before += 1
+                else:
+                    result = (transitions.resume if candidate.step_count else transitions.admit)(
+                        candidate.ref, reason="mori_cycle_promote", backend_id=snapshot.backend_id
+                    )
+                    if result.applied:
+                        gpu.add(candidate.ref, claim)
+                        cpu.remove(candidate.ref)
+                        self.counters["promotion_applied"] += 1
+                        admitted_before += 1
+                    elif exchange_victims:
+                        self.counters["replacement_transition_rejections"] += 1
+            except Exception as error:
+                transition_error = f"{type(error).__name__}: {error}"
+                if exchange_victims:
+                    self.counters["replacement_transition_exceptions"] += 1
+                raise
             finally:
                 # Spend CPU relief only after admission commits. Rejected
                 # promotions keep their CPU claim; accepted pauses still need
                 # a destination based on that unchanged committed capacity.
-                self._place_exchange_victims(exchange_victims, snapshot, strategy_factors, cpu)
+                # Only victims whose pause transition applied have left ``gpu``.
+                accepted_victims = [victim for victim in exchange_victims if victim.ref not in gpu.claims]
+                placements = self._place_exchange_victims(accepted_victims, snapshot, strategy_factors, cpu)
+                if capture_plan_details and plan_details is not None:
+                    plan_details["transition_rejected"] = (
+                        transition_error is not None or result is None or not result.applied
+                    )
+                    plan_details["transition_applied"] = result is not None and result.applied
+                    plan_details["transition_reason"] = (
+                        result.reason
+                        if result is not None
+                        else "transition_exception"
+                        if transition_error is not None
+                        else "demotion_rejected"
+                    )
+                    plan_details["transition_exception"] = transition_error
+                    plan_details["final_placements"] = [
+                        {"ref": self._ref_text(ref), "tier": tier} for ref, tier in placements
+                    ]
+                    if self._emit_replacement_telemetry:
+                        telemetry_started = time.thread_time()
+                        encoded_plan = json.dumps(plan_details, sort_keys=True, separators=(",", ":"))
+                        logger.info("MORI replacement plan %s", encoded_plan)
+                        self.replacement_telemetry_cpu_seconds += time.thread_time() - telemetry_started
+                        self.counters["replacement_telemetry_records"] += 1
+                        self.counters["replacement_telemetry_bytes"] += len(encoded_plan.encode("utf-8"))
             if decision is not None:
-                decision["reason"] = "promotion_applied" if result.applied else "promotion_rejected"
-                decision["transition_reason"] = result.reason
+                decision["reason"] = (
+                    "promotion_applied" if result is not None and result.applied else "promotion_rejected"
+                )
+                decision["transition_reason"] = result.reason if result is not None else "demotion_rejected"
         return tuple(demoted)
+
+    @staticmethod
+    def _ref_text(ref: ProgramRef) -> str:
+        return f"{ref.program_id}:{ref.generation}"
+
+    @staticmethod
+    def _backend_context_known(victim: ProgramView) -> bool:
+        return victim.tokens.source is TokenObservationSource.BACKEND_USAGE
+
+    def _victim_observation(self, factors: MORIFactors, victim: ProgramView) -> dict[str, object]:
+        """Return production cost and cache shadow facts without affecting selection."""
+        sidecar = self._factor(factors, victim.ref)
+        return {
+            "ref": self._ref_text(victim.ref),
+            "source": victim.tokens.source.value,
+            "context_tokens": victim.tokens.estimated_context_tokens,
+            "hbm_cached_prefix_exact_present": sidecar.last_hbm_cached_prefix_exact_present,
+            "hbm_cached_prefix_tokens": (
+                sidecar.last_hbm_cached_prefix_tokens if sidecar.last_hbm_cached_prefix_exact_present else None
+            ),
+            "hbm_hit_ref_zero_exact_present": sidecar.last_hbm_hit_ref_zero_exact_present,
+            "hbm_hit_ref_zero_tokens": (
+                sidecar.last_hbm_hit_ref_zero_tokens if sidecar.last_hbm_hit_ref_zero_exact_present else None
+            ),
+        }
+
+    @classmethod
+    def _plan_from_ledger(
+        cls,
+        victims: tuple[ProgramView, ...],
+        ledger: CapacityLedger,
+        quota: int,
+    ) -> _VictimPlan:
+        return _VictimPlan(
+            victims=victims,
+            final_used=ledger.used,
+            overshoot=quota - ledger.used,
+            known_context_cost=sum(
+                victim.tokens.estimated_context_tokens for victim in victims if cls._backend_context_known(victim)
+            ),
+            unknown_refs=tuple(victim.ref for victim in victims if not cls._backend_context_known(victim)),
+        )
+
+    @classmethod
+    def _legacy_victim_plan(
+        cls,
+        candidate_ledger: CapacityLedger,
+        eligible: list[ProgramView],
+        quota: int,
+    ) -> _VictimPlan | None:
+        """Build the exact first feasible prefix without skipping zero-relief owners."""
+        projected = candidate_ledger.copy()
+        selected: list[ProgramView] = []
+        for victim in eligible:
+            selected.append(victim)
+            projected.remove(victim.ref)
+            if projected.used <= quota:
+                return cls._plan_from_ledger(tuple(selected), projected, quota)
+        return None
+
+    @staticmethod
+    def _used_after_removing(candidate_ledger: CapacityLedger, victims: list[ProgramView]) -> int:
+        projected = candidate_ledger.copy()
+        for victim in victims:
+            projected.remove(victim.ref)
+        return projected.used
+
+    def _bounded_replacement_plan(
+        self,
+        candidate_ledger: CapacityLedger,
+        eligible: list[ProgramView],
+        legacy: _VictimPlan,
+        quota: int,
+        factors: MORIFactors,
+        *,
+        capture_trials: bool,
+    ) -> tuple[_VictimPlan, dict[str, object]]:
+        """Try deterministic known-context swaps inside the legacy safety envelope."""
+        legacy_refs = {victim.ref for victim in legacy.victims}
+        selected = {victim.ref: victim for victim in legacy.victims}
+        legacy_index = {victim.ref: index for index, victim in enumerate(eligible)}
+        planned = candidate_ledger.copy()
+        for victim in legacy.victims:
+            planned.remove(victim.ref)
+        trials: list[dict[str, object]] = []
+        swaps: list[dict[str, object]] = []
+        accepted_swap_count = 0
+        outgoing = sorted(
+            (victim for victim in legacy.victims if self._backend_context_known(victim)),
+            key=lambda victim: (-victim.tokens.estimated_context_tokens, legacy_index[victim.ref]),
+        )
+        for outgoing_victim in outgoing:
+            if outgoing_victim.ref not in selected:
+                continue
+            best: tuple[int, int, int, ProgramRef, ProgramView, int] | None = None
+            for incoming in eligible:
+                if incoming.ref in legacy_refs or incoming.ref in selected:
+                    continue
+                if not self._backend_context_known(incoming):
+                    self.counters["replacement_unknown_skipped"] += 1
+                    continue
+                incoming_cost = incoming.tokens.estimated_context_tokens
+                outgoing_cost = outgoing_victim.tokens.estimated_context_tokens
+                if incoming_cost >= outgoing_cost:
+                    self.counters["replacement_non_improving_guard"] += 1
+                    if incoming_cost == outgoing_cost:
+                        self.counters["replacement_equal_cost_guard"] += 1
+                    continue
+                self.counters["replacement_trials"] += 1
+                trial_used = planned.used_after_swap(
+                    candidate_ledger.claims[outgoing_victim.ref],
+                    incoming.ref,
+                )
+                trial_overshoot = quota - trial_used
+                outcome = "accepted_candidate"
+                if trial_used > quota:
+                    self.counters["replacement_capacity_guard"] += 1
+                    outcome = "capacity_guard"
+                elif trial_overshoot > legacy.overshoot:
+                    self.counters["replacement_overshoot_guard"] += 1
+                    outcome = "overshoot_guard"
+                else:
+                    key = (
+                        incoming_cost,
+                        trial_overshoot,
+                        legacy_index[incoming.ref],
+                        incoming.ref,
+                        incoming,
+                        trial_used,
+                    )
+                    if best is None or key[:4] < best[:4]:
+                        best = key
+                if capture_trials:
+                    trials.append(
+                        {
+                            "outgoing_ref": self._ref_text(outgoing_victim.ref),
+                            "incoming_ref": self._ref_text(incoming.ref),
+                            "outgoing_context_tokens": outgoing_cost,
+                            "incoming_context_tokens": incoming_cost,
+                            "final_used_tokens": trial_used,
+                            "overshoot_tokens": trial_overshoot,
+                            "outcome": outcome,
+                        }
+                    )
+            if best is None:
+                continue
+            incoming = best[4]
+            planned.add(outgoing_victim.ref, candidate_ledger.claims[outgoing_victim.ref])
+            planned.remove(incoming.ref)
+            del selected[outgoing_victim.ref]
+            selected[incoming.ref] = incoming
+            accepted_swap_count += 1
+            if capture_trials:
+                swaps.append(
+                    {
+                        "outgoing_ref": self._ref_text(outgoing_victim.ref),
+                        "incoming_ref": self._ref_text(incoming.ref),
+                        "outgoing_context_tokens": outgoing_victim.tokens.estimated_context_tokens,
+                        "incoming_context_tokens": incoming.tokens.estimated_context_tokens,
+                        "final_used_tokens": planned.used,
+                        "overshoot_tokens": quota - planned.used,
+                    }
+                )
+
+        chosen_victims = tuple(victim for victim in eligible if victim.ref in selected)
+        chosen = self._plan_from_ledger(chosen_victims, planned, quota)
+        changed = tuple(victim.ref for victim in chosen.victims) != tuple(victim.ref for victim in legacy.victims)
+        guard_ok = (
+            len(chosen.victims) == len(legacy.victims)
+            and chosen.final_used <= quota
+            and chosen.overshoot <= legacy.overshoot
+            and (not changed or chosen.known_context_cost < legacy.known_context_cost)
+            and chosen.unknown_refs == legacy.unknown_refs
+        )
+        fallback_reason = "no_improving_swap"
+        if changed and guard_ok:
+            self.counters["replacement_plans_changed"] += 1
+            self.counters["replacement_swaps"] += accepted_swap_count
+            fallback_reason = "changed"
+        else:
+            self.counters["replacement_plans_legacy_fallback"] += 1
+            if not guard_ok:
+                self.counters["replacement_internal_guard_fallback"] += 1
+                fallback_reason = "internal_guard_failed"
+            chosen = legacy
+            swaps = []
+            changed = False
+        reasoning_victim_count = sum(victim.status is ProgramStatus.REASONING for victim in chosen.victims)
+        self.counters["replacement_reasoning_victims"] += reasoning_victim_count
+        if not capture_trials:
+            return chosen, {}
+        details: dict[str, object] = {
+            "eligible_refs": [self._ref_text(victim.ref) for victim in eligible],
+            "eligible_count": len(eligible),
+            "victim_observations": [self._victim_observation(factors, victim) for victim in eligible],
+            "legacy_refs": [self._ref_text(victim.ref) for victim in legacy.victims],
+            "legacy_count": len(legacy.victims),
+            "legacy_final_used_tokens": legacy.final_used,
+            "legacy_overshoot_tokens": legacy.overshoot,
+            "legacy_known_context_cost": legacy.known_context_cost,
+            "chosen_refs": [self._ref_text(victim.ref) for victim in chosen.victims],
+            "chosen_count": len(chosen.victims),
+            "chosen_final_used_tokens": chosen.final_used,
+            "chosen_overshoot_tokens": chosen.overshoot,
+            "chosen_known_context_cost": chosen.known_context_cost,
+            "known_context_cost_delta": chosen.known_context_cost - legacy.known_context_cost,
+            "changed": changed,
+            "fallback_reason": fallback_reason,
+            "replacement_trials": trials,
+            "accepted_swaps": swaps,
+            "reasoning_victim_count": reasoning_victim_count,
+        }
+        return chosen, details
 
     def _pause_for_exchange(
         self,
@@ -449,14 +762,17 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         snapshot: SchedulingSnapshot,
         factors: MORIFactors,
         cpu: CapacityLedger,
-    ) -> None:
+    ) -> tuple[tuple[ProgramRef, str], ...]:
         """Commit paused victims against CPU capacity after the admission result."""
+        placements: list[tuple[ProgramRef, str]] = []
         for victim in victims:
             claim = self._claim(victim, snapshot, gpu=False)
             target, replacements = self._cpu_destination(victim, snapshot, factors, cpu, claim)
             sidecar = self._factor(factors, victim.ref)
             self._set_factor(factors, victim.ref, replace(sidecar, tier=target, pending_tier=None))
             self._commit_cpu_destination(victim, factors, cpu, claim, target, replacements)
+            placements.append((victim.ref, target.value))
+        return tuple(placements)
 
     def repair_capacity(
         self,
@@ -586,6 +902,8 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                     ),
                     ("cache_class_epoch", self.cache_class_epoch),
                     ("decision_cpu_seconds", self.decision_cpu_seconds),
+                    ("replacement_planner_cpu_seconds", self.replacement_planner_cpu_seconds),
+                    ("replacement_telemetry_cpu_seconds", self.replacement_telemetry_cpu_seconds),
                     *(
                         (name, self.counters[name])
                         for name in (
@@ -602,6 +920,22 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                             "owners_retired",
                             "rebalance_demotions",
                             "idle_gpu_progress_demotions",
+                            "replacement_plans_considered",
+                            "replacement_plans_changed",
+                            "replacement_plans_legacy_fallback",
+                            "replacement_trials",
+                            "replacement_swaps",
+                            "replacement_unknown_skipped",
+                            "replacement_non_improving_guard",
+                            "replacement_equal_cost_guard",
+                            "replacement_capacity_guard",
+                            "replacement_overshoot_guard",
+                            "replacement_internal_guard_fallback",
+                            "replacement_transition_rejections",
+                            "replacement_transition_exceptions",
+                            "replacement_reasoning_victims",
+                            "replacement_telemetry_records",
+                            "replacement_telemetry_bytes",
                         )
                     ),
                 ),
@@ -689,6 +1023,8 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             hbm_hit_tokens,
             self._event_non_negative_int(event.field("hbm_hit_ref_zero_tokens")),
         )
+        hbm_exact_present = event.field("hbm_cached_prefix_exact_present") is True
+        hbm_ref_zero_exact_present = event.field("hbm_hit_ref_zero_exact_present") is True
         self.counters["cache_observed_requests"] += 1
         self.counters["cache_prompt_tokens"] += prompt_tokens
         self.counters["cache_prefix_hit_tokens"] += prefix_hit_tokens
@@ -714,6 +1050,10 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             reasoning_wait_started_at_monotonic_s=(
                 None if reasoning_finished else sidecar.reasoning_wait_started_at_monotonic_s
             ),
+            last_hbm_cached_prefix_tokens=hbm_hit_tokens if hbm_exact_present else None,
+            last_hbm_hit_ref_zero_tokens=(hbm_ref_zero_hit_tokens if hbm_ref_zero_exact_present else None),
+            last_hbm_cached_prefix_exact_present=hbm_exact_present,
+            last_hbm_hit_ref_zero_exact_present=hbm_ref_zero_exact_present,
         )
         self._set_factor(strategy_factors, event.program, updated)
 

@@ -2,17 +2,24 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AgentInfer project
 """Slow-request evidence preserves policy decisions and exact union accounting."""
 
+import json
+import logging
 from dataclasses import replace
 from unittest.mock import patch
 
 import pytest
 
-from agentinfer.scheduling.domain import ProgramState, ProgramStatus
+from agentinfer.scheduling.domain import ProgramState, ProgramStatus, TokenObservationSource
 from agentinfer.scheduling.events import SchedulingEvent, SchedulingEventKind
 from agentinfer.scheduling.mori import MORIConfig, MORIProgramFactors, MORITier, build_mori_strategy
-from agentinfer.scheduling.mori.capacity import ReliefProjection
 from agentinfer.scheduling.mori.diagnostics import score_components
-from tests.scheduling.test_mori_strategy import accepting_controller, set_tier, snapshot, view
+from tests.scheduling.test_mori_strategy import (
+    accepting_controller,
+    set_tier,
+    snapshot,
+    view,
+    with_token_source,
+)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -83,25 +90,16 @@ def test_shared_victims_do_not_overstate_diagnostic_reclaimable_space():
     assert decision["reason"] == "no_all_acting_fit"
 
 
-def test_fast_waiter_does_not_reconstruct_context_or_add_projection_queries():
-    queries = []
-    original = ReliefProjection.required
-
-    def counted(projection, removed, claim):
-        queries.append(removed)
-        return original(projection, removed, claim)
-
+def test_fast_waiter_does_not_reconstruct_diagnostic_context():
     for threshold in (0, 30):
         components, observed, _ = scenario(threshold=threshold, waited=10)
         diagnostics = components.strategy._slow_diagnostics
-        with patch.object(ReliefProjection, "required", counted):
-            if diagnostics is None:
+        if diagnostics is None:
+            plan(components, observed)
+        else:
+            with patch.object(diagnostics, "context", side_effect=AssertionError("fast context scan")):
                 plan(components, observed)
-            else:
-                with patch.object(diagnostics, "context", side_effect=AssertionError("fast context scan")):
-                    plan(components, observed)
-                assert diagnostics.decisions == {}
-    assert queries == [0, 0]
+            assert diagnostics.decisions == {}
 
 
 def test_decision_sampling_is_bounded_and_release_cleans_generation():
@@ -197,3 +195,103 @@ def test_context_pending_release_uses_union_and_does_not_change_policy_counters(
     assert context["reconstructed_capacity"]["pending_release_programs"] == 2
     assert context["latest_snapshot"]["age_seconds"] == 10
     assert dict(components.strategy.counters) == before
+
+
+def test_replacement_telemetry_exposes_exact_plan_and_monotonic_counters():
+    components = build_mori_strategy(MORIConfig(enable_wait_credit=False, slow_request_threshold_seconds=1))
+    legacy = with_token_source(
+        view("legacy", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=500),
+        TokenObservationSource.BACKEND_USAGE,
+    )
+    cheaper = with_token_source(
+        view("cheaper", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=450),
+        TokenObservationSource.BACKEND_USAGE,
+    )
+    running = view("running", state=ProgramState.ACTIVE, status=ProgramStatus.REASONING, tokens=100)
+    candidate = replace(
+        view("candidate", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400, step_count=1),
+        wait_started_at_monotonic_s=0,
+    )
+    set_tier(components, legacy, MORITier.GPU, idleness=0.9)
+    set_tier(components, cheaper, MORITier.GPU, idleness=0.8)
+    set_tier(components, running, MORITier.GPU)
+    set_tier(components, candidate, MORITier.CPU, idleness=0.1)
+    observed = snapshot(legacy, cheaper, running, candidate, hbm=1350, dram=5000)
+
+    plan(components, observed)
+
+    decision = components.strategy._slow_diagnostics.decisions[candidate.ref]
+    replacement = decision["replacement_plan"]
+    assert replacement["candidate_ref"] == "candidate:0"
+    assert replacement["legacy_refs"] == ["legacy:0"]
+    assert replacement["chosen_refs"] == ["cheaper:0"]
+    assert replacement["legacy_count"] == replacement["chosen_count"] == 1
+    assert replacement["chosen_overshoot_tokens"] <= replacement["legacy_overshoot_tokens"]
+    assert replacement["known_context_cost_delta"] == -50
+    assert replacement["accepted_swaps"][0]["incoming_ref"] == "cheaper:0"
+    assert replacement["final_placements"] == [{"ref": "cheaper:0", "tier": "cpu"}]
+
+    fields = dict(components.strategy.diagnostics(observed, components.initial_factors)[0].fields)
+    integer_fields = (
+        "replacement_plans_considered",
+        "replacement_plans_changed",
+        "replacement_plans_legacy_fallback",
+        "replacement_trials",
+        "replacement_swaps",
+        "replacement_unknown_skipped",
+        "replacement_non_improving_guard",
+        "replacement_equal_cost_guard",
+        "replacement_capacity_guard",
+        "replacement_overshoot_guard",
+        "replacement_internal_guard_fallback",
+        "replacement_transition_rejections",
+        "replacement_transition_exceptions",
+        "replacement_reasoning_victims",
+        "replacement_telemetry_records",
+        "replacement_telemetry_bytes",
+    )
+    assert all(isinstance(fields[name], int) and fields[name] >= 0 for name in integer_fields)
+    assert fields["replacement_planner_cpu_seconds"] >= 0.0
+    assert fields["replacement_telemetry_cpu_seconds"] >= 0.0
+
+
+@pytest.mark.parametrize("observability_enabled", [False, True])
+def test_replacement_plan_logging_follows_observability_before_slow_threshold(caplog, observability_enabled):
+    components = build_mori_strategy(MORIConfig(enable_wait_credit=False, slow_request_threshold_seconds=1000))
+    components.strategy.bind_observability(observability_enabled)
+    legacy = with_token_source(
+        view("legacy", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=500),
+        TokenObservationSource.BACKEND_USAGE,
+    )
+    cheaper = with_token_source(
+        view("cheaper", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=450),
+        TokenObservationSource.BACKEND_USAGE,
+    )
+    running = view("running", state=ProgramState.ACTIVE, status=ProgramStatus.REASONING, tokens=100)
+    candidate = replace(
+        view("candidate", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400, step_count=1),
+        wait_started_at_monotonic_s=99,
+    )
+    set_tier(components, legacy, MORITier.GPU, idleness=0.9)
+    set_tier(components, cheaper, MORITier.GPU, idleness=0.8)
+    set_tier(components, running, MORITier.GPU)
+    set_tier(components, candidate, MORITier.CPU, idleness=0.1)
+    observed = snapshot(legacy, cheaper, running, candidate, hbm=1350, dram=5000)
+    caplog.set_level(logging.INFO, logger="agentinfer.scheduling.mori.strategy")
+
+    plan(components, observed)
+
+    assert components.strategy._slow_diagnostics.decisions == {}
+    records = [record.message for record in caplog.records if record.message.startswith("MORI replacement plan ")]
+    assert len(records) == int(observability_enabled)
+    if not observability_enabled:
+        return
+    payload = json.loads(records[0].removeprefix("MORI replacement plan "))
+    assert payload["legacy_refs"] == ["legacy:0"]
+    assert payload["chosen_refs"] == ["cheaper:0"]
+    assert payload["transition_applied"] is True
+    assert payload["transition_rejected"] is False
+    assert payload["victim_observations"][0]["hbm_cached_prefix_exact_present"] is False
+    fields = dict(components.strategy.diagnostics(observed, components.initial_factors)[0].fields)
+    assert fields["replacement_telemetry_records"] == 1
+    assert fields["replacement_telemetry_bytes"] >= len(records[0]) - len("MORI replacement plan ")

@@ -103,6 +103,7 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
         self._cycle_dirty = False
         self._schedule_interval_seconds = schedule_interval_seconds
         self._observability = observability or SchedulerObservabilityConfig()
+        self.strategy.bind_observability(self._observability.enabled)
         self._next_observability_log_at_monotonic_s = 0.0
         self._next_periodic_check_at_monotonic_s = 0.0
         self._next_check_at_monotonic_s = self._strategy_next_check_at()
@@ -536,7 +537,12 @@ class ProgramScheduler(Generic[RetainedRequestT, StrategyGlobalFactorsT, Strateg
                         if binding.hbm_cached_prefix_tokens is not None
                         else cached_prefix_tokens,
                     ),
+                    ("hbm_cached_prefix_exact_present", binding.hbm_cached_prefix_tokens is not None),
                     ("hbm_hit_ref_zero_tokens", binding.hbm_hit_ref_zero_tokens or 0),
+                    (
+                        "hbm_hit_ref_zero_exact_present",
+                        binding.hbm_cached_prefix_tokens is not None and binding.hbm_hit_ref_zero_tokens is not None,
+                    ),
                 ),
             )
         )

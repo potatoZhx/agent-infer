@@ -50,6 +50,78 @@ def test_union_ledger_matches_brute_force_with_private_growth_promises():
         assert ledger.used == expected
 
 
+def test_used_after_swap_matches_copy_mutation_for_random_overlapping_claims():
+    random = Random(743)
+    for iteration in range(300):
+        ledger = CapacityLedger(16)
+        refs = [ProgramRef(f"owner-{iteration}-{index}", 0) for index in range(8)]
+        for ref in refs:
+            blocks = frozenset(random.sample(range(32), random.randrange(12)))
+            ledger.add(ref, CapacityClaim(16 * (len(blocks) + random.randrange(6)), blocks))
+        incoming_ref = random.choice(refs)
+        restore_blocks = frozenset(random.sample(range(32), random.randrange(12)))
+        restore_claim = CapacityClaim(16 * (len(restore_blocks) + random.randrange(6)), restore_blocks)
+        before_claims = ledger.claims.copy()
+        before_owners = ledger.owners.copy()
+        before_used = ledger.used
+
+        expected = ledger.copy()
+        expected.add(ProgramRef(f"restore-{iteration}", 0), restore_claim)
+        expected.remove(incoming_ref)
+
+        assert ledger.used_after_swap(restore_claim, incoming_ref) == expected.used
+        assert ledger.claims == before_claims
+        assert ledger.owners == before_owners
+        assert ledger.used == before_used
+
+
+def test_used_after_swap_accounts_for_candidate_and_outgoing_incoming_overlap():
+    candidate, incoming = ProgramRef("candidate", 0), ProgramRef("incoming", 0)
+    ledger = CapacityLedger(16)
+    ledger.add(candidate, CapacityClaim(64, frozenset({1, 2, 5})))
+    ledger.add(incoming, CapacityClaim(64, frozenset({2, 3, 4})))
+    outgoing_claim = CapacityClaim(80, frozenset({1, 3, 6}))
+
+    expected = ledger.copy()
+    expected.add(ProgramRef("outgoing", 0), outgoing_claim)
+    expected.remove(incoming)
+
+    assert ledger.used_after_swap(outgoing_claim, incoming) == expected.used
+    assert ledger.used == 112
+
+
+def test_used_after_swap_keeps_unproven_private_and_decode_tokens():
+    incoming = ProgramRef("incoming", 0)
+    ledger = CapacityLedger(16)
+    ledger.add(incoming, CapacityClaim(160))
+    ledger.add(ProgramRef("resident", 0), CapacityClaim(96, frozenset({1, 2})))
+    restore_claim = CapacityClaim(192, frozenset({2, 3, 4}))
+
+    expected = ledger.copy()
+    expected.add(ProgramRef("outgoing", 0), restore_claim)
+    expected.remove(incoming)
+
+    assert ledger.used_after_swap(restore_claim, incoming) == expected.used
+
+
+def test_legacy_plan_keeps_zero_relief_owner_until_shared_last_owner_releases():
+    components = build_mori_strategy()
+    first = view("first", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=32)
+    second = view("second", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=32)
+    candidate = ProgramRef("candidate", 0)
+    ledger = CapacityLedger(16)
+    shared = CapacityClaim(32, frozenset({1, 2}))
+    ledger.add(first.ref, shared)
+    ledger.add(second.ref, shared)
+    ledger.add(candidate, CapacityClaim(32))
+
+    plan = components.strategy._legacy_victim_plan(ledger, [first, second], quota=32)
+
+    assert plan is not None
+    assert [victim.ref for victim in plan.victims] == [first.ref, second.ref]
+    assert plan.final_used == 32
+
+
 def test_relief_projection_matches_independent_union_after_admissions_at_every_boundary():
     random = Random(539)
     initial = CapacityLedger(16)

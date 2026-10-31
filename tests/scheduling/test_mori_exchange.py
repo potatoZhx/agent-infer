@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AgentInfer project
 """Cross-tier exchanges preserve feasible destinations and rejected CPU owners."""
 
+import json
+import logging
 from dataclasses import replace
 from unittest.mock import patch
 
@@ -222,8 +224,9 @@ def test_exchange_does_not_spend_cpu_space_of_a_later_unadmitted_candidate():
 
 
 @pytest.mark.parametrize("failure", ["first_pause", "second_pause", "resume"])
-def test_exchange_exception_finishes_accepted_pauses_without_spending_candidate_capacity(failure):
+def test_exchange_exception_finishes_accepted_pauses_without_spending_candidate_capacity(failure, caplog):
     components = build_mori_strategy(MORIConfig(decode_buffer_tokens=0))
+    components.strategy.bind_observability(True)
     first = _program("a-victim", 350, acting=True, gpu=True)
     second = _program("b-victim", 350, acting=True, gpu=True)
     running = _program("running", 100, gpu=True)
@@ -235,6 +238,7 @@ def test_exchange_exception_finishes_accepted_pauses_without_spending_candidate_
     fixed = snapshot(first, second, running, waiting, hbm=800, dram=1000)
     calls = []
     accepted = _controller(components, calls)
+    caplog.set_level(logging.INFO, logger="agentinfer.scheduling.mori.strategy")
 
     def apply(request):
         if (
@@ -260,6 +264,20 @@ def test_exchange_exception_finishes_accepted_pauses_without_spending_candidate_
         assert factor.pending_tier is None
     gpu, cpu = components.strategy._ledgers(fixed, components.initial_factors)
     assert (gpu.used, cpu.used) == expected[2:]
+    assert components.strategy.counters["replacement_transition_exceptions"] == 1
+    records = [record.message for record in caplog.records if record.message.startswith("MORI replacement plan ")]
+    assert len(records) == 1
+    payload = json.loads(records[0].removeprefix("MORI replacement plan "))
+    assert payload["transition_rejected"] is True
+    assert payload["transition_applied"] is False
+    assert payload["transition_reason"] == "transition_exception"
+    assert payload["transition_exception"] == "RuntimeError: transition failed before mutation"
+    expected_placements = {
+        "first_pause": [],
+        "second_pause": [{"ref": "a-victim:0", "tier": "cpu"}],
+        "resume": [{"ref": "a-victim:0", "tier": "cpu"}, {"ref": "b-victim:0", "tier": "waiting"}],
+    }[failure]
+    assert payload["final_placements"] == expected_placements
 
 
 @pytest.mark.parametrize("rejected", [False, True])

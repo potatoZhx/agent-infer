@@ -47,12 +47,26 @@ class MORIProgramFactors:
     reasoning_wait_started_at_monotonic_s: float | None = None
     pending_tier: MORITier | None = None
     execution_observed: bool = False
+    # Shadow-only last-request cache evidence. These fields are never ranking
+    # inputs; exact-presence bits prevent a combined-cache fallback from being
+    # misreported as a local-HBM observation.
+    last_hbm_cached_prefix_tokens: int | None = None
+    last_hbm_hit_ref_zero_tokens: int | None = None
+    last_hbm_cached_prefix_exact_present: bool = False
+    last_hbm_hit_ref_zero_exact_present: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.tier, MORITier):
             raise ValueError("MORI tier must be a MORITier")
         if self.pending_tier is not None and not isinstance(self.pending_tier, MORITier):
             raise ValueError("MORI pending_tier must be a MORITier when supplied")
+        cache_counts = (self.last_hbm_cached_prefix_tokens, self.last_hbm_hit_ref_zero_tokens)
+        if any(value is not None and value < 0 for value in cache_counts):
+            raise ValueError("MORI shadow cache observations must be non-negative")
+        if not isinstance(self.last_hbm_cached_prefix_exact_present, bool) or not isinstance(
+            self.last_hbm_hit_ref_zero_exact_present, bool
+        ):
+            raise ValueError("MORI shadow cache exact-presence fields must be boolean")
         values = [self.pending_reasoning_seconds, self.reasoning_wait_seconds]
         values.extend(value for cycle in self.cycles for value in cycle)
         if any(not math.isfinite(value) or value < 0 for value in values):

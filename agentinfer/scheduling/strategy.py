@@ -69,6 +69,9 @@ class SchedulingStrategy(Generic[StrategyGlobalFactorsT, StrategyProgramFactorsT
         """Optionally provide bounded slow-request tracking independent of debug logs."""
         return None
 
+    def bind_observability(self, enabled: bool) -> None:
+        """Bind the runtime's explicit diagnostic logging policy."""
+
     def on_context_pending(self, program: ProgramRef) -> None:
         """Invalidate prompt-specific proof while a replacement request is still retained."""
 

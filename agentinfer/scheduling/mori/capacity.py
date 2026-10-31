@@ -73,6 +73,24 @@ class CapacityLedger:
                 del self.owners[key]
         return freed
 
+    def used_after_swap(self, restore_claim: CapacityClaim, remove_ref: ProgramRef) -> int:
+        """Return exact usage after restoring one claim and removing one owner.
+
+        ``restore_claim`` belongs to an owner that is absent from this planning
+        ledger, while ``remove_ref`` must still be present.  The computation is
+        deliberately read-only: it is the hot-path equivalent of
+        ``copy(); add(restore); remove(remove_ref)`` without copying the owner
+        map for every replacement trial.
+        """
+        incoming_claim = self.claims[remove_ref]
+        restore_incremental = restore_claim.tokens - self.quantum * sum(
+            block in self.owners for block in restore_claim.blocks
+        )
+        remove_relief_after_restore = incoming_claim.tokens - self.quantum * sum(
+            self.owners[block] + int(block in restore_claim.blocks) > 1 for block in incoming_claim.blocks
+        )
+        return self.used + restore_incremental - remove_relief_after_restore
+
     def copy(self) -> CapacityLedger:
         """Copy accounting for a speculative plan without modifying committed claims."""
         other = CapacityLedger(self.quantum)

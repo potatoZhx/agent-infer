@@ -18,6 +18,7 @@ from agentinfer.scheduling import (
     SchedulingEvent,
     SchedulingEventKind,
     SchedulingSnapshot,
+    TokenObservationSource,
     TransitionController,
     TransitionKind,
     TransitionRequest,
@@ -106,6 +107,10 @@ def accepting_controller(strategy, factors, calls: list[TransitionRequest]) -> T
 def set_tier(components, program: ProgramView, tier: MORITier, *, idleness: float = 0.0) -> None:
     sidecar = MORIProgramFactors(tier=tier, cycles=((1.0 - idleness, idleness),))
     components.strategy._set_factor(components.initial_factors, program.ref, sidecar)
+
+
+def with_token_source(program: ProgramView, source: TokenObservationSource) -> ProgramView:
+    return replace(program, tokens=replace(program.tokens, source=source))
 
 
 def test_no_fit_admission_preserves_acting_reservation_until_planning() -> None:
@@ -392,6 +397,352 @@ def test_idle_gpu_can_reclaim_acting_regardless_of_relative_score(resident_idle,
     ]
 
 
+@pytest.mark.parametrize("reverse_snapshot", [False, True])
+@pytest.mark.parametrize("wait_seconds", [59.0, 60.0, 61.0])
+def test_context_replacement_k1_is_deterministic_and_ignores_wait_age(reverse_snapshot, wait_seconds) -> None:
+    components = build_mori_strategy(MORIConfig(enable_wait_credit=False))
+    legacy = with_token_source(
+        view("legacy", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=500),
+        TokenObservationSource.BACKEND_USAGE,
+    )
+    cheaper = with_token_source(
+        view("cheaper", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=450),
+        TokenObservationSource.BACKEND_USAGE,
+    )
+    running = view("running", state=ProgramState.ACTIVE, status=ProgramStatus.REASONING, tokens=100)
+    candidate = replace(
+        view("candidate", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400, step_count=1),
+        wait_started_at_monotonic_s=100.0 - wait_seconds,
+    )
+    set_tier(components, legacy, MORITier.GPU, idleness=0.9)
+    set_tier(components, cheaper, MORITier.GPU, idleness=0.8)
+    set_tier(components, running, MORITier.GPU)
+    set_tier(components, candidate, MORITier.CPU, idleness=0.1)
+    residents = [legacy, cheaper, running]
+    if reverse_snapshot:
+        residents.reverse()
+    calls = []
+
+    components.strategy.schedule_resume(
+        snapshot(*residents, candidate, hbm=1350, dram=5000),
+        components.initial_factors,
+        accepting_controller(components.strategy, components.initial_factors, calls),
+    )
+
+    assert [(call.kind, call.program) for call in calls] == [
+        (TransitionKind.PAUSE, cheaper.ref),
+        (TransitionKind.RESUME, candidate.ref),
+    ]
+    assert components.strategy.counters["replacement_plans_changed"] == 1
+    assert components.strategy.counters["replacement_reasoning_victims"] == 0
+
+
+def test_context_replacement_k2_keeps_count_and_improves_both_slots() -> None:
+    components = build_mori_strategy(MORIConfig(enable_wait_credit=False))
+    legacy_a = with_token_source(
+        view("legacy-a", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=500),
+        TokenObservationSource.BACKEND_USAGE,
+    )
+    legacy_b = with_token_source(
+        view("legacy-b", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=450),
+        TokenObservationSource.BACKEND_USAGE,
+    )
+    cheaper_c = with_token_source(
+        view("cheaper-c", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=400),
+        TokenObservationSource.BACKEND_USAGE,
+    )
+    cheaper_d = with_token_source(
+        view("cheaper-d", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=350),
+        TokenObservationSource.BACKEND_USAGE,
+    )
+    running = view("running", state=ProgramState.ACTIVE, status=ProgramStatus.REASONING, tokens=100)
+    candidate = view("candidate", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=800, step_count=1)
+    for program, idle in ((legacy_a, 0.9), (legacy_b, 0.8), (cheaper_c, 0.7), (cheaper_d, 0.6)):
+        set_tier(components, program, MORITier.GPU, idleness=idle)
+    set_tier(components, running, MORITier.GPU)
+    set_tier(components, candidate, MORITier.CPU, idleness=0.1)
+    calls = []
+
+    components.strategy.schedule_resume(
+        snapshot(legacy_a, legacy_b, cheaper_c, cheaper_d, running, candidate, hbm=2300, dram=5000),
+        components.initial_factors,
+        accepting_controller(components.strategy, components.initial_factors, calls),
+    )
+
+    assert [(call.kind, call.program) for call in calls] == [
+        (TransitionKind.PAUSE, cheaper_c.ref),
+        (TransitionKind.PAUSE, cheaper_d.ref),
+        (TransitionKind.RESUME, candidate.ref),
+    ]
+    assert components.strategy.counters["replacement_swaps"] == 2
+    assert components.strategy.counters["replacement_plans_changed"] == 1
+
+
+@pytest.mark.parametrize(
+    ("legacy_source", "incoming_source"),
+    [
+        (TokenObservationSource.BACKEND_USAGE, TokenObservationSource.ROUTER_ESTIMATE),
+        (TokenObservationSource.ROUTER_ESTIMATE, TokenObservationSource.BACKEND_USAGE),
+        (TokenObservationSource.BACKEND_USAGE, TokenObservationSource.MIXED),
+    ],
+)
+def test_unknown_context_cannot_enter_or_leave_the_legacy_plan(legacy_source, incoming_source) -> None:
+    components = build_mori_strategy(MORIConfig(enable_wait_credit=False))
+    legacy = with_token_source(
+        view("legacy", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=500), legacy_source
+    )
+    incoming = with_token_source(
+        view("incoming", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=450), incoming_source
+    )
+    running = view("running", state=ProgramState.ACTIVE, status=ProgramStatus.REASONING, tokens=100)
+    candidate = view("candidate", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400, step_count=1)
+    set_tier(components, legacy, MORITier.GPU, idleness=0.9)
+    set_tier(components, incoming, MORITier.GPU, idleness=0.8)
+    set_tier(components, running, MORITier.GPU)
+    set_tier(components, candidate, MORITier.CPU, idleness=0.1)
+    calls = []
+
+    components.strategy.schedule_resume(
+        snapshot(legacy, incoming, running, candidate, hbm=1350, dram=5000),
+        components.initial_factors,
+        accepting_controller(components.strategy, components.initial_factors, calls),
+    )
+
+    assert [(call.kind, call.program) for call in calls[:2]] == [
+        (TransitionKind.PAUSE, legacy.ref),
+        (TransitionKind.RESUME, candidate.ref),
+    ]
+    assert components.strategy.counters["replacement_plans_legacy_fallback"] == 1
+
+
+def test_equal_context_cost_does_not_change_the_legacy_plan() -> None:
+    components = build_mori_strategy(MORIConfig(enable_wait_credit=False))
+    legacy = with_token_source(
+        view("legacy", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=500),
+        TokenObservationSource.BACKEND_USAGE,
+    )
+    equal = with_token_source(
+        view("equal", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=500),
+        TokenObservationSource.BACKEND_USAGE,
+    )
+    running = view("running", state=ProgramState.ACTIVE, status=ProgramStatus.REASONING, tokens=100)
+    candidate = view("candidate", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400, step_count=1)
+    set_tier(components, legacy, MORITier.GPU, idleness=0.9)
+    set_tier(components, equal, MORITier.GPU, idleness=0.8)
+    set_tier(components, running, MORITier.GPU)
+    set_tier(components, candidate, MORITier.CPU, idleness=0.1)
+    calls = []
+
+    components.strategy.schedule_resume(
+        snapshot(legacy, equal, running, candidate, hbm=1400, dram=5000),
+        components.initial_factors,
+        accepting_controller(components.strategy, components.initial_factors, calls),
+    )
+
+    assert calls[0].program == legacy.ref
+    assert components.strategy.counters["replacement_equal_cost_guard"] == 1
+    assert components.strategy.counters["replacement_plans_changed"] == 0
+
+
+def test_cheaper_context_with_more_overshoot_falls_back_to_legacy() -> None:
+    components = build_mori_strategy(MORIConfig(enable_wait_credit=False))
+    legacy = with_token_source(
+        view("legacy", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=500),
+        TokenObservationSource.BACKEND_USAGE,
+    )
+    cheaper = with_token_source(
+        view("cheaper", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=400),
+        TokenObservationSource.BACKEND_USAGE,
+    )
+    running = view("running", state=ProgramState.ACTIVE, status=ProgramStatus.REASONING, tokens=500)
+    candidate = view("candidate", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=100, step_count=1)
+
+    class Shared:
+        def footprint(self, ref, tier):
+            if tier != "gpu":
+                return frozenset()
+            if ref in (legacy.ref, running.ref):
+                return frozenset(range(1, 501))
+            if ref == cheaper.ref:
+                return frozenset(range(501, 901))
+            return frozenset()
+
+    components.strategy.bind_footprints(Shared())
+    set_tier(components, legacy, MORITier.GPU, idleness=0.9)
+    set_tier(components, cheaper, MORITier.GPU, idleness=0.8)
+    set_tier(components, running, MORITier.GPU)
+    set_tier(components, candidate, MORITier.CPU, idleness=0.1)
+    calls = []
+
+    components.strategy.schedule_resume(
+        snapshot(legacy, cheaper, running, candidate, hbm=1300, dram=5000),
+        components.initial_factors,
+        accepting_controller(components.strategy, components.initial_factors, calls),
+    )
+
+    assert calls[0].program == legacy.ref
+    assert components.strategy.counters["replacement_overshoot_guard"] == 1
+    assert components.strategy.counters["replacement_plans_changed"] == 0
+
+
+def test_cheaper_context_that_cannot_fit_falls_back_to_legacy() -> None:
+    components = build_mori_strategy(MORIConfig(enable_wait_credit=False))
+    legacy = with_token_source(
+        view("legacy", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=500),
+        TokenObservationSource.BACKEND_USAGE,
+    )
+    cheaper = with_token_source(
+        view("cheaper", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=400),
+        TokenObservationSource.BACKEND_USAGE,
+    )
+    running = view("running", state=ProgramState.ACTIVE, status=ProgramStatus.REASONING, tokens=100)
+    candidate = view("candidate", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=500, step_count=1)
+    set_tier(components, legacy, MORITier.GPU, idleness=0.9)
+    set_tier(components, cheaper, MORITier.GPU, idleness=0.8)
+    set_tier(components, running, MORITier.GPU)
+    set_tier(components, candidate, MORITier.CPU, idleness=0.1)
+    calls = []
+
+    components.strategy.schedule_resume(
+        snapshot(legacy, cheaper, running, candidate, hbm=1300, dram=5000),
+        components.initial_factors,
+        accepting_controller(components.strategy, components.initial_factors, calls),
+    )
+
+    assert calls[0].program == legacy.ref
+    assert components.strategy.counters["replacement_capacity_guard"] == 1
+    assert components.strategy.counters["replacement_plans_changed"] == 0
+
+
+def test_replacement_scope_excludes_ineligible_and_reasoning_programs() -> None:
+    components = build_mori_strategy(MORIConfig(enable_wait_credit=False))
+    legacy = with_token_source(
+        view("legacy", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=500),
+        TokenObservationSource.BACKEND_USAGE,
+    )
+    marked = with_token_source(
+        view(
+            "marked",
+            state=ProgramState.ACTIVE,
+            status=ProgramStatus.ACTING,
+            tokens=300,
+            marked_for_pause=True,
+        ),
+        TokenObservationSource.BACKEND_USAGE,
+    )
+    reasoning = with_token_source(
+        view("reasoning", state=ProgramState.ACTIVE, status=ProgramStatus.REASONING, tokens=300),
+        TokenObservationSource.BACKEND_USAGE,
+    )
+    pending = with_token_source(
+        view("pending", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=300),
+        TokenObservationSource.BACKEND_USAGE,
+    )
+    non_gpu = with_token_source(
+        view("non-gpu", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=300),
+        TokenObservationSource.BACKEND_USAGE,
+    )
+    candidate = view("candidate", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400, step_count=1)
+    for program, idle in ((legacy, 0.9), (marked, 0.8), (reasoning, 0.7), (pending, 0.6)):
+        set_tier(components, program, MORITier.GPU, idleness=idle)
+    pending_factor = components.initial_factors.for_program(pending.ref)
+    assert pending_factor is not None
+    components.strategy._set_factor(
+        components.initial_factors,
+        pending.ref,
+        replace(pending_factor, pending_tier=MORITier.CPU),
+    )
+    set_tier(components, non_gpu, MORITier.CPU, idleness=0.5)
+    set_tier(components, candidate, MORITier.CPU, idleness=0.1)
+    calls = []
+
+    components.strategy.schedule_resume(
+        snapshot(legacy, marked, reasoning, pending, non_gpu, candidate, hbm=2000, dram=5000),
+        components.initial_factors,
+        accepting_controller(components.strategy, components.initial_factors, calls),
+    )
+
+    assert calls[0].program == legacy.ref
+    assert components.strategy.counters["replacement_reasoning_victims"] == 0
+
+
+def test_multiple_candidates_replan_from_committed_arbitrary_subset() -> None:
+    components = build_mori_strategy(MORIConfig(enable_wait_credit=False))
+    legacy = with_token_source(
+        view("legacy", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=500),
+        TokenObservationSource.BACKEND_USAGE,
+    )
+    cheaper = with_token_source(
+        view("cheaper", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=450),
+        TokenObservationSource.BACKEND_USAGE,
+    )
+    running = view("running", state=ProgramState.ACTIVE, status=ProgramStatus.REASONING, tokens=100)
+    first = view("first", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400, step_count=1)
+    second = view("second", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=100, step_count=1)
+    set_tier(components, legacy, MORITier.GPU, idleness=0.9)
+    set_tier(components, cheaper, MORITier.GPU, idleness=0.8)
+    set_tier(components, running, MORITier.GPU)
+    set_tier(components, first, MORITier.CPU, idleness=0.1)
+    set_tier(components, second, MORITier.WAITING, idleness=0.1)
+    calls = []
+
+    components.strategy.schedule_resume(
+        snapshot(legacy, cheaper, running, first, second, hbm=1350, dram=5000),
+        components.initial_factors,
+        accepting_controller(components.strategy, components.initial_factors, calls),
+    )
+
+    assert [(call.kind, call.program) for call in calls] == [
+        (TransitionKind.PAUSE, cheaper.ref),
+        (TransitionKind.RESUME, first.ref),
+        (TransitionKind.PAUSE, legacy.ref),
+        (TransitionKind.RESUME, second.ref),
+    ]
+    assert components.strategy.counters["replacement_plans_considered"] == 2
+
+
+def test_rejected_arbitrary_subset_pause_preserves_real_slack_for_later_fit() -> None:
+    components = build_mori_strategy(MORIConfig(enable_wait_credit=False))
+    legacy = with_token_source(
+        view("legacy", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=500),
+        TokenObservationSource.BACKEND_USAGE,
+    )
+    cheaper = with_token_source(
+        view("cheaper", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=450),
+        TokenObservationSource.BACKEND_USAGE,
+    )
+    running = view("running", state=ProgramState.ACTIVE, status=ProgramStatus.REASONING, tokens=100)
+    blocked = view("blocked", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=400, step_count=1)
+    backfill = view("backfill", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=0)
+    set_tier(components, legacy, MORITier.GPU, idleness=0.9)
+    set_tier(components, cheaper, MORITier.GPU, idleness=0.8)
+    set_tier(components, running, MORITier.GPU)
+    set_tier(components, blocked, MORITier.CPU, idleness=0.1)
+    attempts = []
+    accepted_calls = []
+    accepted = accepting_controller(components.strategy, components.initial_factors, accepted_calls)
+
+    def reject_selected(request):
+        attempts.append(request)
+        if request.kind is TransitionKind.PAUSE:
+            return TransitionResult(request.kind, request.program, False, "still_authorized")
+        return accepted.apply(request)
+
+    components.strategy.schedule_resume(
+        snapshot(legacy, cheaper, running, blocked, backfill, hbm=1450, dram=5000),
+        components.initial_factors,
+        TransitionController(reject_selected),
+    )
+
+    assert [(call.kind, call.program) for call in attempts] == [
+        (TransitionKind.PAUSE, cheaper.ref),
+        (TransitionKind.ADMIT, backfill.ref),
+    ]
+    assert components.initial_factors.for_program(cheaper.ref).tier is MORITier.GPU
+    assert components.initial_factors.for_program(blocked.ref).tier is MORITier.CPU
+    assert components.strategy.counters["replacement_transition_rejections"] == 1
+
+
 @pytest.mark.parametrize(("resident_idle", "waiting_idle"), [(1.0, 1.0), (0.01, 0.99), (0.0, 0.0)])
 def test_active_gpu_reasoning_preserves_equal_or_less_idle_acting(resident_idle, waiting_idle) -> None:
     components = build_mori_strategy()
@@ -575,6 +926,8 @@ def test_completion_accumulates_cache_hit_report_from_server_observations() -> N
             ("cached_prefix_tokens", 300),
             ("hbm_cached_prefix_tokens", 250),
             ("hbm_hit_ref_zero_tokens", 50),
+            ("hbm_cached_prefix_exact_present", True),
+            ("hbm_hit_ref_zero_exact_present", True),
             ("request_latency_seconds", 2.0),
             ("scheduler_queue_seconds", 0.25),
         ),
@@ -590,6 +943,51 @@ def test_completion_accumulates_cache_hit_report_from_server_observations() -> N
     assert report["cache_hbm_ref_zero_hit_tokens"] == 50
     assert report["cache_prefix_hit_ratio"] == pytest.approx(0.75)
     assert report["cache_hbm_hit_ratio"] == pytest.approx(0.625)
+    shadow = components.initial_factors.for_program(program.ref)
+    assert shadow.last_hbm_cached_prefix_exact_present is True
+    assert shadow.last_hbm_cached_prefix_tokens == 250
+    assert shadow.last_hbm_hit_ref_zero_exact_present is True
+    assert shadow.last_hbm_hit_ref_zero_tokens == 50
+
+
+def test_shadow_cache_observation_distinguishes_exact_zero_from_combined_fallback() -> None:
+    components = build_mori_strategy(MORIConfig(mode=MORIMode.FULL))
+    program = view("program", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=100)
+    set_tier(components, program, MORITier.GPU)
+
+    def finished(sequence, *, exact):
+        return SchedulingEvent(
+            event_id=f"finished-{sequence}",
+            sequence=sequence,
+            kind=SchedulingEventKind.REQUEST_FINISHED,
+            occurred_at_monotonic_s=100.0 + sequence,
+            reason="request_completed",
+            program=program.ref,
+            current_state=ProgramState.ACTIVE,
+            current_status=ProgramStatus.ACTING,
+            fields=(
+                ("prompt_tokens", 100),
+                ("cached_prefix_tokens", 80),
+                ("hbm_cached_prefix_tokens", 0 if exact else 80),
+                ("hbm_hit_ref_zero_tokens", 0),
+                ("hbm_cached_prefix_exact_present", exact),
+                ("hbm_hit_ref_zero_exact_present", exact),
+            ),
+        )
+
+    components.strategy.handle_scheduling_event(components.initial_factors, finished(1, exact=True))
+    exact_zero = components.initial_factors.for_program(program.ref)
+    assert exact_zero.last_hbm_cached_prefix_exact_present is True
+    assert exact_zero.last_hbm_cached_prefix_tokens == 0
+    assert exact_zero.last_hbm_hit_ref_zero_exact_present is True
+    assert exact_zero.last_hbm_hit_ref_zero_tokens == 0
+
+    components.strategy.handle_scheduling_event(components.initial_factors, finished(2, exact=False))
+    fallback = components.initial_factors.for_program(program.ref)
+    assert fallback.last_hbm_cached_prefix_exact_present is False
+    assert fallback.last_hbm_cached_prefix_tokens is None
+    assert fallback.last_hbm_hit_ref_zero_exact_present is False
+    assert fallback.last_hbm_hit_ref_zero_tokens is None
 
 
 def test_overlapping_completions_end_reasoning_only_after_the_last_request() -> None:
