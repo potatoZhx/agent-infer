@@ -42,7 +42,6 @@ def test_controller_selects_mori_without_a_dynamic_factory() -> None:
     assert isinstance(controller.strategy, MORIStrategy)
     assert controller.strategy.config.mode is MORIMode.FULL
     assert controller.strategy.config.enable_wait_credit is True
-    assert controller.strategy.config.enable_bounded_service_debt is False
     assert controller.strategy.config.decode_buffer_tokens == 100
     assert controller._schedule_interval_seconds == 5.0
 
@@ -72,37 +71,12 @@ def test_wait_credit_can_be_disabled_for_exchange_only_ablation() -> None:
     assert controller.strategy.config.enable_wait_credit is False
 
 
-def test_bounded_service_debt_can_be_enabled_independently() -> None:
-    controller = build_mori_controller(backend(), {"mori": {"enable_bounded_service_debt": True}})
-
-    assert controller.strategy.config.enable_bounded_service_debt is True
-
-
-def test_bounded_service_debt_preserves_original_config_positional_arguments() -> None:
-    config = MORIConfig(3, MORIMode.FULL, False, 7, 11.0, 13.0)
-
-    assert config.window_size == 3
-    assert config.enable_wait_credit is False
-    assert config.decode_buffer_tokens == 7
-    assert config.slow_request_threshold_seconds == 11.0
-    assert config.slow_request_repeat_seconds == 13.0
-    assert config.enable_bounded_service_debt is False
-
-
 @pytest.mark.parametrize("value", [0, 1, "false", None])
 def test_wait_credit_requires_an_exact_boolean(value: object) -> None:
     with pytest.raises(ValueError, match="enable_wait_credit must be a boolean"):
         build_mori_controller(backend(), {"mori": {"enable_wait_credit": value}})
     with pytest.raises(ValueError, match="enable_wait_credit must be a boolean"):
         MORIConfig(enable_wait_credit=value)  # type: ignore[arg-type]
-
-
-@pytest.mark.parametrize("value", [0, 1, "false", None])
-def test_bounded_service_debt_requires_an_exact_boolean(value: object) -> None:
-    with pytest.raises(ValueError, match="enable_bounded_service_debt must be a boolean"):
-        build_mori_controller(backend(), {"mori": {"enable_bounded_service_debt": value}})
-    with pytest.raises(ValueError, match="enable_bounded_service_debt must be a boolean"):
-        MORIConfig(enable_bounded_service_debt=value)  # type: ignore[arg-type]
 
 
 def test_slow_request_diagnostics_default_and_explicit_settings() -> None:

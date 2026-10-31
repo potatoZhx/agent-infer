@@ -26,8 +26,6 @@ class MORIConfig:
     decode_buffer_tokens: int = 100
     slow_request_threshold_seconds: float = 30.0
     slow_request_repeat_seconds: float = 60.0
-    # Keep new fields after the original public positional parameters.
-    enable_bounded_service_debt: bool = False
 
     def __post_init__(self) -> None:
         if self.window_size <= 0:
@@ -36,8 +34,6 @@ class MORIConfig:
             raise ValueError("MORI mode must be a MORIMode")
         if not isinstance(self.enable_wait_credit, bool):
             raise ValueError("MORI enable_wait_credit must be a boolean")
-        if not isinstance(self.enable_bounded_service_debt, bool):
-            raise ValueError("MORI enable_bounded_service_debt must be a boolean")
         if self.decode_buffer_tokens < 0:
             raise ValueError("MORI decode_buffer_tokens must be non-negative")
         if (
