@@ -60,6 +60,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         self.config = config
         self.counters: Counter[str] = Counter()
         self.decision_cpu_seconds = 0.0
+        self.repair_ledger_cpu_seconds = 0.0
         self.replacement_planner_cpu_seconds = 0.0
         self.replacement_telemetry_cpu_seconds = 0.0
         self._factors: MORIFactors | None = None
@@ -784,8 +785,19 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             self._slow_diagnostics.observe(snapshot)
         started = time.thread_time()
         try:
-            self._repair_cpu_capacity(snapshot, strategy_factors)
-            self._repair_gpu_capacity(snapshot, strategy_factors, transitions)
+            self.counters["repair_cycles"] += 1
+            reads_before = self.counters["planning_program_reads"]
+            ledger_started = time.thread_time()
+            try:
+                gpu, cpu = self._ledgers(snapshot, strategy_factors)
+            finally:
+                self.repair_ledger_cpu_seconds += time.thread_time() - ledger_started
+                self.counters["repair_programs_observed"] += self.counters["planning_program_reads"] - reads_before
+            self.counters["repair_ledger_builds"] += 1
+            self._repair_cpu_capacity(snapshot, strategy_factors, cpu)
+            if self.config.mode is MORIMode.FULL:
+                self.counters["repair_program_reads_avoided"] += len(snapshot.programs)
+            self._repair_gpu_capacity(snapshot, strategy_factors, transitions, gpu, cpu)
         finally:
             self.decision_cpu_seconds += time.thread_time() - started
 
@@ -902,12 +914,17 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                     ),
                     ("cache_class_epoch", self.cache_class_epoch),
                     ("decision_cpu_seconds", self.decision_cpu_seconds),
+                    ("repair_ledger_cpu_seconds", self.repair_ledger_cpu_seconds),
                     ("replacement_planner_cpu_seconds", self.replacement_planner_cpu_seconds),
                     ("replacement_telemetry_cpu_seconds", self.replacement_telemetry_cpu_seconds),
                     *(
                         (name, self.counters[name])
                         for name in (
                             "planning_program_reads",
+                            "repair_cycles",
+                            "repair_ledger_builds",
+                            "repair_programs_observed",
+                            "repair_program_reads_avoided",
                             "planning_candidates",
                             "planning_victims",
                             "promotion_no_fit",
@@ -1225,10 +1242,14 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         return MORITier.WAITING, ()
 
     def _repair_gpu_capacity(
-        self, snapshot: SchedulingSnapshot, factors: MORIFactors, transitions: TransitionController
+        self,
+        snapshot: SchedulingSnapshot,
+        factors: MORIFactors,
+        transitions: TransitionController,
+        gpu: CapacityLedger,
+        cpu: CapacityLedger,
     ) -> None:
         """Plan enough marginal relief to cover hard debt without spending pending releases."""
-        gpu, cpu = self._ledgers(snapshot, factors)
         quota = self._gpu_quota(snapshot)
         if gpu.used <= quota:
             return
@@ -1254,11 +1275,10 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                 return
         self.counters["gpu_capacity_debt_unresolved"] += 1
 
-    def _repair_cpu_capacity(self, snapshot: SchedulingSnapshot, factors: MORIFactors) -> None:
+    def _repair_cpu_capacity(self, snapshot: SchedulingSnapshot, factors: MORIFactors, cpu: CapacityLedger) -> None:
         """Relinquish lower-priority CPU claims until the logical union fits its quota."""
         if self.config.mode is MORIMode.PLACEMENT_ONLY:
             return
-        _gpu, cpu = self._ledgers(snapshot, factors)
         quota = self._dram_quota(snapshot)
         if cpu.used <= quota:
             return
@@ -1266,8 +1286,10 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         victims.sort(
             key=lambda p: (-self._idleness(self._factor(factors, p.ref), snapshot.observed_at_monotonic_s), p.ref)
         )
+        retained_claims: list[tuple[ProgramRef, CapacityClaim]] = []
         for victim in victims:
             sidecar = self._factor(factors, victim.ref)
+            claim = cpu.claims[victim.ref]
             replacement = (
                 replace(sidecar, tier=MORITier.WAITING)
                 if sidecar.tier is MORITier.CPU
@@ -1275,9 +1297,16 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             )
             self._set_factor(factors, victim.ref, replacement)
             cpu.remove(victim.ref)
+            if replacement.tier is MORITier.CPU or replacement.pending_tier is MORITier.CPU:
+                # In-tree writers never produce CPU/CPU, but injected factors can.
+                # Preserve the old post-CPU rebuild result without rescanning the
+                # snapshot or changing this loop's historical stopping point.
+                retained_claims.append((victim.ref, claim))
             self.counters["cpu_capacity_to_waiting"] += 1
             if cpu.used <= quota:
-                return
+                break
+        for ref, claim in retained_claims:
+            cpu.add(ref, claim)
 
     def _promotion_key(
         self,

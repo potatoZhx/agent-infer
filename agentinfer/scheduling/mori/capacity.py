@@ -12,7 +12,12 @@ from agentinfer.scheduling.domain import ProgramRef
 
 
 class FootprintProvider(Protocol):
-    """Supply current-prompt native block IDs; never promise physical readiness."""
+    """Supply current-prompt native block IDs; never promise physical readiness.
+
+    Reads are side-effect free and stable for the duration of one serialized
+    scheduling hook. Providers must not depend on repeated reads of one tier or
+    vary an exception by call count within that hook.
+    """
 
     def footprint(self, program: ProgramRef, tier: str) -> frozenset[int]: ...
 
