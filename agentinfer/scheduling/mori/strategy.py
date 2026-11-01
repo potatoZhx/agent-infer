@@ -917,6 +917,9 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                     ("writeback_audit_cpu_seconds", self.writeback_audit_cpu_seconds),
                     ("repair_writeback_endpoints", self.config.repair_writeback_endpoints),
                     ("writeback_capture_cpu_seconds", self.writeback_capture_cpu_seconds),
+                    ("fast_capacity_accounting", self.config.fast_capacity_accounting),
+                    ("footprint_snapshot_hits", getattr(self._footprints, "footprint_snapshot_hits", 0)),
+                    ("footprint_snapshot_misses", getattr(self._footprints, "footprint_snapshot_misses", 0)),
                     ("decode_buffer_tokens", self.config.decode_buffer_tokens),
                     ("gpu_programs", tiers[MORITier.GPU.value]),
                     ("cpu_programs", tiers[MORITier.CPU.value]),
@@ -1008,6 +1011,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                             "writeback_capture_requests",
                             "writeback_capture_blocks",
                             "writeback_capture_noninitial_blocks",
+                            "fast_capacity_ledger_builds",
                             "replacement_plans_considered",
                             "replacement_plans_changed",
                             "replacement_plans_legacy_fallback",
@@ -1230,8 +1234,9 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
 
     def _ledgers(self, snapshot: SchedulingSnapshot, factors: MORIFactors) -> tuple[CapacityLedger, CapacityLedger]:
         """Build GPU commitments and CPU commitments plus pending destinations in one scan."""
-        gpu = CapacityLedger(snapshot.hbm_block_size_tokens or 1)
-        cpu = CapacityLedger(snapshot.dram_chunk_size_tokens or 1)
+        gpu = CapacityLedger(snapshot.hbm_block_size_tokens or 1, fast=self.config.fast_capacity_accounting)
+        cpu = CapacityLedger(snapshot.dram_chunk_size_tokens or 1, fast=self.config.fast_capacity_accounting)
+        self.counters["fast_capacity_ledger_builds"] += int(self.config.fast_capacity_accounting)
         for program in snapshot.programs:
             self.counters["planning_program_reads"] += 1
             sidecar = self._factor(factors, program.ref)

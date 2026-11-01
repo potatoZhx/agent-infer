@@ -55,6 +55,9 @@ class MORIRuntimeState(ProgramCacheClassObserver):
         if self._provider is not None and self._provider is not provider:
             raise RuntimeError("MORI runtime state is already bound to another scheduler")
         self._provider = provider
+        self.footprints.configure_snapshot_cache(
+            getattr(getattr(provider, "config", None), "fast_capacity_accounting", False) is True
+        )
         provider.subscribe_cache_class_observer(self)
         bind = getattr(provider, "bind_footprints", None)
         if callable(bind):
@@ -101,6 +104,14 @@ class MORIRuntimeState(ProgramCacheClassObserver):
     def footprint(self, program: ProgramRef, tier: str) -> frozenset[int]:
         """Expose current-prompt block identity evidence to the placement planner."""
         return self.footprints.get(program, tier)
+
+    @property
+    def footprint_snapshot_hits(self) -> int:
+        return self.footprints.snapshot_hits
+
+    @property
+    def footprint_snapshot_misses(self) -> int:
+        return self.footprints.snapshot_misses
 
     def invalidate_footprint(self, program: ProgramRef) -> None:
         """Forget block proof without deleting native contents or LRU ownership."""
@@ -197,6 +208,7 @@ class MORIRuntimeState(ProgramCacheClassObserver):
         self._hbm_pressure_pending = False
         self.footprints.clear()
         self.footprints.enabled = False
+        self.footprints.configure_snapshot_cache(False)
 
 
 MORI_RUNTIME_STATE = MORIRuntimeState()

@@ -89,6 +89,7 @@ _CONFIGURABLE_MORI_SETTINGS = frozenset(
         "decode_batch_tokens",
         "audit_writeback_sources",
         "repair_writeback_endpoints",
+        "fast_capacity_accounting",
         "slow_request_threshold_seconds",
         "slow_request_repeat_seconds",
     }
@@ -134,6 +135,7 @@ def build_mori_controller(
         decode_batch_tokens=_int_setting(raw, "decode_batch_tokens", 0, scope="mori"),
         audit_writeback_sources=_bool_setting(raw, "audit_writeback_sources", False, scope="mori"),
         repair_writeback_endpoints=_bool_setting(raw, "repair_writeback_endpoints", False, scope="mori"),
+        fast_capacity_accounting=_bool_setting(raw, "fast_capacity_accounting", False, scope="mori"),
         slow_request_threshold_seconds=_float_setting(raw, "slow_request_threshold_seconds", 30.0, scope="mori"),
         slow_request_repeat_seconds=_float_setting(raw, "slow_request_repeat_seconds", 60.0, scope="mori"),
     )

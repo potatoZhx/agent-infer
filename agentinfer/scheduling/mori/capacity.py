@@ -42,27 +42,38 @@ class CapacityLedger:
     counts a shared block only after its last protection claim disappears.
     """
 
-    def __init__(self, quantum: int) -> None:
+    def __init__(self, quantum: int, *, fast: bool = False) -> None:
         self.quantum = quantum
+        self.fast = fast
         self.claims: dict[ProgramRef, CapacityClaim] = {}
         self.owners: Counter[int] = Counter()
+        self._shared: set[int] = set()
         self.used = 0
 
     def incremental(self, claim: CapacityClaim) -> int:
         """Return the additional tokens charged if a new owner takes this claim."""
+        if self.fast:
+            return claim.tokens - self.quantum * len(claim.blocks & self.owners.keys())
         return claim.tokens - self.quantum * sum(key in self.owners for key in claim.blocks)
 
     def add(self, ref: ProgramRef, claim: CapacityClaim) -> None:
         """Insert or replace one owner claim, updating shared block multiplicities."""
         if ref in self.claims:
             self.remove(ref)
-        self.used += self.incremental(claim)
+        if self.fast:
+            overlap = claim.blocks & self.owners.keys()
+            self.used += claim.tokens - self.quantum * len(overlap)
+            self._shared.update(overlap)
+        else:
+            self.used += self.incremental(claim)
         self.claims[ref] = claim
         self.owners.update(claim.blocks)
 
     def reclaimable(self, ref: ProgramRef) -> int:
         """Return marginal logical relief, excluding blocks still claimed by peers."""
         claim = self.claims[ref]
+        if self.fast:
+            return claim.tokens - self.quantum * len(claim.blocks & self._shared)
         return claim.tokens - self.quantum * sum(self.owners[key] > 1 for key in claim.blocks)
 
     def remove(self, ref: ProgramRef) -> int:
@@ -71,6 +82,11 @@ class CapacityLedger:
             return 0
         freed = self.reclaimable(ref)
         claim = self.claims.pop(ref)
+        if self.fast:
+            # Only previously shared keys can cross 2 -> 1. Unique keys never
+            # enter this index, and 3+ owners must remain shared after removal.
+            newly_unique = {key for key in claim.blocks & self._shared if self.owners[key] == 2}
+            self._shared.difference_update(newly_unique)
         self.used -= freed
         for key in claim.blocks:
             self.owners[key] -= 1
@@ -88,6 +104,10 @@ class CapacityLedger:
         map for every replacement trial.
         """
         incoming_claim = self.claims[remove_ref]
+        if self.fast:
+            restore_incremental = restore_claim.tokens - self.quantum * len(restore_claim.blocks & self.owners.keys())
+            retained = (incoming_claim.blocks & self._shared) | (incoming_claim.blocks & restore_claim.blocks)
+            return self.used + restore_incremental - incoming_claim.tokens + self.quantum * len(retained)
         restore_incremental = restore_claim.tokens - self.quantum * sum(
             block in self.owners for block in restore_claim.blocks
         )
@@ -98,9 +118,10 @@ class CapacityLedger:
 
     def copy(self) -> CapacityLedger:
         """Copy accounting for a speculative plan without modifying committed claims."""
-        other = CapacityLedger(self.quantum)
+        other = CapacityLedger(self.quantum, fast=self.fast)
         other.claims = self.claims.copy()
         other.owners = self.owners.copy()
+        other._shared = self._shared.copy()
         other.used = self.used
         return other
 

@@ -28,6 +28,7 @@ class MORIConfig:
     decode_batch_tokens: int = 0
     audit_writeback_sources: bool = False
     repair_writeback_endpoints: bool = False
+    fast_capacity_accounting: bool = False
     decode_buffer_tokens: int = 100
     slow_request_threshold_seconds: float = 30.0
     slow_request_repeat_seconds: float = 60.0
@@ -47,6 +48,10 @@ class MORIConfig:
             raise ValueError("MORI repair_writeback_endpoints must be a boolean")
         if self.repair_writeback_endpoints and self.mode is not MORIMode.FULL:
             raise ValueError("MORI repair_writeback_endpoints requires full mode")
+        if not isinstance(self.fast_capacity_accounting, bool):
+            raise ValueError("MORI fast_capacity_accounting must be a boolean")
+        if self.fast_capacity_accounting and self.mode is not MORIMode.FULL:
+            raise ValueError("MORI fast_capacity_accounting requires full mode")
         if (
             isinstance(self.gpu_service_requests, bool)
             or not isinstance(self.gpu_service_requests, int)
