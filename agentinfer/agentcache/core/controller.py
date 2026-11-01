@@ -80,7 +80,14 @@ _REMOVED_PROGRESS_TTL_SETTINGS = frozenset(
 )
 
 _CONFIGURABLE_MORI_SETTINGS = frozenset(
-    {"enable_wait_credit", "mode", "window_size", "slow_request_threshold_seconds", "slow_request_repeat_seconds"}
+    {
+        "enable_wait_credit",
+        "mode",
+        "window_size",
+        "ready_wait_limit_seconds",
+        "slow_request_threshold_seconds",
+        "slow_request_repeat_seconds",
+    }
 )
 _FIXED_MORI_SETTINGS = frozenset({"decode_buffer_tokens"})
 
@@ -118,6 +125,7 @@ def build_mori_controller(
         mode=_mori_mode_setting(raw, "mode", MORIMode.FULL),
         window_size=_int_setting(raw, "window_size", 5, scope="mori"),
         enable_wait_credit=_bool_setting(raw, "enable_wait_credit", True, scope="mori"),
+        ready_wait_limit_seconds=_float_setting(raw, "ready_wait_limit_seconds", 0.0, scope="mori"),
         slow_request_threshold_seconds=_float_setting(raw, "slow_request_threshold_seconds", 30.0, scope="mori"),
         slow_request_repeat_seconds=_float_setting(raw, "slow_request_repeat_seconds", 60.0, scope="mori"),
     )

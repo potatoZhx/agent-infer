@@ -71,6 +71,20 @@ def test_wait_credit_can_be_disabled_for_exchange_only_ablation() -> None:
     assert controller.strategy.config.enable_wait_credit is False
 
 
+def test_ready_wait_reservation_is_explicit_and_defaults_off() -> None:
+    assert build_mori_controller(backend(), {}).strategy.config.ready_wait_limit_seconds == 0
+    controller = build_mori_controller(backend(), {"mori": {"ready_wait_limit_seconds": 30.0}})
+    assert controller.strategy.config.ready_wait_limit_seconds == 30.0
+
+
+@pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf"), True])
+def test_invalid_ready_wait_limit_is_rejected(value) -> None:
+    with pytest.raises(ValueError):
+        build_mori_controller(backend(), {"mori": {"ready_wait_limit_seconds": value}})
+    with pytest.raises(ValueError):
+        MORIConfig(ready_wait_limit_seconds=value)
+
+
 @pytest.mark.parametrize("value", [0, 1, "false", None])
 def test_wait_credit_requires_an_exact_boolean(value: object) -> None:
     with pytest.raises(ValueError, match="enable_wait_credit must be a boolean"):

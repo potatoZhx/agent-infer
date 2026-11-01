@@ -325,6 +325,9 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             return ()
         now = snapshot.observed_at_monotonic_s
         candidates.sort(key=lambda p: self._promotion_key(p, strategy_factors, snapshot, now))
+        reserved = self._aged_waiter(snapshot)
+        if reserved is not None:
+            candidates.sort(key=lambda p: p.ref != reserved.ref)
         victims = [
             p
             for p in snapshot.programs
@@ -372,6 +375,9 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                 candidate_idle = self._idleness(self._factor(strategy_factors, candidate.ref), now)
                 acting = [victim for victim in victims if victim.ref in gpu.claims]
                 eligible = [victim for victim in acting if victim_idleness[victim.ref] > candidate_idle]
+                if reserved is not None and candidate.ref == reserved.ref:
+                    eligible = acting
+                    reason = "mori_ready_reservation"
                 has_reasoning = any(
                     program.ref in gpu.claims and program.status is ProgramStatus.REASONING
                     for program in snapshot.programs
@@ -417,6 +423,11 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                             "fallback_reason": "no_feasible_legacy_prefix",
                             "planner_cpu_seconds": planner_elapsed,
                         }
+                    if reserved is not None and candidate.ref == reserved.ref:
+                        # Do not spend capacity being drained for this ready
+                        # request on a younger, smaller continuation.
+                        self.counters["ready_reservation_blocked_cycles"] += 1
+                        break
                     continue
                 self.counters["replacement_plans_considered"] += 1
                 capture_plan_details = decision is not None or self._emit_replacement_telemetry
@@ -512,6 +523,8 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                     "promotion_applied" if result is not None and result.applied else "promotion_rejected"
                 )
                 decision["transition_reason"] = result.reason if result is not None else "demotion_rejected"
+            if reserved is not None and candidate.ref == reserved.ref and (result is None or not result.applied):
+                break
         return tuple(demoted)
 
     @staticmethod
@@ -798,6 +811,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             if self.config.mode is MORIMode.FULL:
                 self.counters["repair_program_reads_avoided"] += len(snapshot.programs)
             self._repair_gpu_capacity(snapshot, strategy_factors, transitions, gpu, cpu)
+            self._reserve_aged_waiter(snapshot, strategy_factors, transitions, gpu, cpu)
         finally:
             self.decision_cpu_seconds += time.thread_time() - started
 
@@ -880,6 +894,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                     ("mode", self.config.mode.value),
                     ("window_size", self.config.window_size),
                     ("enable_wait_credit", self.config.enable_wait_credit),
+                    ("ready_wait_limit_seconds", self.config.ready_wait_limit_seconds),
                     ("decode_buffer_tokens", self.config.decode_buffer_tokens),
                     ("gpu_programs", tiers[MORITier.GPU.value]),
                     ("cpu_programs", tiers[MORITier.CPU.value]),
@@ -937,6 +952,10 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                             "owners_retired",
                             "rebalance_demotions",
                             "idle_gpu_progress_demotions",
+                            "ready_reservation_cycles",
+                            "ready_reservation_marks",
+                            "ready_reservation_pauses",
+                            "ready_reservation_blocked_cycles",
                             "replacement_plans_considered",
                             "replacement_plans_changed",
                             "replacement_plans_legacy_fallback",
@@ -1307,6 +1326,85 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                 break
         for ref, claim in retained_claims:
             cpu.add(ref, claim)
+
+    def _aged_waiter(self, snapshot: SchedulingSnapshot) -> ProgramView | None:
+        """Select a causally ready oldest request independently of cache presence."""
+        limit = self.config.ready_wait_limit_seconds
+        if limit <= 0 or self.config.mode is not MORIMode.FULL:
+            return None
+        now = snapshot.observed_at_monotonic_s
+        return min(
+            (
+                program
+                for program in snapshot.programs
+                if program.state is ProgramState.PAUSED
+                and program.status is ProgramStatus.REASONING
+                and not program.marked_for_pause
+                and program.wait_started_at_monotonic_s is not None
+                and self._wait_seconds(program, now) >= limit
+                and self._gpu_target(program, snapshot) <= self._gpu_quota(snapshot)
+            ),
+            key=lambda program: (program.wait_started_at_monotonic_s, program.ref),
+            default=None,
+        )
+
+    def _reserve_aged_waiter(
+        self,
+        snapshot: SchedulingSnapshot,
+        factors: MORIFactors,
+        transitions: TransitionController,
+        gpu: CapacityLedger,
+        cpu: CapacityLedger,
+    ) -> None:
+        """Drain a feasible oldest waiter's capacity at natural request boundaries.
+
+        The projected ledger chooses lazy victims only. Their real GPU claims
+        and native transfer/source pins remain intact until completion; resume
+        still checks the real ledger. A failed transition never earns relief.
+        """
+        if self.config.ready_wait_limit_seconds <= 0 or self.config.mode is not MORIMode.FULL:
+            return
+        candidate = self._aged_waiter(snapshot)
+        if candidate is None:
+            now = snapshot.observed_at_monotonic_s
+            for program in snapshot.programs:
+                if (
+                    program.state is ProgramState.PAUSED
+                    and program.status is ProgramStatus.REASONING
+                    and program.wait_started_at_monotonic_s is not None
+                    and self._gpu_target(program, snapshot) <= self._gpu_quota(snapshot)
+                ):
+                    deadline = program.wait_started_at_monotonic_s + self.config.ready_wait_limit_seconds
+                    if deadline > now:
+                        self._request_schedule(factors, deadline)
+            return
+        quota = self._gpu_quota(snapshot)
+        projected = gpu.copy()
+        projected.add(candidate.ref, self._claim(candidate, snapshot, gpu=True))
+        for program in snapshot.programs:
+            if self._factor(factors, program.ref).pending_tier is not None:
+                projected.remove(program.ref)
+        if projected.used <= quota:
+            return
+        self.counters["ready_reservation_cycles"] += 1
+        victims = [
+            program
+            for program in snapshot.programs
+            if program.ref in gpu.claims
+            and program.state is ProgramState.ACTIVE
+            and not program.marked_for_pause
+            and self._factor(factors, program.ref).pending_tier is None
+        ]
+        victims.sort(key=lambda program: self._demotion_key(program, factors, snapshot.observed_at_monotonic_s))
+        for victim in victims:
+            if self._demote(victim, snapshot, factors, transitions, gpu, cpu, reason="mori_ready_reservation"):
+                projected.remove(victim.ref)
+                counter = (
+                    "ready_reservation_pauses" if victim.status is ProgramStatus.ACTING else "ready_reservation_marks"
+                )
+                self.counters[counter] += 1
+            if projected.used <= quota:
+                return
 
     def _promotion_key(
         self,
