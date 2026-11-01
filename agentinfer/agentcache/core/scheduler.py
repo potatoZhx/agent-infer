@@ -160,6 +160,12 @@ class _VllmAdmissionHooks:
             else build_controller(self.backend_pool_info(owner), settings)
         )
         strategy = getattr(self.controller, "strategy", None)
+        if isinstance(strategy, MORIStrategy) and strategy.config.decode_batch_tokens > 0:
+            native_budget = getattr(owner, "max_num_scheduled_tokens", None)
+            if isinstance(native_budget, bool) or not isinstance(native_budget, int) or native_budget <= 0:
+                raise ValueError("MORI decode_batch_tokens requires a positive native max_num_scheduled_tokens")
+            if not getattr(owner.scheduler_config, "enable_chunked_prefill", False):
+                raise ValueError("MORI decode_batch_tokens requires native chunked prefill")
         self._mori_adapter = install_vllm_mori(owner, strategy) if isinstance(strategy, MORIStrategy) else None
         if self._mori_adapter is not None:
             # Token-equivalent union accounting is exact only for one native KV group.
@@ -282,6 +288,81 @@ class _VllmAdmissionHooks:
             self.controller.on_request_dispatch(request_id)
             self._mori_context_handed_off.add(request_id)
         MORI_RUNTIME_STATE.bind_request(request_id, program)
+
+    def schedule_native(self, owner: Scheduler, native_schedule: Callable, *args, **kwargs):
+        """Bound mixed iterations only while a native request is actually decoding.
+
+        This chooses a batch within the configured native ceiling. It neither
+        reads output bounds nor pauses/cancels requests. Existing decoders are
+        visited before prefills within this call; native queue mutations survive
+        restoring the remaining requests' original relative order afterwards.
+        """
+        strategy = getattr(self.controller, "strategy", None)
+        if not isinstance(strategy, MORIStrategy) or strategy.config.decode_batch_tokens <= 0:
+            return native_schedule(*args, **kwargs)
+        started = time.thread_time()
+        native_cpu = 0.0
+
+        def run_native():
+            nonlocal native_cpu
+            native_started = time.thread_time()
+            try:
+                return native_schedule(*args, **kwargs)
+            finally:
+                native_cpu += time.thread_time() - native_started
+
+        try:
+            return self._schedule_mori_batch(owner, strategy, run_native)
+        finally:
+            strategy.batch_policy_cpu_seconds += max(0.0, time.thread_time() - started - native_cpu)
+
+    @staticmethod
+    def _schedule_mori_batch(owner: Scheduler, strategy: MORIStrategy, native_schedule: Callable):
+        """Apply one transient decode-first budget over the current native queue."""
+        running = owner.running
+        decoding = {
+            id(request)
+            for request in running
+            if request.num_output_tokens > 0 and request.num_computed_tokens >= request.num_prompt_tokens
+        }
+        if not decoding:
+            return native_schedule()
+        original = owner.max_num_scheduled_tokens
+        budget = min(original, max(strategy.config.decode_batch_tokens, len(running)))
+        if budget == original:
+            return native_schedule()
+        ordered = sorted(running, key=lambda request: id(request) not in decoding)
+        reordered = any(before is not after for before, after in zip(running, ordered, strict=False))
+        previous_order = {id(request): index for index, request in enumerate(running)} if reordered else {}
+        if reordered:
+            running[:] = ordered
+        owner.max_num_scheduled_tokens = budget
+        try:
+            output = native_schedule()
+        except Exception:
+            strategy.counters["decode_batch_native_errors"] += 1
+            raise
+        finally:
+            owner.max_num_scheduled_tokens = original
+            if reordered:
+                # Preserve actual removals/preemptions and append new arrivals
+                # in native order. Never resurrect a removed request.
+                owner.running.sort(key=lambda request: previous_order.get(id(request), len(previous_order)))
+        assigned = sum(output.num_scheduled_tokens.values())
+        if assigned:
+            strategy.counters["decode_batch_capped_iterations"] += 1
+            strategy.counters["decode_batch_reordered_iterations"] += int(reordered)
+            strategy.counters["decode_batch_assigned_tokens"] += assigned
+            strategy.counters["decode_batch_max_budget_tokens"] = max(
+                strategy.counters["decode_batch_max_budget_tokens"], budget
+            )
+            strategy.counters["decode_batch_native_ceiling_tokens"] = max(
+                strategy.counters["decode_batch_native_ceiling_tokens"], original
+            )
+            strategy.counters["decode_batch_max_assigned_tokens"] = max(
+                strategy.counters["decode_batch_max_assigned_tokens"], assigned
+            )
+        return output
 
     def _commit_mori_context_handoff(self, request_id: str, computed_blocks: object) -> None:
         """Replace old ownership after lookup, then immediately reclaim exact HBM hits."""
@@ -627,7 +708,7 @@ class AgentCacheAsyncSchedulerBridge(AsyncScheduler):
 
     def schedule(self, *args, **kwargs):
         self._agentcache.before_schedule(self, super().add_request)
-        output = super().schedule(*args, **kwargs)
+        output = self._agentcache.schedule_native(self, super().schedule, *args, **kwargs)
         self._agentcache.observe_prefix_cache(output)
         return output
 
@@ -672,7 +753,7 @@ class AgentCacheSyncSchedulerBridge(Scheduler):
 
     def schedule(self, *args, **kwargs):
         self._agentcache.before_schedule(self, super().add_request)
-        output = super().schedule(*args, **kwargs)
+        output = self._agentcache.schedule_native(self, super().schedule, *args, **kwargs)
         self._agentcache.observe_prefix_cache(output)
         return output
 

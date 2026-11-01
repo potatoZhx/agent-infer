@@ -64,6 +64,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         self.config = config
         self.counters: Counter[str] = Counter()
         self.decision_cpu_seconds = 0.0
+        self.batch_policy_cpu_seconds = 0.0
         self.repair_ledger_cpu_seconds = 0.0
         self.replacement_planner_cpu_seconds = 0.0
         self.replacement_telemetry_cpu_seconds = 0.0
@@ -908,6 +909,8 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                     ("enable_wait_credit", self.config.enable_wait_credit),
                     ("ready_wait_limit_seconds", self.config.ready_wait_limit_seconds),
                     ("gpu_service_requests", self.config.gpu_service_requests),
+                    ("decode_batch_tokens", self.config.decode_batch_tokens),
+                    ("batch_policy_cpu_seconds", self.batch_policy_cpu_seconds),
                     ("decode_buffer_tokens", self.config.decode_buffer_tokens),
                     ("gpu_programs", tiers[MORITier.GPU.value]),
                     ("cpu_programs", tiers[MORITier.CPU.value]),
@@ -973,6 +976,13 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                             "gpu_service_started",
                             "gpu_service_completed_requests",
                             "gpu_service_protection_checks",
+                            "decode_batch_capped_iterations",
+                            "decode_batch_reordered_iterations",
+                            "decode_batch_assigned_tokens",
+                            "decode_batch_max_budget_tokens",
+                            "decode_batch_native_ceiling_tokens",
+                            "decode_batch_max_assigned_tokens",
+                            "decode_batch_native_errors",
                             "replacement_plans_considered",
                             "replacement_plans_changed",
                             "replacement_plans_legacy_fallback",
