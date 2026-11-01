@@ -85,6 +85,7 @@ _CONFIGURABLE_MORI_SETTINGS = frozenset(
         "mode",
         "window_size",
         "ready_wait_limit_seconds",
+        "gpu_service_requests",
         "slow_request_threshold_seconds",
         "slow_request_repeat_seconds",
     }
@@ -126,6 +127,7 @@ def build_mori_controller(
         window_size=_int_setting(raw, "window_size", 5, scope="mori"),
         enable_wait_credit=_bool_setting(raw, "enable_wait_credit", True, scope="mori"),
         ready_wait_limit_seconds=_float_setting(raw, "ready_wait_limit_seconds", 0.0, scope="mori"),
+        gpu_service_requests=_int_setting(raw, "gpu_service_requests", 0, scope="mori"),
         slow_request_threshold_seconds=_float_setting(raw, "slow_request_threshold_seconds", 30.0, scope="mori"),
         slow_request_repeat_seconds=_float_setting(raw, "slow_request_repeat_seconds", 60.0, scope="mori"),
     )

@@ -77,6 +77,22 @@ def test_ready_wait_reservation_is_explicit_and_defaults_off() -> None:
     assert controller.strategy.config.ready_wait_limit_seconds == 30.0
 
 
+def test_gpu_service_request_budget_defaults_off_and_is_explicit():
+    assert build_mori_controller(backend(), {}).strategy.config.gpu_service_requests == 0
+    assert (
+        build_mori_controller(backend(), {"mori": {"gpu_service_requests": 4}}).strategy.config.gpu_service_requests
+        == 4
+    )
+
+
+@pytest.mark.parametrize("value", [-1, 1.5, True, "4"])
+def test_gpu_service_request_budget_requires_non_negative_integer(value):
+    with pytest.raises(ValueError):
+        MORIConfig(gpu_service_requests=value)
+    with pytest.raises(ValueError):
+        build_mori_controller(backend(), {"mori": {"gpu_service_requests": value}})
+
+
 @pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf"), True])
 def test_invalid_ready_wait_limit_is_rejected(value) -> None:
     with pytest.raises(ValueError):

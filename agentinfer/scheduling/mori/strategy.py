@@ -35,6 +35,10 @@ MORIFactors = StrategyFactors[MORIGlobalFactors, MORIProgramFactors]
 
 logger = logging.getLogger(__name__)
 
+# Optional residency commitments remain bounded even with unknown future tools.
+_GPU_SERVICE_MAX_SECONDS = 30.0
+_GPU_SERVICE_ACTING_GRACE_SECONDS = 1.0
+
 
 @dataclass(frozen=True)
 class _VictimPlan:
@@ -133,6 +137,13 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         if sidecar is None:
             return
         if running:
+            if (
+                self.config.gpu_service_requests > 0
+                and sidecar.gpu_service_started_at_monotonic_s is None
+                and sidecar.tier is MORITier.GPU
+            ):
+                sidecar = replace(sidecar, gpu_service_started_at_monotonic_s=now)
+                self.counters["gpu_service_started"] += 1
             if sidecar.reasoning_wait_seconds or sidecar.reasoning_wait_started_at_monotonic_s is not None:
                 sidecar = replace(sidecar, reasoning_wait_seconds=0.0, reasoning_wait_started_at_monotonic_s=None)
             if not sidecar.execution_observed:
@@ -337,6 +348,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             and not p.marked_for_pause
             and self._factor(strategy_factors, p.ref).tier is MORITier.GPU
             and self._factor(strategy_factors, p.ref).pending_tier is None
+            and not self._gpu_service_protected(p, strategy_factors, now)
         ]
         victims.sort(key=lambda p: self._demotion_key(p, strategy_factors, now))
         victim_idleness = {
@@ -895,6 +907,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                     ("window_size", self.config.window_size),
                     ("enable_wait_credit", self.config.enable_wait_credit),
                     ("ready_wait_limit_seconds", self.config.ready_wait_limit_seconds),
+                    ("gpu_service_requests", self.config.gpu_service_requests),
                     ("decode_buffer_tokens", self.config.decode_buffer_tokens),
                     ("gpu_programs", tiers[MORITier.GPU.value]),
                     ("cpu_programs", tiers[MORITier.CPU.value]),
@@ -957,6 +970,9 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                             "ready_reservation_pauses",
                             "ready_reservation_blocked_cycles",
                             "ready_reservation_transition_exceptions",
+                            "gpu_service_started",
+                            "gpu_service_completed_requests",
+                            "gpu_service_protection_checks",
                             "replacement_plans_considered",
                             "replacement_plans_changed",
                             "replacement_plans_legacy_fallback",
@@ -1081,6 +1097,14 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         updated = replace(
             sidecar,
             pending_reasoning_seconds=reasoning,
+            gpu_service_completed_requests=(
+                sidecar.gpu_service_completed_requests + 1
+                if self.config.gpu_service_requests > 0
+                and sidecar.tier is MORITier.GPU
+                and sidecar.gpu_service_started_at_monotonic_s is not None
+                and self._event_non_negative_int(event.field("completion_tokens")) > 0
+                else sidecar.gpu_service_completed_requests
+            ),
             acting_started_at_monotonic_s=acting_started,
             reasoning_started_at_monotonic_s=(None if reasoning_finished else sidecar.reasoning_started_at_monotonic_s),
             reasoning_wait_seconds=(0.0 if reasoning_finished else sidecar.reasoning_wait_seconds),
@@ -1093,6 +1117,14 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             last_hbm_hit_ref_zero_exact_present=hbm_ref_zero_exact_present,
         )
         self._set_factor(strategy_factors, event.program, updated)
+
+        if (
+            self.config.gpu_service_requests > 0
+            and sidecar.tier is MORITier.GPU
+            and sidecar.gpu_service_started_at_monotonic_s is not None
+            and self._event_non_negative_int(event.field("completion_tokens")) > 0
+        ):
+            self.counters["gpu_service_completed_requests"] += 1
 
     def on_program_paused(self, strategy_factors: MORIFactors, event: SchedulingEvent) -> None:
         if event.program is None:
@@ -1140,6 +1172,8 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                 pending_tier=None,
                 reasoning_wait_seconds=0.0,
                 reasoning_wait_started_at_monotonic_s=None,
+                gpu_service_started_at_monotonic_s=None,
+                gpu_service_completed_requests=0,
                 reasoning_started_at_monotonic_s=(
                     event.occurred_at_monotonic_s
                     if event.current_status is ProgramStatus.REASONING
@@ -1328,6 +1362,34 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         for ref, claim in retained_claims:
             cpu.add(ref, claim)
 
+    def _gpu_service_protected(self, program: ProgramView, factors: MORIFactors, now: float) -> bool:
+        """Keep a bounded useful-service lease, with at most one second of Acting grace.
+
+        Admission and restoration alone earn no service. Only observed native
+        execution starts this clock; real output-bearing completions consume
+        its request budget. Hard capacity repair deliberately ignores leases.
+        """
+        if self.config.gpu_service_requests <= 0:
+            return False
+        sidecar = self._factor(factors, program.ref)
+        started = sidecar.gpu_service_started_at_monotonic_s
+        if (
+            sidecar.tier is not MORITier.GPU
+            or started is None
+            or sidecar.gpu_service_completed_requests >= self.config.gpu_service_requests
+        ):
+            return False
+        deadline = started + _GPU_SERVICE_MAX_SECONDS
+        if program.status is ProgramStatus.ACTING:
+            if sidecar.acting_started_at_monotonic_s is None:
+                return False
+            deadline = min(deadline, sidecar.acting_started_at_monotonic_s + _GPU_SERVICE_ACTING_GRACE_SECONDS)
+        if now >= deadline:
+            return False
+        self._request_schedule(factors, deadline)
+        self.counters["gpu_service_protection_checks"] += 1
+        return True
+
     def _aged_waiter(self, snapshot: SchedulingSnapshot) -> ProgramView | None:
         """Select a causally ready oldest request independently of cache presence."""
         limit = self.config.ready_wait_limit_seconds
@@ -1395,6 +1457,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             and program.state is ProgramState.ACTIVE
             and not program.marked_for_pause
             and self._factor(factors, program.ref).pending_tier is None
+            and not self._gpu_service_protected(program, factors, snapshot.observed_at_monotonic_s)
         ]
         victims.sort(key=lambda program: self._demotion_key(program, factors, snapshot.observed_at_monotonic_s))
         for victim in victims:

@@ -24,6 +24,7 @@ class MORIConfig:
     mode: MORIMode = MORIMode.FULL
     enable_wait_credit: bool = True
     ready_wait_limit_seconds: float = 0.0
+    gpu_service_requests: int = 0
     decode_buffer_tokens: int = 100
     slow_request_threshold_seconds: float = 30.0
     slow_request_repeat_seconds: float = 60.0
@@ -35,6 +36,12 @@ class MORIConfig:
             raise ValueError("MORI mode must be a MORIMode")
         if not isinstance(self.enable_wait_credit, bool):
             raise ValueError("MORI enable_wait_credit must be a boolean")
+        if (
+            isinstance(self.gpu_service_requests, bool)
+            or not isinstance(self.gpu_service_requests, int)
+            or self.gpu_service_requests < 0
+        ):
+            raise ValueError("MORI gpu_service_requests must be a non-negative integer")
         if (
             isinstance(self.ready_wait_limit_seconds, bool)
             or not math.isfinite(self.ready_wait_limit_seconds)

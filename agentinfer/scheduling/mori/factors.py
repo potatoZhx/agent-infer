@@ -47,6 +47,8 @@ class MORIProgramFactors:
     reasoning_wait_started_at_monotonic_s: float | None = None
     pending_tier: MORITier | None = None
     execution_observed: bool = False
+    gpu_service_started_at_monotonic_s: float | None = None
+    gpu_service_completed_requests: int = 0
     # Shadow-only last-request cache evidence. These fields are never ranking
     # inputs; exact-presence bits prevent a combined-cache fallback from being
     # misreported as a local-HBM observation.
@@ -58,6 +60,12 @@ class MORIProgramFactors:
     def __post_init__(self) -> None:
         if not isinstance(self.tier, MORITier):
             raise ValueError("MORI tier must be a MORITier")
+        if (
+            isinstance(self.gpu_service_completed_requests, bool)
+            or not isinstance(self.gpu_service_completed_requests, int)
+            or self.gpu_service_completed_requests < 0
+        ):
+            raise ValueError("MORI GPU service completion count must be a non-negative integer")
         if self.pending_tier is not None and not isinstance(self.pending_tier, MORITier):
             raise ValueError("MORI pending_tier must be a MORITier when supplied")
         cache_counts = (self.last_hbm_cached_prefix_tokens, self.last_hbm_hit_ref_zero_tokens)
@@ -75,6 +83,7 @@ class MORIProgramFactors:
             self.acting_started_at_monotonic_s,
             self.reasoning_started_at_monotonic_s,
             self.reasoning_wait_started_at_monotonic_s,
+            self.gpu_service_started_at_monotonic_s,
         )
         if any(value is not None and (not math.isfinite(value) or value < 0) for value in timestamps):
             raise ValueError("MORI timestamps must be finite and non-negative")
