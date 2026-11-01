@@ -93,6 +93,28 @@ def test_gpu_service_request_budget_requires_non_negative_integer(value):
         build_mori_controller(backend(), {"mori": {"gpu_service_requests": value}})
 
 
+def test_history_gated_service_defaults_off_and_is_explicit():
+    assert build_mori_controller(backend(), {}).strategy.config.history_gated_gpu_service is False
+    controller = build_mori_controller(
+        backend(), {"mori": {"gpu_service_requests": 4, "history_gated_gpu_service": True}}
+    )
+    assert controller.strategy.config.history_gated_gpu_service is True
+
+
+@pytest.mark.parametrize("value", [0, 1, "true", None])
+def test_history_gated_service_requires_exact_boolean(value):
+    with pytest.raises(ValueError, match="history_gated_gpu_service must be a boolean"):
+        MORIConfig(gpu_service_requests=4, history_gated_gpu_service=value)
+    with pytest.raises(ValueError, match="history_gated_gpu_service must be a boolean"):
+        build_mori_controller(backend(), {"mori": {"gpu_service_requests": 4, "history_gated_gpu_service": value}})
+
+
+@pytest.mark.parametrize("kwargs", [{}, {"gpu_service_requests": 4, "mode": MORIMode.PLACEMENT_ONLY}])
+def test_history_gated_service_requires_full_mode_and_service_budget(kwargs):
+    with pytest.raises(ValueError, match="requires full mode and a positive service budget"):
+        MORIConfig(history_gated_gpu_service=True, **kwargs)
+
+
 @pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf"), True])
 def test_invalid_ready_wait_limit_is_rejected(value) -> None:
     with pytest.raises(ValueError):

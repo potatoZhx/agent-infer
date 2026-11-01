@@ -161,3 +161,78 @@ def test_new_gpu_resume_resets_the_previous_service_window():
     factor = c.initial_factors.for_program(p.ref)
     assert factor.gpu_service_started_at_monotonic_s is None
     assert factor.gpu_service_completed_requests == 0
+
+
+@pytest.mark.parametrize(
+    "gaps,expected",
+    [((), False), ((0.2,), True), ((1.0,), True), ((1.01,), False), ((0.1, 2.1), False), ((0.5, 1.4), True)],
+)
+def test_history_gate_uses_only_completed_observed_tool_gaps(gaps, expected):
+    c = build_mori_strategy(MORIConfig(gpu_service_requests=4, history_gated_gpu_service=True))
+    p = view("gpu", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=400)
+    protect(c, p, acting_start=99.5)
+    f = c.initial_factors.for_program(p.ref)
+    c.strategy._set_factor(c.initial_factors, p.ref, replace(f, cycles=tuple((3.0, gap) for gap in gaps)))
+    assert c.strategy._gpu_service_protected(p, c.initial_factors, 100) is expected
+    assert c.strategy.counters["gpu_service_history_eligible_checks"] == int(expected)
+    assert c.strategy.counters["gpu_service_history_rejected_checks"] == int(not expected)
+    assert not c.strategy._gpu_service_protected(p, c.initial_factors, 100.5)
+
+
+@pytest.mark.parametrize("completed,now", [(4, 100), (1, 125)])
+def test_good_history_cannot_extend_request_or_wall_clock_budget(completed, now):
+    c = build_mori_strategy(MORIConfig(gpu_service_requests=4, history_gated_gpu_service=True))
+    p = view("gpu", state=ProgramState.ACTIVE, status=ProgramStatus.REASONING, tokens=400)
+    protect(c, p, completed=completed)
+    f = c.initial_factors.for_program(p.ref)
+    c.strategy._set_factor(c.initial_factors, p.ref, replace(f, cycles=((2.0, 0.1),)))
+    assert not c.strategy._gpu_service_protected(p, c.initial_factors, now)
+
+
+def test_history_gate_changes_exchange_without_claiming_service_or_capacity():
+    c = build_mori_strategy(MORIConfig(gpu_service_requests=4, history_gated_gpu_service=True))
+    p = view("gpu", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=700)
+    waiter = view("waiter", state=ProgramState.PAUSED, status=ProgramStatus.REASONING, tokens=500, step_count=1)
+    protect(c, p, acting_start=99.5)
+    f = c.initial_factors.for_program(p.ref)
+    c.strategy._set_factor(c.initial_factors, p.ref, replace(f, cycles=((1.0, 0.1),)))
+    calls = []
+    controller = accepting_controller(c.strategy, c.initial_factors, calls)
+    fixed = snapshot(p, waiter)
+    c.strategy.schedule_resume(fixed, c.initial_factors, controller)
+    assert calls == []
+    # A later observed slow tool cycle removes the speculative retention.
+    # The exact same full capacity claim and real transitions remain required.
+    f = c.initial_factors.for_program(p.ref)
+    c.strategy._set_factor(c.initial_factors, p.ref, replace(f, cycles=((1.0, 0.1), (1.0, 3.0))))
+    c.strategy.schedule_resume(fixed, c.initial_factors, controller)
+    assert [x.kind for x in calls][:2] == [TransitionKind.PAUSE, TransitionKind.RESUME]
+    assert c.strategy.counters["gpu_service_completed_requests"] == 0
+
+
+def test_history_gate_learns_only_after_a_tool_actually_returns():
+    c = build_mori_strategy(MORIConfig(gpu_service_requests=4, history_gated_gpu_service=True))
+    capacity = backend(1008)
+    runtime = ProgramScheduler(c.strategy, c.initial_factors, capacity, schedule_interval_seconds=5)
+    with patch("agentinfer.scheduling.runtime.time.monotonic", return_value=100.0) as clock:
+        assert runtime.on_request_arrival("one", AgentIdentity("owner"), 300, capacity, "one")
+        ref = runtime.program_ref_for_request("one")
+        runtime.on_native_execution("one", running=True)
+        clock.return_value = 100.2
+        runtime.on_request_completion("one", 310)
+        f = c.initial_factors.for_program(ref)
+        assert f.cycles == ()
+        clock.return_value = 100.4
+        assert runtime.on_request_arrival("two", AgentIdentity("owner"), 320, capacity, "two")
+        f = c.initial_factors.for_program(ref)
+        assert len(f.cycles) == 1
+        assert f.cycles[0][1] == pytest.approx(0.2)
+        runtime.on_native_execution("two", running=True)
+        clock.return_value = 100.6
+        runtime.on_request_completion("two", 330)
+        assert runtime.on_response_completion("owner", ProgramLifecycle.TERMINAL)
+        clock.return_value = 101.0
+        assert runtime.on_request_arrival("new", AgentIdentity("owner"), 300, capacity, "new")
+        new_ref = runtime.program_ref_for_request("new")
+        assert new_ref != ref
+        assert c.initial_factors.for_program(new_ref).cycles == ()

@@ -25,6 +25,7 @@ class MORIConfig:
     enable_wait_credit: bool = True
     ready_wait_limit_seconds: float = 0.0
     gpu_service_requests: int = 0
+    history_gated_gpu_service: bool = False
     decode_batch_tokens: int = 0
     audit_writeback_sources: bool = False
     repair_writeback_endpoints: bool = False
@@ -58,6 +59,10 @@ class MORIConfig:
             or self.gpu_service_requests < 0
         ):
             raise ValueError("MORI gpu_service_requests must be a non-negative integer")
+        if not isinstance(self.history_gated_gpu_service, bool):
+            raise ValueError("MORI history_gated_gpu_service must be a boolean")
+        if self.history_gated_gpu_service and (self.gpu_service_requests <= 0 or self.mode is not MORIMode.FULL):
+            raise ValueError("MORI history_gated_gpu_service requires full mode and a positive service budget")
         if (
             isinstance(self.decode_batch_tokens, bool)
             or not isinstance(self.decode_batch_tokens, int)

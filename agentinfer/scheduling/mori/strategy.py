@@ -911,6 +911,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                     ("enable_wait_credit", self.config.enable_wait_credit),
                     ("ready_wait_limit_seconds", self.config.ready_wait_limit_seconds),
                     ("gpu_service_requests", self.config.gpu_service_requests),
+                    ("history_gated_gpu_service", self.config.history_gated_gpu_service),
                     ("decode_batch_tokens", self.config.decode_batch_tokens),
                     ("batch_policy_cpu_seconds", self.batch_policy_cpu_seconds),
                     ("audit_writeback_sources", self.config.audit_writeback_sources),
@@ -985,6 +986,8 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                             "gpu_service_started",
                             "gpu_service_completed_requests",
                             "gpu_service_protection_checks",
+                            "gpu_service_history_eligible_checks",
+                            "gpu_service_history_rejected_checks",
                             "decode_batch_capped_iterations",
                             "decode_batch_reordered_iterations",
                             "decode_batch_assigned_tokens",
@@ -1419,6 +1422,19 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             or sidecar.gpu_service_completed_requests >= self.config.gpu_service_requests
         ):
             return False
+        if self.config.history_gated_gpu_service:
+            # Completed cycles contain only past, actually observed tool gaps.
+            # Unknown or slow-return owners receive no speculative retention.
+            # This is a reuse hint, never a tool completion clock or a promise
+            # of service: all existing native-progress and expiry gates remain.
+            eligible = bool(sidecar.cycles) and sum(acting for _, acting in sidecar.cycles) <= (
+                len(sidecar.cycles) * _GPU_SERVICE_ACTING_GRACE_SECONDS
+            )
+            self.counters[
+                "gpu_service_history_eligible_checks" if eligible else "gpu_service_history_rejected_checks"
+            ] += 1
+            if not eligible:
+                return False
         deadline = started + _GPU_SERVICE_MAX_SECONDS
         if program.status is ProgramStatus.ACTING:
             if sidecar.acting_started_at_monotonic_s is None:
