@@ -12,6 +12,7 @@ from typing import Any
 from agentinfer.agentcache.mori.hbm_policy import MORIHBMPolicy
 from agentinfer.agentcache.mori.runtime_state import MORI_RUNTIME_STATE
 from agentinfer.agentcache.mori.simple_cpu_policy import MORISimpleCPUOffloadPolicy
+from agentinfer.agentcache.mori.writeback_audit import WritebackSourceAudit
 from agentinfer.scheduling.mori import MORIMode, MORIStrategy
 
 
@@ -36,12 +37,21 @@ class VllmMORIAdapter:
     strategy: MORIStrategy
     cpu_unregister: Callable[[], None] | None = None
     closed: bool = False
+    writeback_audit: WritebackSourceAudit | None = None
 
     def close(self) -> None:
         """Unregister native hooks and process-local indexes idempotently."""
         if self.closed:
             return
         self.closed = True
+        try:
+            if self.writeback_audit is not None:
+                self.writeback_audit.close()
+        finally:
+            self._close_native()
+
+    def _close_native(self) -> None:
+        """Release native handles even if diagnostic restoration fails."""
         kv_cache_manager = getattr(self.owner, "kv_cache_manager", None)
         try:
             if self.hbm_policy is not None:
@@ -191,13 +201,20 @@ def install_vllm_mori(owner: object, strategy: MORIStrategy) -> VllmMORIAdapter:
         raise RuntimeError(
             f"unsupported vLLM MORI HBM hook API version: {version!r}; expected {MORIHBMPolicy.HOOK_API_VERSION}"
         )
-    return VllmMORIAdapter(
+    adapter = VllmMORIAdapter(
         hbm_policy=hbm_policy,
         cpu_policy=cpu_policy,
         owner=owner,
         strategy=strategy,
         cpu_unregister=cpu_unregister,
     )
+    if strategy.config.audit_writeback_sources:
+        try:
+            adapter.writeback_audit = WritebackSourceAudit(scheduler, strategy)
+        except BaseException:
+            adapter.close()
+            raise
+    return adapter
 
 
 def _offload_scheduler(owner: object) -> object | None:

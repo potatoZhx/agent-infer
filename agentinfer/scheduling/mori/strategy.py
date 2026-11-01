@@ -65,6 +65,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         self.counters: Counter[str] = Counter()
         self.decision_cpu_seconds = 0.0
         self.batch_policy_cpu_seconds = 0.0
+        self.writeback_audit_cpu_seconds = 0.0
         self.repair_ledger_cpu_seconds = 0.0
         self.replacement_planner_cpu_seconds = 0.0
         self.replacement_telemetry_cpu_seconds = 0.0
@@ -911,6 +912,8 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                     ("gpu_service_requests", self.config.gpu_service_requests),
                     ("decode_batch_tokens", self.config.decode_batch_tokens),
                     ("batch_policy_cpu_seconds", self.batch_policy_cpu_seconds),
+                    ("audit_writeback_sources", self.config.audit_writeback_sources),
+                    ("writeback_audit_cpu_seconds", self.writeback_audit_cpu_seconds),
                     ("decode_buffer_tokens", self.config.decode_buffer_tokens),
                     ("gpu_programs", tiers[MORITier.GPU.value]),
                     ("cpu_programs", tiers[MORITier.CPU.value]),
@@ -983,6 +986,18 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                             "decode_batch_native_ceiling_tokens",
                             "decode_batch_max_assigned_tokens",
                             "decode_batch_native_errors",
+                            "writeback_audit_snapshot_intents",
+                            "writeback_audit_candidates",
+                            "writeback_audit_missing_before",
+                            "writeback_audit_matched_intents",
+                            "writeback_audit_matched_missing",
+                            "writeback_audit_sources_lost",
+                            "writeback_audit_lost_with_capacity",
+                            "writeback_audit_zero_capacity_intents",
+                            "writeback_audit_cancelled_intents",
+                            "writeback_audit_unmatched_intents",
+                            "writeback_audit_submitted_blocks",
+                            "writeback_audit_native_errors",
                             "replacement_plans_considered",
                             "replacement_plans_changed",
                             "replacement_plans_legacy_fallback",

@@ -297,6 +297,9 @@ class _VllmAdmissionHooks:
         visited before prefills within this call; native queue mutations survive
         restoring the remaining requests' original relative order afterwards.
         """
+        audit = getattr(getattr(self, "_mori_adapter", None), "writeback_audit", None)
+        if audit is not None:
+            audit.snapshot_before_allocation()
         strategy = getattr(self.controller, "strategy", None)
         if not isinstance(strategy, MORIStrategy) or strategy.config.decode_batch_tokens <= 0:
             return native_schedule(*args, **kwargs)

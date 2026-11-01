@@ -87,6 +87,7 @@ _CONFIGURABLE_MORI_SETTINGS = frozenset(
         "ready_wait_limit_seconds",
         "gpu_service_requests",
         "decode_batch_tokens",
+        "audit_writeback_sources",
         "slow_request_threshold_seconds",
         "slow_request_repeat_seconds",
     }
@@ -130,6 +131,7 @@ def build_mori_controller(
         ready_wait_limit_seconds=_float_setting(raw, "ready_wait_limit_seconds", 0.0, scope="mori"),
         gpu_service_requests=_int_setting(raw, "gpu_service_requests", 0, scope="mori"),
         decode_batch_tokens=_int_setting(raw, "decode_batch_tokens", 0, scope="mori"),
+        audit_writeback_sources=_bool_setting(raw, "audit_writeback_sources", False, scope="mori"),
         slow_request_threshold_seconds=_float_setting(raw, "slow_request_threshold_seconds", 30.0, scope="mori"),
         slow_request_repeat_seconds=_float_setting(raw, "slow_request_repeat_seconds", 60.0, scope="mori"),
     )

@@ -26,6 +26,7 @@ class MORIConfig:
     ready_wait_limit_seconds: float = 0.0
     gpu_service_requests: int = 0
     decode_batch_tokens: int = 0
+    audit_writeback_sources: bool = False
     decode_buffer_tokens: int = 100
     slow_request_threshold_seconds: float = 30.0
     slow_request_repeat_seconds: float = 60.0
@@ -37,6 +38,10 @@ class MORIConfig:
             raise ValueError("MORI mode must be a MORIMode")
         if not isinstance(self.enable_wait_credit, bool):
             raise ValueError("MORI enable_wait_credit must be a boolean")
+        if not isinstance(self.audit_writeback_sources, bool):
+            raise ValueError("MORI audit_writeback_sources must be a boolean")
+        if self.audit_writeback_sources and self.mode is not MORIMode.FULL:
+            raise ValueError("MORI audit_writeback_sources requires full mode")
         if (
             isinstance(self.gpu_service_requests, bool)
             or not isinstance(self.gpu_service_requests, int)
