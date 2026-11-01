@@ -155,3 +155,62 @@ def test_real_runtime_drains_at_completion_and_preserves_wait_clock():
         runtime.schedule_cycle(capacity)
         assert [entry.request_id for entry, _ in runtime.consume_admitted_requests()] == ["old"]
         assert runtime.registry.require(old).wait_started_at_monotonic_s is None
+
+
+def test_exception_before_transition_commit_clears_speculation_and_allows_retry():
+    c, resident, oldest, younger, calls, controller = setup_case()
+    fixed = snapshot(resident, oldest, younger)
+
+    def fail(request):
+        raise RuntimeError("before commit")
+
+    with pytest.raises(RuntimeError, match="before commit"):
+        c.strategy.repair_capacity(fixed, c.initial_factors, TransitionController(fail))
+    assert c.initial_factors.for_program(resident.ref).pending_tier is None
+    gpu, cpu = c.strategy._ledgers(fixed, c.initial_factors)
+    assert gpu.used == 800 and cpu.used == 100
+    c.strategy.repair_capacity(fixed, c.initial_factors, controller)
+    assert calls[-1].kind is TransitionKind.MARK_FOR_PAUSE
+    controller.pause(resident.ref, reason="marked_pause_completion")
+    c.strategy.schedule_resume(
+        snapshot(replace(resident, state=ProgramState.PAUSED, status=ProgramStatus.ACTING), oldest),
+        c.initial_factors,
+        controller,
+    )
+    assert any(call.kind is TransitionKind.RESUME and call.program == oldest.ref for call in calls)
+
+
+def test_exception_after_committed_acting_pause_preserves_the_real_cpu_tier():
+    c, resident, oldest, younger, calls, controller = setup_case()
+    resident = replace(resident, status=ProgramStatus.ACTING)
+
+    def apply_then_fail(request):
+        controller.apply(request)
+        raise RuntimeError("after commit")
+
+    with pytest.raises(RuntimeError, match="after commit"):
+        c.strategy.repair_capacity(snapshot(resident, oldest), c.initial_factors, TransitionController(apply_then_fail))
+    factor = c.initial_factors.for_program(resident.ref)
+    assert factor.tier is MORITier.CPU and factor.pending_tier is None
+    fresh = snapshot(replace(resident, state=ProgramState.PAUSED), oldest)
+    c.strategy.schedule_resume(fresh, c.initial_factors, controller)
+    assert any(call.kind is TransitionKind.RESUME and call.program == oldest.ref for call in calls)
+
+
+def test_later_failed_victim_does_not_undo_an_earlier_committed_mark():
+    c, resident, oldest, younger, calls, controller = setup_case()
+    resident = replace(resident, tokens=replace(resident.tokens, estimated_context_tokens=400))
+    peer = replace(resident, ref=younger.ref)
+    oldest = replace(oldest, tokens=replace(oldest.tokens, estimated_context_tokens=600))
+    set_tier(c, peer, MORITier.GPU)
+    fixed = snapshot(resident, peer, oldest)
+
+    def fail_second(request):
+        if request.program == peer.ref:
+            raise RuntimeError("second victim")
+        return controller.apply(request)
+
+    with pytest.raises(RuntimeError, match="second victim"):
+        c.strategy.repair_capacity(fixed, c.initial_factors, TransitionController(fail_second))
+    assert c.initial_factors.for_program(resident.ref).pending_tier is MORITier.CPU
+    assert c.initial_factors.for_program(peer.ref).pending_tier is None

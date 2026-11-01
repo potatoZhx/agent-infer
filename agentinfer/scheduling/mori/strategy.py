@@ -956,6 +956,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                             "ready_reservation_marks",
                             "ready_reservation_pauses",
                             "ready_reservation_blocked_cycles",
+                            "ready_reservation_transition_exceptions",
                             "replacement_plans_considered",
                             "replacement_plans_changed",
                             "replacement_plans_legacy_fallback",
@@ -1397,7 +1398,22 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         ]
         victims.sort(key=lambda program: self._demotion_key(program, factors, snapshot.observed_at_monotonic_s))
         for victim in victims:
-            if self._demote(victim, snapshot, factors, transitions, gpu, cpu, reason="mori_ready_reservation"):
+            previous = self._factor(factors, victim.ref)
+            try:
+                applied = self._demote(
+                    victim, snapshot, factors, transitions, gpu, cpu, reason="mori_ready_reservation"
+                )
+            except Exception:
+                current = self._factor(factors, victim.ref)
+                # A committed pause already changed tier through its event and
+                # must remain real. A speculative destination on the old tier
+                # is not a release or a CPU backup. A committed lazy mark, if
+                # any, still drains naturally to WAITING at completion.
+                if current.tier is previous.tier and current.pending_tier is not None:
+                    self._set_factor(factors, victim.ref, replace(current, pending_tier=previous.pending_tier))
+                self.counters["ready_reservation_transition_exceptions"] += 1
+                raise
+            if applied:
                 projected.remove(victim.ref)
                 counter = (
                     "ready_reservation_pauses" if victim.status is ProgramStatus.ACTING else "ready_reservation_marks"
