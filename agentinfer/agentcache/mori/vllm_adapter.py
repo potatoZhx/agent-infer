@@ -13,6 +13,7 @@ from agentinfer.agentcache.mori.hbm_policy import MORIHBMPolicy
 from agentinfer.agentcache.mori.runtime_state import MORI_RUNTIME_STATE
 from agentinfer.agentcache.mori.simple_cpu_policy import MORISimpleCPUOffloadPolicy
 from agentinfer.agentcache.mori.writeback_audit import WritebackSourceAudit
+from agentinfer.agentcache.mori.writeback_capture import FullPrefixWritebackCapture
 from agentinfer.scheduling.mori import MORIMode, MORIStrategy
 
 
@@ -38,6 +39,7 @@ class VllmMORIAdapter:
     cpu_unregister: Callable[[], None] | None = None
     closed: bool = False
     writeback_audit: WritebackSourceAudit | None = None
+    writeback_capture: FullPrefixWritebackCapture | None = None
 
     def close(self) -> None:
         """Unregister native hooks and process-local indexes idempotently."""
@@ -48,7 +50,11 @@ class VllmMORIAdapter:
             if self.writeback_audit is not None:
                 self.writeback_audit.close()
         finally:
-            self._close_native()
+            try:
+                if self.writeback_capture is not None:
+                    self.writeback_capture.close()
+            finally:
+                self._close_native()
 
     def _close_native(self) -> None:
         """Release native handles even if diagnostic restoration fails."""
@@ -208,9 +214,14 @@ def install_vllm_mori(owner: object, strategy: MORIStrategy) -> VllmMORIAdapter:
         strategy=strategy,
         cpu_unregister=cpu_unregister,
     )
-    if strategy.config.audit_writeback_sources:
+    if strategy.config.audit_writeback_sources or strategy.config.repair_writeback_endpoints:
         try:
-            adapter.writeback_audit = WritebackSourceAudit(scheduler, strategy)
+            if strategy.config.repair_writeback_endpoints:
+                adapter.writeback_capture = FullPrefixWritebackCapture(scheduler, strategy)
+            if strategy.config.audit_writeback_sources:
+                adapter.writeback_audit = WritebackSourceAudit(
+                    scheduler, strategy, track_completions=strategy.config.repair_writeback_endpoints
+                )
         except BaseException:
             adapter.close()
             raise

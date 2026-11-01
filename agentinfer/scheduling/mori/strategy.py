@@ -66,6 +66,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         self.decision_cpu_seconds = 0.0
         self.batch_policy_cpu_seconds = 0.0
         self.writeback_audit_cpu_seconds = 0.0
+        self.writeback_capture_cpu_seconds = 0.0
         self.repair_ledger_cpu_seconds = 0.0
         self.replacement_planner_cpu_seconds = 0.0
         self.replacement_telemetry_cpu_seconds = 0.0
@@ -914,6 +915,8 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                     ("batch_policy_cpu_seconds", self.batch_policy_cpu_seconds),
                     ("audit_writeback_sources", self.config.audit_writeback_sources),
                     ("writeback_audit_cpu_seconds", self.writeback_audit_cpu_seconds),
+                    ("repair_writeback_endpoints", self.config.repair_writeback_endpoints),
+                    ("writeback_capture_cpu_seconds", self.writeback_capture_cpu_seconds),
                     ("decode_buffer_tokens", self.config.decode_buffer_tokens),
                     ("gpu_programs", tiers[MORITier.GPU.value]),
                     ("cpu_programs", tiers[MORITier.CPU.value]),
@@ -998,6 +1001,13 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                             "writeback_audit_unmatched_intents",
                             "writeback_audit_submitted_blocks",
                             "writeback_audit_native_errors",
+                            "writeback_audit_completed_blocks",
+                            "writeback_audit_completed_noninitial_blocks",
+                            "writeback_audit_abandoned_blocks",
+                            "writeback_audit_invalid_completions",
+                            "writeback_capture_requests",
+                            "writeback_capture_blocks",
+                            "writeback_capture_noninitial_blocks",
                             "replacement_plans_considered",
                             "replacement_plans_changed",
                             "replacement_plans_legacy_fallback",
