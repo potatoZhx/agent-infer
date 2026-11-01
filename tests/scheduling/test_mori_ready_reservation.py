@@ -214,3 +214,33 @@ def test_later_failed_victim_does_not_undo_an_earlier_committed_mark():
         c.strategy.repair_capacity(fixed, c.initial_factors, TransitionController(fail_second))
     assert c.initial_factors.for_program(resident.ref).pending_tier is MORITier.CPU
     assert c.initial_factors.for_program(peer.ref).pending_tier is None
+
+
+def test_real_runtime_committed_mark_survives_exception_and_drains_on_completion():
+    c = build_mori_strategy(MORIConfig(ready_wait_limit_seconds=30, enable_wait_credit=False))
+    capacity = backend(1008)
+    runtime = ProgramScheduler(c.strategy, c.initial_factors, capacity, schedule_interval_seconds=5)
+    with patch("agentinfer.scheduling.runtime.time.monotonic", return_value=0.0) as clock:
+        assert runtime.on_request_arrival("resident", AgentIdentity("resident"), 700, capacity, "resident")
+        runtime.schedule_cycle(capacity)
+        clock.return_value = 1
+        assert not runtime.on_request_arrival("old", AgentIdentity("old"), 500, capacity, "old")
+        resident = runtime.program_ref_for_request("resident")
+        original = runtime._apply_transition
+
+        def mark_then_fail(request):
+            result = original(request)
+            if request.kind is TransitionKind.MARK_FOR_PAUSE:
+                raise RuntimeError("after real mark")
+            return result
+
+        clock.return_value = 31
+        with patch.object(runtime, "_apply_transition", side_effect=mark_then_fail):
+            with pytest.raises(RuntimeError, match="after real mark"):
+                runtime.schedule_cycle(capacity)
+        assert runtime.registry.require(resident).marked_for_pause
+        assert c.initial_factors.for_program(resident).pending_tier is None
+        clock.return_value = 32
+        runtime.on_request_completion("resident", 710)
+        runtime.schedule_cycle(capacity)
+        assert [entry.request_id for entry, _ in runtime.consume_admitted_requests()] == ["old"]

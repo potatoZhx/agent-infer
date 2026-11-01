@@ -148,3 +148,16 @@ def test_zero_output_completion_is_not_counted_as_useful_service():
         runtime.on_request_completion("zero", 300)
         assert c.initial_factors.for_program(ref).gpu_service_completed_requests == 0
         assert c.strategy.counters["gpu_service_completed_requests"] == 0
+
+
+def test_new_gpu_resume_resets_the_previous_service_window():
+    c = components()
+    p = view("gpu", state=ProgramState.ACTIVE, status=ProgramStatus.ACTING, tokens=300)
+    protect(c, p, completed=3, acting_start=99.5)
+    calls = []
+    controller = accepting_controller(c.strategy, c.initial_factors, calls)
+    controller.pause(p.ref, reason="test pause")
+    controller.resume(p.ref, reason="test resume", backend_id="backend")
+    factor = c.initial_factors.for_program(p.ref)
+    assert factor.gpu_service_started_at_monotonic_s is None
+    assert factor.gpu_service_completed_requests == 0
