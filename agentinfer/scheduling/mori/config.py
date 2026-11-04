@@ -25,6 +25,7 @@ class MORIConfig:
     ready_wait_limit_seconds: float = 0.0
     gpu_service_requests: int = 0
     history_gated_gpu_service: bool = False
+    reasoning_preempt_acting: bool = False
     decode_batch_tokens: int = 0
     audit_writeback_sources: bool = False
     repair_writeback_endpoints: bool = False
@@ -54,6 +55,8 @@ class MORIConfig:
             raise ValueError("MORI gpu_service_requests must be a non-negative integer")
         if not isinstance(self.history_gated_gpu_service, bool):
             raise ValueError("MORI history_gated_gpu_service must be a boolean")
+        if not isinstance(self.reasoning_preempt_acting, bool):
+            raise ValueError("MORI reasoning_preempt_acting must be a boolean")
         if self.history_gated_gpu_service and self.gpu_service_requests <= 0:
             raise ValueError("MORI history_gated_gpu_service requires full mode and a positive service budget")
         if (

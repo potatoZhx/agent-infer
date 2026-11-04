@@ -415,10 +415,30 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                         "exchange_valid": exchange_valid,
                     }
                 planner_started = time.thread_time()
+                eligibility_mode = "relative"
                 legacy = self._legacy_victim_plan(candidate_ledger, eligible, quota)
                 if legacy is None and not has_reasoning:
                     eligible = acting
                     reason = "mori_idle_gpu_progress"
+                    eligibility_mode = "idle_gpu_progress"
+                    legacy = self._legacy_victim_plan(candidate_ledger, eligible, quota)
+                elif legacy is None and self.config.reasoning_preempt_acting:
+                    # Relaxation: a waiting Reasoning candidate may preempt
+                    # ACTIVE+ACTING owners beyond the relative-idleness rule.
+                    # The victim order prefers the cheapest recomputation per
+                    # freed token, so the wider net stays economical.
+                    eligible = sorted(
+                        acting,
+                        key=lambda victim: (
+                            self._recompute_ratio(victim, gpu),
+                            -victim_idleness[victim.ref],
+                            victim.ref.program_id,
+                            victim.ref.generation,
+                        ),
+                    )
+                    reason = "mori_reasoning_preempt"
+                    eligibility_mode = "reasoning_preempt"
+                    self.counters["reasoning_preempt_fallbacks"] += 1
                     legacy = self._legacy_victim_plan(candidate_ledger, eligible, quota)
                 if legacy is None:
                     planner_elapsed = time.thread_time() - planner_started
@@ -430,7 +450,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                         decision["replacement_plan"] = {
                             "candidate_ref": self._ref_text(candidate.ref),
                             "candidate_rank": rank,
-                            "eligibility_mode": "relative" if has_reasoning else "idle_gpu_progress",
+                            "eligibility_mode": eligibility_mode,
                             "eligible_refs": [self._ref_text(victim.ref) for victim in eligible],
                             "eligible_count": len(eligible),
                             "candidate_added_used_tokens": candidate_ledger.used,
@@ -459,9 +479,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                 exchange_victims.extend(chosen.victims)
                 if capture_plan_details:
                     plan_details["planner_cpu_seconds"] = planner_elapsed
-                    plan_details["eligibility_mode"] = (
-                        "idle_gpu_progress" if reason == "mori_idle_gpu_progress" else "relative"
-                    )
+                    plan_details["eligibility_mode"] = eligibility_mode
                     plan_details["has_gpu_reasoning"] = has_reasoning
                     plan_details["candidate_ref"] = self._ref_text(candidate.ref)
                     plan_details["candidate_rank"] = rank
@@ -484,6 +502,8 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                     self.counters["rebalance_demotions"] += 1
                     if reason == "mori_idle_gpu_progress":
                         self.counters["idle_gpu_progress_demotions"] += 1
+                    elif reason == "mori_reasoning_preempt":
+                        self.counters["reasoning_preempt_demotions"] += 1
                 if gpu.used + gpu.incremental(claim) > quota:
                     if decision is not None:
                         decision["reason"] = "demotion_rejected"
@@ -1562,6 +1582,20 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         """Measure only the current pending request's wait, excluding idle time."""
         started = program.wait_started_at_monotonic_s
         return max(0.0, now - started) if started is not None else 0.0
+
+    def _recompute_ratio(self, program: ProgramView, gpu: CapacityLedger) -> float:
+        """Approximate recomputation waste per freed token when evicting this owner.
+
+        A victim with a large cached context freed against a small claim costs
+        a full re-prefill for little capacity relief; evicting it last keeps
+        the relaxed preemption net economical.
+        """
+        claim = gpu.claims.get(program.ref)
+        freed = claim.tokens if claim is not None else 0
+        cost = max(0, program.tokens.estimated_context_tokens)
+        if freed <= 0:
+            return float("inf")
+        return cost / freed
 
     def _demotion_key(
         self,
