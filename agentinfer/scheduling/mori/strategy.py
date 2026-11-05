@@ -1677,27 +1677,38 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         gpu: CapacityLedger,
         now: float,
     ) -> None:
-        """Order victims for prefix eviction, by recompute cost when calibrated.
+        """Order victims for prefix eviction; calibrated cost only breaks ties.
 
-        Falls back to the legacy demotion key until the utility calibration has
-        enough samples, keeping cold-start behavior identical to the baseline.
+        The legacy demotion order (ACTING first, idleness descending) stays
+        primary: iteration-1 measurements showed that replacing it with a pure
+        recompute-ratio order causes many small evictions and a net regression.
+        Once calibrated, the per-token recompute ratio prefers cheaper owners
+        among victims of near-equal idleness (0.05 bands).
         """
         if self.config.utility_victim_order and (
             self._utility.samples >= self.config.utility_min_samples and self._utility.ready
         ):
             self.counters["utility_victim_order_cycles"] += 1
-            victims.sort(
-                key=lambda p: self._utility.utility_victim_key(
+            band = 0.05
+
+            def banded_key(p: ProgramView) -> tuple[int, int, float, str, int]:
+                cost = self._utility.victim_cost_seconds(
                     p.tokens.estimated_context_tokens,
-                    gpu.reclaimable(p.ref) if p.ref in gpu.claims else 0,
-                    self._idleness(self._factor(factors, p.ref), now),
                     p.status is ProgramStatus.ACTING,
-                    p.ref,
                     jitter_seconds=self.config.utility_jitter_seconds,
                     min_prefill_tokens_per_second=self.config.utility_prefill_min_tokens_per_second,
                     max_prefill_tokens_per_second=self.config.utility_prefill_max_tokens_per_second,
                 )
-            )
+                relief = gpu.reclaimable(p.ref) if p.ref in gpu.claims else 0
+                return (
+                    0 if p.status is ProgramStatus.ACTING else 1,
+                    -int(self._idleness(self._factor(factors, p.ref), now) / band),
+                    cost / max(1, relief),
+                    p.ref.program_id,
+                    p.ref.generation,
+                )
+
+            victims.sort(key=banded_key)
         else:
             if self.config.utility_victim_order:
                 self.counters["utility_victim_order_warmup"] += 1
