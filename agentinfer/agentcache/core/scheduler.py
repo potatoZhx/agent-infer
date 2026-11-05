@@ -13,6 +13,7 @@ import logging
 import math
 import os
 import time
+from collections import deque
 from collections.abc import Callable, Iterable, Mapping
 from typing import Protocol, cast, get_args, get_type_hints
 
@@ -156,6 +157,11 @@ class _VllmAdmissionHooks:
         self._mori_context_handed_off: set[str] = set()
         self._context_handoff_at_lookup = False
         self._prefix_refresh_pending = False
+        # Adaptive decode-guard state: per-request last (tokens, monotonic time)
+        # and a bounded window of observed per-token decode intervals in ms.
+        self._mori_decode_last: dict[str, tuple[int, float]] = {}
+        self._mori_decode_intervals: deque[tuple[float, float]] = deque(maxlen=256)
+        self._mori_last_tpot_ratio: float = 1.0
         self.controller = (
             build_progress_ttl_controller(self.backend_pool_info(owner), settings)
             if settings.get("strategy", "progress_ttl") == "progress_ttl"
@@ -291,6 +297,31 @@ class _VllmAdmissionHooks:
             self._mori_context_handed_off.add(request_id)
         MORI_RUNTIME_STATE.bind_request(request_id, program)
 
+    def _observe_decode_interval(self, request_id: str, total_output_tokens: int) -> None:
+        """Track per-token decode intervals from streamed outputs (ms)."""
+        now = time.monotonic()
+        last = self._mori_decode_last.get(request_id)
+        if last is not None and total_output_tokens > last[0]:
+            delta = total_output_tokens - last[0]
+            elapsed_ms = max(0.0, (now - last[1]) * 1000.0)
+            self._mori_decode_intervals.append((now, elapsed_ms / max(1, delta)))
+        self._mori_decode_last[request_id] = (total_output_tokens, now)
+
+    def _mori_decode_tpot_ratio(self, strategy: MORIStrategy) -> float:
+        """Current decode interval vs its own recent baseline; 1.0 while cold."""
+        intervals = self._mori_decode_intervals
+        if len(intervals) < 32:
+            return 1.0
+        current_window = [value for _, value in list(intervals)[-16:]]
+        current = sum(current_window) / len(current_window)
+        ordered = sorted(value for _, value in intervals)
+        baseline = ordered[max(0, int(len(ordered) * 0.1))]
+        if baseline <= 1e-6:
+            return 1.0
+        ratio = min(8.0, max(0.25, current / baseline))
+        self._mori_last_tpot_ratio = ratio
+        return ratio
+
     def schedule_native(self, owner: Scheduler, native_schedule: Callable, *args, **kwargs):
         """Bound mixed iterations only while a native request is actually decoding.
 
@@ -303,7 +334,9 @@ class _VllmAdmissionHooks:
         if audit is not None:
             audit.snapshot_before_allocation()
         strategy = getattr(self.controller, "strategy", None)
-        if not isinstance(strategy, MORIStrategy) or strategy.config.decode_batch_tokens <= 0:
+        if not isinstance(strategy, MORIStrategy) or (
+            strategy.config.decode_batch_tokens <= 0 and strategy.config.decode_batch_mode != "adaptive"
+        ):
             return native_schedule(*args, **kwargs)
         started = time.thread_time()
         native_cpu = 0.0
@@ -321,8 +354,7 @@ class _VllmAdmissionHooks:
         finally:
             strategy.batch_policy_cpu_seconds += max(0.0, time.thread_time() - started - native_cpu)
 
-    @staticmethod
-    def _schedule_mori_batch(owner: Scheduler, strategy: MORIStrategy, native_schedule: Callable):
+    def _schedule_mori_batch(self, owner: Scheduler, strategy: MORIStrategy, native_schedule: Callable):
         """Apply one transient decode-first budget over the current native queue."""
         running = owner.running
         decoding = {
@@ -333,7 +365,23 @@ class _VllmAdmissionHooks:
         if not decoding:
             return native_schedule()
         original = owner.max_num_scheduled_tokens
-        budget = min(original, max(strategy.config.decode_batch_tokens, len(running)))
+        if strategy.config.decode_batch_mode == "adaptive":
+            # Clamp only when decode is measurably degraded while a large
+            # chunked prefill is queued behind it; otherwise run at the full
+            # native ceiling so prefills proceed unimpeded.
+            strategy.counters["decode_batch_adaptive_evaluations"] += 1
+            big_prefill_waiting = any(
+                request.num_computed_tokens < request.num_prompt_tokens
+                and request.num_prompt_tokens - request.num_computed_tokens > strategy.config.decode_batch_floor_tokens
+                for request in getattr(owner, "waiting", ())
+            )
+            tpot_ratio = self._mori_decode_tpot_ratio(strategy)
+            if not big_prefill_waiting or tpot_ratio <= strategy.config.decode_batch_tpot_guard_ratio:
+                return native_schedule()
+            strategy.counters["decode_batch_adaptive_clamped"] += 1
+            budget = min(original, max(strategy.config.decode_batch_floor_tokens, len(running)))
+        else:
+            budget = min(original, max(strategy.config.decode_batch_tokens, len(running)))
         if budget == original:
             return native_schedule()
         ordered = sorted(running, key=lambda request: id(request) not in decoding)
@@ -458,6 +506,7 @@ class _VllmAdmissionHooks:
                     else token_counts_before_update.get(request_id, (0, 0))[1] + len(output.new_token_ids)
                 )
                 self.controller.on_stream_output(request_id, total_output_tokens)
+                self._observe_decode_interval(request_id, total_output_tokens)
                 if output.finished:
                     total_tokens = (
                         request.num_tokens
@@ -467,6 +516,7 @@ class _VllmAdmissionHooks:
                     self.controller.on_request_completion(request_id, total_tokens)
                     self.tracked_native.discard(request_id)
                     self._local_prefix_observations.pop(request_id, None)
+                    self._mori_decode_last.pop(request_id, None)
                     self._mori_context_handed_off.discard(request_id)
                     MORI_RUNTIME_STATE.unbind_request(request_id)
                     completed_request = True

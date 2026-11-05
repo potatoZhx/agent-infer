@@ -88,6 +88,18 @@ _CONFIGURABLE_MORI_SETTINGS = frozenset(
         "gpu_service_requests",
         "history_gated_gpu_service",
         "reasoning_preempt_acting",
+        "drain_wait_threshold_seconds",
+        "drain_persist_cycles",
+        "drain_min_dwell_seconds",
+        "drain_max_victims_per_cycle",
+        "utility_victim_order",
+        "utility_min_samples",
+        "utility_jitter_seconds",
+        "utility_prefill_min_tokens_per_second",
+        "utility_prefill_max_tokens_per_second",
+        "decode_batch_mode",
+        "decode_batch_tpot_guard_ratio",
+        "decode_batch_floor_tokens",
         "decode_batch_tokens",
         "audit_writeback_sources",
         "repair_writeback_endpoints",
@@ -136,6 +148,24 @@ def build_mori_controller(
         gpu_service_requests=_int_setting(raw, "gpu_service_requests", 0, scope="mori"),
         history_gated_gpu_service=_bool_setting(raw, "history_gated_gpu_service", False, scope="mori"),
         reasoning_preempt_acting=_bool_setting(raw, "reasoning_preempt_acting", False, scope="mori"),
+        drain_wait_threshold_seconds=_float_setting(
+            raw, "drain_wait_threshold_seconds", 0.0, scope="mori"
+        ),
+        drain_persist_cycles=_int_setting(raw, "drain_persist_cycles", 3, scope="mori"),
+        drain_min_dwell_seconds=_float_setting(raw, "drain_min_dwell_seconds", 60.0, scope="mori"),
+        drain_max_victims_per_cycle=_int_setting(raw, "drain_max_victims_per_cycle", 2, scope="mori"),
+        utility_victim_order=_bool_setting(raw, "utility_victim_order", False, scope="mori"),
+        utility_min_samples=_int_setting(raw, "utility_min_samples", 20, scope="mori"),
+        utility_jitter_seconds=_float_setting(raw, "utility_jitter_seconds", 2.0, scope="mori"),
+        utility_prefill_min_tokens_per_second=_float_setting(
+            raw, "utility_prefill_min_tokens_per_second", 2000.0, scope="mori"
+        ),
+        utility_prefill_max_tokens_per_second=_float_setting(
+            raw, "utility_prefill_max_tokens_per_second", 50000.0, scope="mori"
+        ),
+        decode_batch_mode=_str_setting(raw, "decode_batch_mode", "static", scope="mori"),
+        decode_batch_tpot_guard_ratio=_float_setting(raw, "decode_batch_tpot_guard_ratio", 1.3, scope="mori"),
+        decode_batch_floor_tokens=_int_setting(raw, "decode_batch_floor_tokens", 512, scope="mori"),
         decode_batch_tokens=_int_setting(raw, "decode_batch_tokens", 0, scope="mori"),
         audit_writeback_sources=_bool_setting(raw, "audit_writeback_sources", False, scope="mori"),
         repair_writeback_endpoints=_bool_setting(raw, "repair_writeback_endpoints", False, scope="mori"),
@@ -372,6 +402,14 @@ def _bool_setting(
     value = settings.get(name, default)
     if not isinstance(value, bool):
         raise ValueError(f"{scope}.{name} must be a boolean")
+    return value
+
+
+def _str_setting(settings: JsonMapping, name: str, default: str, *, scope: str = "progress_ttl") -> str:
+    """Read one exact string policy value."""
+    value = settings.get(name, default)
+    if not isinstance(value, str):
+        raise ValueError(f"{scope}.{name} must be a string")
     return value
 
 

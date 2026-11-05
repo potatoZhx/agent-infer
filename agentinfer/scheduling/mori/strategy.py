@@ -26,6 +26,7 @@ from agentinfer.scheduling.mori.capacity import CapacityClaim, CapacityLedger, F
 from agentinfer.scheduling.mori.config import MORIConfig
 from agentinfer.scheduling.mori.diagnostics import MORIDiagnosticState
 from agentinfer.scheduling.mori.factors import MORIGlobalFactors, MORIProgramFactors, MORITier
+from agentinfer.scheduling.mori.utility import UtilityRuntimeState
 from agentinfer.scheduling.request_diagnostics import RequestDiagnostics
 from agentinfer.scheduling.snapshot import SchedulingSnapshot
 from agentinfer.scheduling.strategy import SchedulingCycleOrder, SchedulingStrategy
@@ -73,6 +74,12 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         self._factors: MORIFactors | None = None
         self._classes: dict[ProgramRef, CacheClass] = {}
         self._cache_class_epoch = 0
+        # Structural-drain state: persistence counter and armed-hold deadline for
+        # the aged-waiter rescue. Only mutated inside serialized scheduling hooks.
+        self._drain_persist: int = 0
+        self._drain_armed_until: float | None = None
+        # Self-calibrating recompute-cost state for utility victim ordering.
+        self._utility = UtilityRuntimeState()
         self._observers: list[ProgramCacheClassObserver] = []
         self._footprints: FootprintProvider | None = None
         self._emit_replacement_telemetry = False
@@ -353,13 +360,17 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             and self._factor(strategy_factors, p.ref).pending_tier is None
             and not self._gpu_service_protected(p, strategy_factors, now)
         ]
-        victims.sort(key=lambda p: self._demotion_key(p, strategy_factors, now))
+        if self.config.utility_victim_order:
+            self._sort_victims(victims, strategy_factors, gpu, now)
+        else:
+            victims.sort(key=lambda p: self._demotion_key(p, strategy_factors, now))
         victim_idleness = {
             victim.ref: self._idleness(self._factor(strategy_factors, victim.ref), now) for victim in victims
         }
         exchange_valid = True
         demoted: list[ProgramView] = []
         admitted_before = 0
+        stall_seen = False
         for rank, candidate in enumerate(candidates):
             self.counters["planning_candidates"] += 1
             exchange_victims: list[ProgramView] = []
@@ -444,6 +455,14 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                     planner_elapsed = time.thread_time() - planner_started
                     self.replacement_planner_cpu_seconds += planner_elapsed
                     self.counters["promotion_no_fit"] += 1
+                    if (
+                        self.config.drain_wait_threshold_seconds > 0
+                        and not acting
+                        and self._wait_seconds(candidate, now) >= self.config.drain_wait_threshold_seconds
+                    ):
+                        # Structural stall: the exchange net has no Acting victim at
+                        # all, so this waiter can never win a relative exchange.
+                        stall_seen = True
                     if decision is not None:
                         assert all_acting_required is not None
                         decision["reason"] = "idleness_limited" if all_acting_required <= quota else "no_all_acting_fit"
@@ -560,6 +579,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                 decision["transition_reason"] = result.reason if result is not None else "demotion_rejected"
             if reserved is not None and candidate.ref == reserved.ref and (result is None or not result.applied):
                 break
+        self._update_drain_state(stall_seen, now)
         return tuple(demoted)
 
     @staticmethod
@@ -1144,6 +1164,13 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         self.counters["cache_prefix_hit_tokens"] += prefix_hit_tokens
         self.counters["cache_hbm_hit_tokens"] += hbm_hit_tokens
         self.counters["cache_hbm_ref_zero_hit_tokens"] += hbm_ref_zero_hit_tokens
+        if self.config.utility_victim_order:
+            self._utility.observe_request_finished(
+                uncached_tokens=max(0, prompt_tokens - prefix_hit_tokens),
+                service_seconds=max(0.0, latency - scheduler_wait),
+                prompt_tokens=prompt_tokens,
+                prefix_hit_tokens=prefix_hit_tokens,
+            )
         reasoning_finished = event.current_status is ProgramStatus.ACTING
         reasoning = sidecar.pending_reasoning_seconds
         if reasoning_finished:
@@ -1463,9 +1490,43 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         self.counters["gpu_service_protection_checks"] += 1
         return True
 
+    def _update_drain_state(self, stall_seen: bool, now: float) -> None:
+        """Maintain the structural-drain arming state with persistence and hold.
+
+        A stall is only actionable after ``drain_persist_cycles`` consecutive
+        cycles and stays armed for ``drain_min_dwell_seconds`` even if the
+        condition briefly vanishes; re-arming after expiry needs a fresh
+        persistence streak.
+        """
+        if self.config.drain_wait_threshold_seconds <= 0:
+            return
+        if stall_seen:
+            self._drain_persist += 1
+            self.counters["drain_stall_cycles"] += 1
+            if (
+                self._drain_persist >= self.config.drain_persist_cycles
+                and (self._drain_armed_until is None or now >= self._drain_armed_until)
+            ):
+                self._drain_armed_until = now + self.config.drain_min_dwell_seconds
+                self.counters["drain_armed_transitions"] += 1
+        else:
+            self._drain_persist = 0
+
+    def _effective_ready_wait_limit(self, now: float) -> float:
+        """Static reservation limit, or the drain threshold while a stall is armed."""
+        if self.config.ready_wait_limit_seconds > 0:
+            return self.config.ready_wait_limit_seconds
+        if (
+            self.config.drain_wait_threshold_seconds > 0
+            and self._drain_armed_until is not None
+            and now < self._drain_armed_until
+        ):
+            return self.config.drain_wait_threshold_seconds
+        return 0.0
+
     def _aged_waiter(self, snapshot: SchedulingSnapshot) -> ProgramView | None:
         """Select a causally ready oldest request independently of cache presence."""
-        limit = self.config.ready_wait_limit_seconds
+        limit = self._effective_ready_wait_limit(snapshot.observed_at_monotonic_s)
         if limit <= 0:
             return None
         now = snapshot.observed_at_monotonic_s
@@ -1498,11 +1559,18 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         and native transfer/source pins remain intact until completion; resume
         still checks the real ledger. A failed transition never earns relief.
         """
-        if self.config.ready_wait_limit_seconds <= 0:
+        now = snapshot.observed_at_monotonic_s
+        effective_limit = self._effective_ready_wait_limit(now)
+        if effective_limit <= 0:
             return
+        drain_budget = (
+            self.config.drain_max_victims_per_cycle
+            if effective_limit == self.config.drain_wait_threshold_seconds
+            and self.config.ready_wait_limit_seconds <= 0
+            else 0
+        )
         candidate = self._aged_waiter(snapshot)
         if candidate is None:
-            now = snapshot.observed_at_monotonic_s
             for program in snapshot.programs:
                 if (
                     program.state is ProgramState.PAUSED
@@ -1510,7 +1578,7 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
                     and program.wait_started_at_monotonic_s is not None
                     and self._gpu_target(program, snapshot) <= self._gpu_quota(snapshot)
                 ):
-                    deadline = program.wait_started_at_monotonic_s + self.config.ready_wait_limit_seconds
+                    deadline = program.wait_started_at_monotonic_s + effective_limit
                     if deadline > now:
                         self._request_schedule(factors, deadline)
             return
@@ -1532,7 +1600,12 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
             and self._factor(factors, program.ref).pending_tier is None
             and not self._gpu_service_protected(program, factors, snapshot.observed_at_monotonic_s)
         ]
-        victims.sort(key=lambda program: self._demotion_key(program, factors, snapshot.observed_at_monotonic_s))
+        if self.config.utility_victim_order:
+            self._sort_victims(victims, factors, gpu, snapshot.observed_at_monotonic_s)
+        else:
+            victims.sort(key=lambda program: self._demotion_key(program, factors, snapshot.observed_at_monotonic_s))
+        if drain_budget > 0:
+            victims = victims[:drain_budget]
         for victim in victims:
             previous = self._factor(factors, victim.ref)
             try:
@@ -1596,6 +1669,39 @@ class MORIStrategy(SchedulingStrategy[MORIGlobalFactors, MORIProgramFactors]):
         if freed <= 0:
             return float("inf")
         return cost / freed
+
+    def _sort_victims(
+        self,
+        victims: list[ProgramView],
+        factors: MORIFactors,
+        gpu: CapacityLedger,
+        now: float,
+    ) -> None:
+        """Order victims for prefix eviction, by recompute cost when calibrated.
+
+        Falls back to the legacy demotion key until the utility calibration has
+        enough samples, keeping cold-start behavior identical to the baseline.
+        """
+        if self.config.utility_victim_order and (
+            self._utility.samples >= self.config.utility_min_samples and self._utility.ready
+        ):
+            self.counters["utility_victim_order_cycles"] += 1
+            victims.sort(
+                key=lambda p: self._utility.utility_victim_key(
+                    p.tokens.estimated_context_tokens,
+                    gpu.reclaimable(p.ref) if p.ref in gpu.claims else 0,
+                    self._idleness(self._factor(factors, p.ref), now),
+                    p.status is ProgramStatus.ACTING,
+                    p.ref,
+                    jitter_seconds=self.config.utility_jitter_seconds,
+                    min_prefill_tokens_per_second=self.config.utility_prefill_min_tokens_per_second,
+                    max_prefill_tokens_per_second=self.config.utility_prefill_max_tokens_per_second,
+                )
+            )
+        else:
+            if self.config.utility_victim_order:
+                self.counters["utility_victim_order_warmup"] += 1
+            victims.sort(key=lambda p: self._demotion_key(p, factors, now))
 
     def _demotion_key(
         self,
